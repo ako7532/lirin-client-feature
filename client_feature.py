@@ -1,0 +1,1258 @@
+"""In-game metin radius scanner for Lirin's embedded Python 2.7 runtime."""
+
+import __main__
+import gc
+import math
+import os
+import sys
+import time
+import traceback
+
+import app
+import background
+import chr
+import net
+import nonplayer
+import player
+import ui
+
+try:
+    INTEGER_TYPES = (int, long)
+except NameError:
+    INTEGER_TYPES = (int,)
+
+
+DIRECTORY = r"C:\Users\andrej-pc\Documents\projects\decomp\dll_injection_test"
+SNAPSHOT = os.path.join(DIRECTORY, "client_feature_vids.txt")
+LOG = os.path.join(DIRECTORY, "metin_scanner.log")
+MIN_RADIUS = 100
+MAX_RADIUS = 10000
+DEFAULT_RADIUS = 1000
+FEATURE_VERSION = 11
+HUNTER_LIMIT = 5
+REACTION_POLL_SECONDS = 0.05
+REACTION_DISCOVERY_SECONDS = 5.0
+PLAYER_POLL_SECONDS = 0.1
+BOSS_TIMER_POLL_SECONDS = 0.5
+BOSS_ACTIVE_POLL_SECONDS = 0.2
+BOSS_LOAD_SETTLE_SECONDS = 1.0
+BOSS_ABSENCE_GRACE_SECONDS = 3.0
+BOSS_HP_WAIT_SECONDS = 2.0
+BOSS_KILL_CONFIRM_SECONDS = 1.5
+BOSS_COMBAT_TIMEOUT_SECONDS = 90.0
+BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
+BOSS_RETURN_DISTANCE = 120
+
+BOSS_IDLE = "idle"
+BOSS_WAIT_TIMER = "wait_timer"
+BOSS_FIND = "find"
+BOSS_WAIT_HP = "wait_hp"
+BOSS_ATTACK = "attack"
+BOSS_CHANGE_CHANNEL = "change_channel"
+BOSS_WAIT_CHANNEL = "wait_channel"
+BOSS_SETTLE_CHANNEL = "settle_channel"
+BOSS_RETURN_POSITION = "return_position"
+
+
+def ascii_text(value):
+    if not isinstance(value, (str, unicode)):
+        value = repr(value)
+    return "".join("%c" % ord(ch) if 32 <= ord(ch) < 127 else "?" for ch in value)
+
+
+def disk_log(message):
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), ascii_text(message))
+    data = line if sys.version_info[0] == 2 else line.encode("ascii")
+    fd = os.open(LOG, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+    try:
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise IOError("log write failed")
+            offset += written
+    finally:
+        os.close(fd)
+
+
+def visible_vids():
+    if time.time() - os.stat(SNAPSHOT).st_mtime > 3.0:
+        raise IOError("entity snapshot is stale")
+    with open(SNAPSHOT, "rb") as source:
+        lines = source.readlines()
+    if not lines:
+        raise IOError("entity snapshot is empty")
+    header = lines[0].strip()
+    if sys.version_info[0] != 2:
+        header = header.decode("ascii")
+    if header != "PID %d" % os.getpid():
+        raise IOError("entity snapshot belongs to another process")
+    return [int(line) for line in lines[1:] if line.strip().isdigit()]
+
+
+def make_text(parent, x, y, message):
+    label = ui.TextLine()
+    label.SetParent(parent)
+    label.SetPosition(x, y)
+    label.SetText(message)
+    label.Show()
+    return label
+
+
+def make_button(parent, x, text, callback, y=43):
+    button = ui.Button()
+    button.SetParent(parent)
+    button.SetPosition(x, y)
+    button.SetUpVisual("d:/ymir work/ui/public/middle_button_01.sub")
+    button.SetOverVisual("d:/ymir work/ui/public/middle_button_02.sub")
+    button.SetDownVisual("d:/ymir work/ui/public/middle_button_03.sub")
+    button.SetText(text)
+    button.SetEvent(callback)
+    button.Show()
+    return button
+
+
+def make_radar_dot(parent, x, y, size, color, fallback):
+    try:
+        dot = ui.Bar()
+        dot.SetParent(parent)
+        dot.SetPosition(x, y)
+        dot.SetSize(size, size)
+        dot.SetColor(color)
+    except Exception:
+        dot = ui.TextLine()
+        dot.SetParent(parent)
+        dot.SetPosition(x, y)
+        dot.SetText(fallback)
+    dot.Show()
+    return dot
+
+
+class ScannerWatcher(ui.Window):
+    """Keep scanning and the hotkey alive while the panel is hidden."""
+
+    def __init__(self, panel):
+        ui.Window.__init__(self)
+        self.panel = panel
+        self.SetPosition(-100, -100)
+        self.SetSize(1, 1)
+        self.Show()
+
+    def OnUpdate(self):
+        self.panel.PollHotkey()
+        self.panel.OnUpdate()
+
+
+class MetinScanner(ui.BoardWithTitleBar):
+    def __init__(self):
+        ui.BoardWithTitleBar.__init__(self)
+        self.feature_version = FEATURE_VERSION
+        self.AddFlag("movable")
+        self.AddFlag("float")
+        self.SetSize(820, 485)
+        self.SetPosition(40, 80)
+        self.SetTitleName("Metin Radius Scanner")
+        self.SetCloseEvent(self.Close)
+        self.running = False
+        self.anchor_position = None
+        self.hotkey_down = False
+        self.hunter_enabled = False
+        self.hunter_queued_vids = set()
+        self.anchor_channel = None
+        self.anchor_map = None
+        self.boss_vnum = None
+        self.boss_name = None
+        self.boss_enabled = False
+        self.boss_state = BOSS_IDLE
+        self.boss_timer = None
+        self.boss_target_board = None
+        self.boss_target_board_set_hp = None
+        self.boss_hp = {}
+        self.boss_channels = []
+        self.boss_channel_index = 0
+        self.boss_target_channel = None
+        self.boss_state_started = 0.0
+        self.boss_deadline = 0.0
+        self.boss_missing_since = None
+        self.boss_target_vid = 0
+        self.boss_target_missing_since = None
+        self.boss_timer_armed = True
+        self.boss_saved_hunter_enabled = False
+        self.boss_saved_queue_enabled = False
+        self.boss_modes_paused = False
+        self.boss_saved_mouse_func = None
+        self.boss_switch_dialog = None
+        self.boss_returning = False
+        self.boss_last_error = None
+        self.boss_next_poll = 0.0
+        self.reaction_enabled = True
+        self.reaction_window = None
+        self.reaction_next_poll = 0.0
+        self.reaction_started = False
+        self.reaction_last_ball = None
+        self.reaction_last_error = None
+        self.reaction_pause_started = None
+        self.player_next_poll = 0.0
+        self.last_player_position = None
+        self.radius = DEFAULT_RADIUS
+        self.next_scan = 0.0
+        self.last_radius_error = None
+        self.last_scan_error = None
+        self.lines = []
+        self.radius_label = make_text(self, 15, 47, "Radius:")
+        self.radius_slot = ui.SlotBar()
+        self.radius_slot.SetParent(self)
+        self.radius_slot.SetPosition(75, 42)
+        self.radius_slot.SetSize(90, 22)
+        self.radius_slot.Show()
+        self.radius_edit = ui.EditLine()
+        self.radius_edit.SetParent(self.radius_slot)
+        self.radius_edit.SetPosition(6, 3)
+        self.radius_edit.SetSize(75, 18)
+        self.radius_edit.SetMax(5)
+        self.radius_edit.SetNumberMode()
+        self.radius_edit.SetText(str(DEFAULT_RADIUS))
+        self.radius_edit.Show()
+        self.start_button = make_button(self, 205, "Start", self.Start)
+        self.stop_button = make_button(self, 315, "Stop", self.Stop)
+        self.anchor_button = make_button(self, 425, "Anchor", self.ToggleAnchor)
+        self.hunter_title = make_text(self, 15, 327, "Metin Hunter")
+        self.hunter_button = make_button(self, 110, "OFF", self.ToggleMetinHunter, 322)
+        self.hunter_label = make_text(self, 205, 327, "Queue: idle")
+        self.anchor_label = make_text(self, 15, 291, "Circle: following character")
+        self.state_label = make_text(self, 15, 81, "Stopped. Set radius, then click Start.")
+        self.log_labels = []
+        for index in range(8):
+            self.log_labels.append(make_text(self, 15, 110 + index * 21, ""))
+        self.radar_center = (650, 221)
+        self.radar_pixels = 112
+        self.radar_label = make_text(self, 525, 66, "Local map: radius %d units" % self.radius)
+        try:
+            background_color = ui.GenerateColor(0.08, 0.14, 0.18, 0.92)
+            grid_color = ui.GenerateColor(0.25, 0.34, 0.39, 0.7)
+            ring_color = ui.GenerateColor(0.30, 0.72, 1.0, 1.0)
+            player_color = ui.GenerateColor(1.0, 0.90, 0.20, 1.0)
+            metin_color = ui.GenerateColor(1.0, 0.25, 0.20, 1.0)
+            other_color = ui.GenerateColor(0.72, 0.85, 0.85, 1.0)
+        except Exception:
+            background_color, grid_color = 0xEE15242E, 0xAA405762
+            ring_color, player_color = 0xFF55AAFF, 0xFFFFFF33
+            metin_color, other_color = 0xFFFF4433, 0xFFBBDDDD
+        self.map_background = ui.Bar()
+        self.map_background.SetParent(self)
+        self.map_background.SetPosition(520, 91)
+        self.map_background.SetSize(260, 260)
+        self.map_background.SetColor(background_color)
+        self.map_background.Show()
+        self.map_grid = []
+        for x in (565, 607, 650, 693, 735):
+            bar = ui.Bar()
+            bar.SetParent(self)
+            bar.SetPosition(x, 91)
+            bar.SetSize(1, 260)
+            bar.SetColor(grid_color)
+            bar.Show()
+            self.map_grid.append(bar)
+        for y in (136, 178, 221, 264, 306):
+            bar = ui.Bar()
+            bar.SetParent(self)
+            bar.SetPosition(520, y)
+            bar.SetSize(260, 1)
+            bar.SetColor(grid_color)
+            bar.Show()
+            self.map_grid.append(bar)
+        self.map_ring = []
+        for index in range(96):
+            angle = 2.0 * math.pi * index / 96.0
+            x = int(self.radar_center[0] + self.radar_pixels * math.cos(angle))
+            y = int(self.radar_center[1] + self.radar_pixels * math.sin(angle))
+            self.map_ring.append(make_radar_dot(self, x, y, 3, ring_color, "."))
+        self.map_player = make_radar_dot(self, self.radar_center[0] - 2,
+                                         self.radar_center[1] - 2, 6, player_color, "P")
+        self.map_metins = []
+        self.map_others = []
+        for pool, count, color, symbol in (
+                (self.map_metins, 32, metin_color, "M"),
+                (self.map_others, 64, other_color, ".")):
+            for index in range(count):
+                dot = make_radar_dot(self, self.radar_center[0],
+                                     self.radar_center[1], 5, color, symbol)
+                dot.Hide()
+                pool.append(dot)
+        self.map_count_label = make_text(self, 525, 360,
+                                         "Yellow: you  Red: metin  White: other")
+        self.boss_title = make_text(self, 15, 399, "Boss Sweep")
+        self.boss_mark_button = make_button(self, 110, "Mark Boss", self.MarkBoss, 394)
+        self.boss_button = make_button(self, 220, "OFF", self.ToggleBossSweep, 394)
+        self.boss_label = make_text(self, 315, 399, "Select a boss, then mark its spot")
+        self.reaction_title = make_text(self, 15, 432, "Auto Reaction")
+        self.reaction_button = make_button(self, 110, "ON", self.ToggleReaction, 427)
+        self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
+        self.AddLine("Ready. Log file: metin_scanner.log")
+        self.Show()
+        self.watcher = ScannerWatcher(self)
+
+    def AddLine(self, message):
+        clean = ascii_text(message)
+        disk_log(clean)
+        self.lines.append(clean)
+        self.lines = self.lines[-8:]
+        for index, label in enumerate(self.log_labels):
+            row = self.lines[index] if index < len(self.lines) else ""
+            label.SetText(row[:60])
+
+    def ClearMap(self):
+        for dot in self.map_metins + self.map_others:
+            dot.Hide()
+        self.map_count_label.SetText("Yellow: you  Red: metin  White: other")
+
+    def UpdateMapPool(self, dots, offsets):
+        for index, dot in enumerate(dots):
+            if index < len(offsets):
+                dx, dy = offsets[index]
+                dot.SetPosition(int(self.radar_center[0] - dx * self.radar_pixels / self.radius),
+                                int(self.radar_center[1] - dy * self.radar_pixels / self.radius))
+                dot.Show()
+            else:
+                dot.Hide()
+
+    def UpdateMap(self, metin_offsets, other_offsets):
+        self.UpdateMapPool(self.map_metins, metin_offsets)
+        self.UpdateMapPool(self.map_others, other_offsets)
+        self.map_count_label.SetText("Yellow: you  Red: %d metins  White: %d others" %
+                                     (len(metin_offsets), len(other_offsets)))
+
+    def UpdatePlayerMarker(self, player_position):
+        center = self.anchor_position or player_position
+        dx = player_position[0] - center[0]
+        dy = player_position[1] - center[1]
+        if abs(dx) > self.radius * 1.15 or abs(dy) > self.radius * 1.15:
+            self.map_player.Hide()
+            return
+        self.map_player.SetPosition(int(self.radar_center[0] - dx * self.radar_pixels / self.radius) - 2,
+                                    int(self.radar_center[1] - dy * self.radar_pixels / self.radius) - 2)
+        self.map_player.Show()
+
+    def UpdateMapHeading(self):
+        mode = "anchored" if self.anchor_position is not None else "following"
+        self.radar_label.SetText("Map: %s, radius %d" % (mode, self.radius))
+
+    def ToggleAnchor(self):
+        if self.anchor_position is None:
+            try:
+                self.anchor_position = tuple(player.GetMainCharacterPosition()[:2])
+                self.anchor_channel = int(net.GetChannelNumber())
+                self.anchor_map = ascii_text(background.GetCurrentMapName())
+            except Exception as exc:
+                self.AddLine("Anchor error: %s" % exc)
+                return
+            self.anchor_button.SetText("Unanchor")
+            self.anchor_label.SetText("Circle: anchored at %d, %d on CH%d" %
+                                      (self.anchor_position[0], self.anchor_position[1],
+                                       self.anchor_channel))
+            self.AddLine("Circle anchored at %d, %d on CH%d" %
+                         (self.anchor_position[0], self.anchor_position[1],
+                          self.anchor_channel))
+        else:
+            if self.boss_enabled:
+                self.StopBossSweep("Boss Sweep stopped: anchor removed", False)
+            self.anchor_position = None
+            self.anchor_channel = None
+            self.anchor_map = None
+            self.anchor_button.SetText("Anchor")
+            self.anchor_label.SetText("Circle: following character")
+            self.AddLine("Circle follows character")
+        self.UpdateMapHeading()
+        self.ClearMap()
+        self.next_scan = 0.0
+
+    def FindRuntimeObject(self, class_name, required_methods):
+        roots = []
+        try:
+            roots.extend(list(__main__.__dict__.values()))
+        except Exception:
+            pass
+        queue = [(obj, 0) for obj in roots]
+        seen = set()
+        index = 0
+        while index < len(queue) and index < 10000:
+            obj, depth = queue[index]
+            index += 1
+            object_id = id(obj)
+            if object_id in seen:
+                continue
+            seen.add(object_id)
+            try:
+                if (obj.__class__.__name__ == class_name and
+                        all(callable(getattr(obj, name, None))
+                            for name in required_methods)):
+                    return obj
+            except Exception:
+                pass
+            if depth >= 5:
+                continue
+            try:
+                if isinstance(obj, dict):
+                    children = list(obj.values())
+                elif isinstance(obj, (list, tuple, set)):
+                    children = list(obj)
+                else:
+                    children = list(getattr(obj, "__dict__", {}).values())
+                for child in children[:250]:
+                    queue.append((child, depth + 1))
+            except Exception:
+                continue
+        for obj in gc.get_objects():
+            try:
+                if obj.__class__.__name__ != class_name:
+                    continue
+                if all(callable(getattr(obj, name, None)) for name in required_methods):
+                    return obj
+            except Exception:
+                continue
+        return None
+
+    def FindBossRuntime(self):
+        if self.boss_timer is None:
+            self.boss_timer = self.FindRuntimeObject(
+                "CursedBossAtlasPanel", ("GetTimeRemaining",))
+        if self.boss_switch_dialog is None:
+            self.boss_switch_dialog = self.FindRuntimeObject(
+                "MoveChannelDialog",
+                ("GetChannelCount", "GetChannelNumber", "AcceptButton"))
+        if self.boss_target_board is None:
+            self.boss_target_board = self.FindRuntimeObject(
+                "TargetBoard", ("GetTargetVID", "SetHP"))
+        return (self.boss_timer is not None and
+                self.boss_switch_dialog is not None and
+                self.boss_target_board is not None)
+
+    def ToggleReaction(self):
+        self.reaction_enabled = not self.reaction_enabled
+        self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
+        self.reaction_next_poll = 0.0
+        self.AddLine("Auto Reaction %s" % ("ON" if self.reaction_enabled else "OFF"))
+
+    def PollReactionGame(self, now):
+        if not self.reaction_enabled and self.reaction_pause_started is None:
+            return False
+        if now < self.reaction_next_poll:
+            return self.reaction_pause_started is not None
+        self.reaction_next_poll = now + (REACTION_POLL_SECONDS if self.reaction_window
+                                         else REACTION_DISCOVERY_SECONDS)
+        try:
+            window = self.reaction_window
+            if window is None:
+                window = self.FindRuntimeObject(
+                    "ReactionGameWindow", ("IsShow", "_ReactionGameWindow__OnClickPlay",
+                                           "_ReactionGameWindow__OnClickSlot"))
+                self.reaction_window = window
+            if window is None or not window.IsShow():
+                if self.reaction_pause_started is not None:
+                    self.AddLine("Reaction game closed")
+                self.reaction_started = False
+                self.reaction_last_ball = None
+                return False
+            self.reaction_next_poll = now + REACTION_POLL_SECONDS
+            if self.reaction_pause_started is None:
+                self.AddLine("Reaction game visible; combat paused")
+                self.reaction_pause_started = now
+            if not self.reaction_enabled:
+                return True
+            if bool(getattr(window, "isPlaying", False)):
+                self.reaction_started = True
+            elif not self.reaction_started:
+                play_button = getattr(window, "playButton", None)
+                if play_button is not None and play_button.IsShow():
+                    window._ReactionGameWindow__OnClickPlay()
+                    self.reaction_started = True
+                    self.AddLine("Reaction game start requested")
+                return True
+            if not bool(getattr(window, "isPlaying", False)):
+                return True
+            slot = getattr(window, "activeSlot", None)
+            buttons = getattr(window, "slotButtons", ())
+            if not isinstance(slot, INTEGER_TYPES) or slot < 0 or slot >= len(buttons):
+                return True
+            if not bool(getattr(window, "firstBallSpawned", False)):
+                return True
+            if bool(getattr(window, "isHit", False)):
+                return True
+            ball_time = getattr(window, "lastBallMoveTime", None)
+            if ball_time is None:
+                return True
+            ball_key = (ball_time, slot)
+            if ball_key == self.reaction_last_ball:
+                return True
+            window._ReactionGameWindow__OnClickSlot(slot)
+            self.reaction_last_ball = ball_key
+            self.AddLine("Reaction game clicked slot %d" % slot)
+            self.reaction_last_error = None
+            return True
+        except Exception as exc:
+            problem = ascii_text(exc)
+            if problem != self.reaction_last_error:
+                self.AddLine("Reaction game error: %s" % problem)
+                self.reaction_last_error = problem
+            self.reaction_window = None
+            return self.reaction_pause_started is not None
+
+    def ResumeAfterReaction(self, now):
+        if self.reaction_pause_started is None:
+            return
+        elapsed = max(0.0, now - self.reaction_pause_started)
+        self.reaction_pause_started = None
+        if self.boss_enabled:
+            self.boss_state_started += elapsed
+            if self.boss_deadline:
+                self.boss_deadline += elapsed
+            if self.boss_missing_since is not None:
+                self.boss_missing_since += elapsed
+            if self.boss_target_missing_since is not None:
+                self.boss_target_missing_since += elapsed
+        self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
+
+    def InstallBossHPMonitor(self):
+        if self.boss_target_board_set_hp is not None:
+            return True
+        if self.boss_target_board is None:
+            return False
+        board = self.boss_target_board
+        original = board.SetHP
+        panel = self
+
+        def capture_hp(*args):
+            try:
+                target_vid = int(board.GetTargetVID())
+                if args:
+                    percentage = float(args[0])
+                    current_hp = None
+                    maximum_hp = None
+                    if len(args) >= 3:
+                        try:
+                            current_hp = float(args[1])
+                            maximum_hp = float(args[2])
+                            if maximum_hp > 0:
+                                percentage = current_hp * 100.0 / maximum_hp
+                        except Exception:
+                            current_hp = None
+                            maximum_hp = None
+                    panel.boss_hp[target_vid] = (percentage, time.time(),
+                                                 current_hp, maximum_hp)
+            except Exception:
+                pass
+            return original(*args)
+
+        try:
+            board.SetHP = capture_hp
+        except Exception:
+            return False
+        self.boss_target_board_set_hp = original
+        return True
+
+    def RemoveBossHPMonitor(self):
+        if self.boss_target_board is None or self.boss_target_board_set_hp is None:
+            return
+        try:
+            self.boss_target_board.SetHP = self.boss_target_board_set_hp
+        except Exception:
+            pass
+        self.boss_target_board_set_hp = None
+
+    def ReadBossTimer(self):
+        if self.boss_timer is None:
+            return None
+        value = self.boss_timer.GetTimeRemaining()
+        if isinstance(value, (tuple, list)):
+            if not value:
+                return None
+            value = value[0]
+        return float(value)
+
+    def MarkBoss(self):
+        try:
+            vid = int(player.GetTargetVID())
+            if vid <= 0:
+                raise ValueError("select the boss first")
+            vnum = int(chr.GetVirtualNumber(vid))
+            name = ascii_text(chr.GetNameByVID(vid))
+            position = tuple(player.GetMainCharacterPosition()[:2])
+            channel = int(net.GetChannelNumber())
+            map_name = ascii_text(background.GetCurrentMapName())
+            if channel <= 0:
+                raise ValueError("current channel is unavailable")
+        except Exception as exc:
+            self.AddLine("Mark Boss error: %s" % exc)
+            return
+        if self.boss_enabled:
+            self.StopBossSweep("Boss Sweep stopped for new mark", False)
+        self.anchor_position = position
+        self.anchor_channel = channel
+        self.anchor_map = map_name
+        self.boss_vnum = vnum
+        self.boss_name = name or "Boss"
+        self.anchor_button.SetText("Unanchor")
+        self.anchor_label.SetText("Circle: anchored at %d, %d on CH%d" %
+                                  (position[0], position[1], channel))
+        self.boss_label.SetText("%s [vnum %d], CH%d" %
+                                (self.boss_name, self.boss_vnum, channel))
+        self.UpdateMapHeading()
+        self.ClearMap()
+        self.next_scan = 0.0
+        self.AddLine("Boss marked: %s [vnum %d] at %d, %d on CH%d" %
+                     (self.boss_name, self.boss_vnum, position[0], position[1],
+                      channel))
+        self.FindBossRuntime()
+        hp_monitor = self.InstallBossHPMonitor()
+        try:
+            channel_count = int(self.boss_switch_dialog.GetChannelCount())
+        except Exception:
+            channel_count = 0
+        self.AddLine("Boss runtime check: timer=%s hp=%s channels=%d" %
+                     ("yes" if self.boss_timer is not None else "no",
+                      "yes" if hp_monitor else "no", channel_count))
+
+    def GetBossChannels(self):
+        count = int(self.boss_switch_dialog.GetChannelCount())
+        if count <= 0 or count > 20:
+            raise ValueError("invalid channel count %d" % count)
+        original = int(self.anchor_channel)
+        channels = [original]
+        channels.extend(channel for channel in range(1, count + 1)
+                        if channel != original)
+        return channels
+
+    def ToggleBossSweep(self):
+        if self.boss_enabled:
+            self.StopBossSweep("Boss Sweep OFF", False)
+            return
+        if self.boss_vnum is None or self.anchor_position is None or self.anchor_channel is None:
+            self.AddLine("Boss Sweep: select the boss and click Mark Boss first")
+            return
+        if not self.running:
+            self.Start()
+            if not self.running:
+                return
+        self.FindBossRuntime()
+        missing = []
+        if self.boss_timer is None:
+            missing.append("boss timer (open M map once)")
+        if self.boss_switch_dialog is None:
+            missing.append("channel changer")
+        if self.boss_target_board is None:
+            missing.append("target board")
+        if missing:
+            self.AddLine("Boss Sweep unavailable: %s" % ", ".join(missing))
+            return
+        if not self.InstallBossHPMonitor():
+            self.AddLine("Boss Sweep unavailable: cannot monitor boss HP")
+            return
+        try:
+            self.boss_channels = self.GetBossChannels()
+        except Exception as exc:
+            self.AddLine("Boss Sweep unavailable: %s" % exc)
+            return
+        self.boss_enabled = True
+        self.boss_state = BOSS_WAIT_TIMER
+        self.boss_state_started = time.time()
+        self.boss_next_poll = 0.0
+        self.boss_timer_armed = True
+        self.boss_last_error = None
+        self.boss_button.SetText("ON")
+        self.boss_label.SetText("Waiting for %s timer" % self.boss_name)
+        self.AddLine("Boss Sweep ON; return CH%d at %d, %d; channels %s" %
+                     (self.anchor_channel, self.anchor_position[0],
+                      self.anchor_position[1], ",".join(map(str, self.boss_channels))))
+
+    def PauseMetinQueueForBoss(self):
+        self.boss_saved_hunter_enabled = bool(self.hunter_enabled)
+        try:
+            self.boss_saved_queue_enabled = bool(player.MetinQueueIsEnabled())
+        except Exception:
+            self.boss_saved_queue_enabled = False
+        self.hunter_enabled = False
+        self.hunter_button.SetText("OFF")
+        self.hunter_queued_vids.clear()
+        player.MetinQueueClear()
+        player.MetinQueueSetEnabled(0)
+        self.boss_modes_paused = True
+        self.hunter_label.SetText("Queue: paused for boss")
+
+    def RestoreAfterBoss(self):
+        self.StopBossAttack()
+        if self.boss_saved_mouse_func is not None:
+            try:
+                player.SetMouseFunc(player.MBT_LEFT, self.boss_saved_mouse_func)
+            except Exception:
+                pass
+            self.boss_saved_mouse_func = None
+        if self.boss_modes_paused:
+            try:
+                player.MetinQueueSetEnabled(1 if self.boss_saved_queue_enabled else 0)
+            except Exception:
+                pass
+            self.hunter_enabled = bool(self.boss_saved_hunter_enabled)
+            self.hunter_button.SetText("ON" if self.hunter_enabled else "OFF")
+            if self.hunter_enabled:
+                self.hunter_label.SetText("Queue: refilling after boss")
+            else:
+                self.hunter_label.SetText("Queue: boss sweep finished")
+        self.boss_modes_paused = False
+        self.boss_saved_hunter_enabled = False
+        self.boss_saved_queue_enabled = False
+
+    def StopBossSweep(self, message, keep_watching):
+        self.RestoreAfterBoss()
+        self.boss_target_vid = 0
+        self.boss_target_missing_since = None
+        self.boss_missing_since = None
+        self.boss_target_channel = None
+        self.boss_state = BOSS_WAIT_TIMER if keep_watching else BOSS_IDLE
+        if not keep_watching:
+            self.boss_enabled = False
+            self.boss_button.SetText("OFF")
+        self.boss_label.SetText(message)
+        self.AddLine(message)
+
+    def BeginBossSweep(self):
+        try:
+            self.PauseMetinQueueForBoss()
+            self.boss_channels = self.GetBossChannels()
+        except Exception as exc:
+            self.StopBossSweep("Boss Sweep start error: %s" % exc, False)
+            return
+        self.boss_channel_index = 0
+        self.boss_timer_armed = False
+        current = int(net.GetChannelNumber())
+        self.AddLine("Boss is up; starting channel sweep from CH%d" % current)
+        if current != self.boss_channels[0]:
+            self.RequestBossChannel(self.boss_channels[0])
+        else:
+            self.StartBossFind()
+
+    def StartBossFind(self):
+        now = time.time()
+        self.boss_state = BOSS_FIND
+        self.boss_state_started = now
+        self.boss_deadline = now + BOSS_ABSENCE_GRACE_SECONDS
+        self.boss_missing_since = now
+        self.boss_target_vid = 0
+        self.boss_target_missing_since = None
+        channel = int(net.GetChannelNumber())
+        self.boss_label.SetText("CH%d: looking for %s (3s)" %
+                                (channel, self.boss_name))
+        self.AddLine("CH%d: looking for boss for 3 seconds" % channel)
+
+    def FindMarkedBoss(self):
+        best = None
+        center_x, center_y = self.anchor_position
+        for vid in visible_vids():
+            try:
+                if int(chr.GetVirtualNumber(vid)) != self.boss_vnum:
+                    continue
+                px, py = chr.GetPixelPosition(vid)[:2]
+                distance = int(((px - center_x) ** 2 + (py - center_y) ** 2) ** 0.5)
+                if distance > self.radius:
+                    continue
+                candidate = (distance, int(vid), px, py)
+                if best is None or candidate < best:
+                    best = candidate
+            except Exception:
+                continue
+        return best
+
+    def SelectBossForHP(self, candidate):
+        distance, vid, px, py = candidate
+        self.boss_target_vid = vid
+        self.boss_hp.pop(vid, None)
+        player.SetAttackKeyState(False)
+        player.SetTarget(vid)
+        self.boss_state = BOSS_WAIT_HP
+        self.boss_state_started = time.time()
+        self.boss_deadline = self.boss_state_started + BOSS_HP_WAIT_SECONDS
+        self.boss_label.SetText("CH%d: reading %s HP" %
+                                (int(net.GetChannelNumber()), self.boss_name))
+        self.AddLine("CH%d: boss found [VID %d], distance %d; reading HP" %
+                     (int(net.GetChannelNumber()), vid, distance))
+
+    def StartBossAttack(self):
+        vid = self.boss_target_vid
+        player.SetAttackKeyState(False)
+        player.SetTarget(vid)
+        player.MetinQueueClear()
+        player.AddMetinQueueAllowedRace(self.boss_vnum)
+        player.MetinQueueSetEnabled(1)
+        player.MetinQueueAdd(vid)
+        queue_size = int(player.MetinQueueGetSize())
+        if queue_size < 1:
+            player.MetinQueueSetEnabled(0)
+            raise RuntimeError("temporary boss queue rejected VID %d" % vid)
+        self.boss_state = BOSS_ATTACK
+        self.boss_state_started = time.time()
+        self.boss_deadline = self.boss_state_started + BOSS_COMBAT_TIMEOUT_SECONDS
+        self.boss_target_missing_since = None
+        self.boss_label.SetText("CH%d: attacking %s" %
+                                (int(net.GetChannelNumber()), self.boss_name))
+        self.AddLine("CH%d: boss HP full; one-target chase queue started" %
+                     int(net.GetChannelNumber()))
+
+    def StopBossAttack(self):
+        try:
+            player.SetAttackKeyState(False)
+        except Exception:
+            pass
+        if self.boss_modes_paused:
+            try:
+                player.MetinQueueClear()
+                player.MetinQueueSetEnabled(0)
+            except Exception:
+                pass
+        try:
+            player.ClearTarget()
+        except Exception:
+            pass
+
+    def SelectChannelInDialog(self, channel):
+        select = getattr(self.boss_switch_dialog,
+                         "_MoveChannelDialog__SelectChannel", None)
+        if select is None:
+            raise AttributeError("channel select method unavailable")
+        try:
+            self.boss_switch_dialog.Show()
+        except Exception:
+            pass
+        selected = None
+        for value in (channel, channel - 1):
+            if value < 0:
+                continue
+            select(value)
+            try:
+                selected = int(self.boss_switch_dialog.GetChannelNumber())
+            except Exception:
+                selected = channel
+            if selected == channel:
+                break
+        if selected != channel:
+            raise ValueError("channel dialog selected %s, expected %d" %
+                             (selected, channel))
+        self.boss_switch_dialog.AcceptButton()
+
+    def RequestBossChannel(self, channel, returning=False):
+        self.StopBossAttack()
+        self.boss_target_channel = int(channel)
+        self.boss_returning = bool(returning)
+        self.boss_state = BOSS_CHANGE_CHANNEL
+        self.boss_state_started = time.time()
+        self.boss_deadline = self.boss_state_started + BOSS_CHANNEL_TIMEOUT_SECONDS
+        self.boss_label.SetText("Changing to CH%d" % channel)
+        self.AddLine("Changing to CH%d%s" %
+                     (channel, " to return" if returning else ""))
+        self.SelectChannelInDialog(channel)
+        self.boss_state = BOSS_WAIT_CHANNEL
+
+    def AdvanceBossChannel(self):
+        self.StopBossAttack()
+        self.boss_channel_index += 1
+        if self.boss_channel_index < len(self.boss_channels):
+            self.RequestBossChannel(self.boss_channels[self.boss_channel_index])
+            return
+        current = int(net.GetChannelNumber())
+        if current != self.anchor_channel:
+            self.RequestBossChannel(self.anchor_channel, True)
+        else:
+            self.StartReturnToAnchor()
+
+    def StartReturnToAnchor(self):
+        self.boss_state = BOSS_RETURN_POSITION
+        self.boss_state_started = time.time()
+        self.boss_deadline = self.boss_state_started + 30.0
+        self.boss_label.SetText("Returning to marked spot on CH%d" % self.anchor_channel)
+        try:
+            chr.MoveToDestPosition(player.GetMainCharacterIndex(),
+                                   self.anchor_position[0], self.anchor_position[1])
+        except Exception as exc:
+            self.AddLine("Return movement unavailable: %s" % exc)
+
+    def BossVIDVisible(self, vid):
+        try:
+            return int(vid) in visible_vids()
+        except Exception:
+            return True
+
+    def SnapshotUpdatedSince(self, timestamp):
+        try:
+            if os.stat(SNAPSHOT).st_mtime + 0.05 < timestamp:
+                return False
+            visible_vids()
+            return True
+        except Exception:
+            return False
+
+    def UpdateBossSweep(self, now, player_position):
+        if not self.boss_enabled:
+            return
+        if now < self.boss_next_poll:
+            return
+        if self.boss_state == BOSS_WAIT_TIMER:
+            self.boss_next_poll = now + BOSS_TIMER_POLL_SECONDS
+        else:
+            self.boss_next_poll = now + BOSS_ACTIVE_POLL_SECONDS
+        try:
+            if self.boss_state == BOSS_WAIT_TIMER:
+                remaining = self.ReadBossTimer()
+                if remaining is None:
+                    return
+                if remaining > 0:
+                    self.boss_timer_armed = True
+                    self.boss_label.SetText("%s in %ds" %
+                                            (self.boss_name, int(remaining)))
+                    return
+                if self.boss_timer_armed:
+                    self.BeginBossSweep()
+                return
+
+            if self.boss_state == BOSS_FIND:
+                candidate = self.FindMarkedBoss()
+                if candidate is not None:
+                    self.SelectBossForHP(candidate)
+                elif now >= self.boss_deadline:
+                    self.AddLine("CH%d: boss absent after 3-second scan" %
+                                 int(net.GetChannelNumber()))
+                    self.AdvanceBossChannel()
+                return
+
+            if self.boss_state == BOSS_WAIT_HP:
+                hp = self.boss_hp.get(self.boss_target_vid)
+                if hp is not None and hp[1] >= self.boss_state_started:
+                    if hp[0] >= 99.999:
+                        self.StartBossAttack()
+                    else:
+                        self.AddLine("CH%d: boss HP %.1f%%; skipping" %
+                                     (int(net.GetChannelNumber()), hp[0]))
+                        self.AdvanceBossChannel()
+                elif now >= self.boss_deadline:
+                    self.AddLine("CH%d: no fresh boss HP; skipping safely" %
+                                 int(net.GetChannelNumber()))
+                    self.AdvanceBossChannel()
+                return
+
+            if self.boss_state == BOSS_ATTACK:
+                hp = self.boss_hp.get(self.boss_target_vid)
+                dead_by_hp = hp is not None and hp[0] <= 0.0
+                if dead_by_hp or not self.BossVIDVisible(self.boss_target_vid):
+                    if self.boss_target_missing_since is None:
+                        self.boss_target_missing_since = now
+                    if dead_by_hp or now - self.boss_target_missing_since >= BOSS_KILL_CONFIRM_SECONDS:
+                        self.AddLine("CH%d: boss kill confirmed" %
+                                     int(net.GetChannelNumber()))
+                        self.AdvanceBossChannel()
+                else:
+                    self.boss_target_missing_since = None
+                if now >= self.boss_deadline:
+                    self.AddLine("CH%d: boss combat timed out; continuing" %
+                                 int(net.GetChannelNumber()))
+                    self.AdvanceBossChannel()
+                return
+
+            if self.boss_state == BOSS_WAIT_CHANNEL:
+                channel_ready = (int(net.GetChannelNumber()) == self.boss_target_channel and
+                                 player_position is not None and
+                                 self.SnapshotUpdatedSince(self.boss_state_started))
+                if channel_ready:
+                    current_map = ascii_text(background.GetCurrentMapName())
+                    if current_map != self.anchor_map:
+                        raise RuntimeError("loaded unexpected map %s" % current_map)
+                    self.boss_state = BOSS_SETTLE_CHANNEL
+                    self.boss_state_started = now
+                    self.boss_deadline = now + BOSS_LOAD_SETTLE_SECONDS
+                    self.boss_label.SetText("CH%d loaded; waiting 1 second" %
+                                            self.boss_target_channel)
+                    self.AddLine("CH%d loaded; settling for 1 second" %
+                                 self.boss_target_channel)
+                elif now >= self.boss_deadline:
+                    raise RuntimeError("channel %d load timeout" % self.boss_target_channel)
+                return
+
+            if self.boss_state == BOSS_SETTLE_CHANNEL:
+                if now < self.boss_deadline:
+                    return
+                if self.boss_returning:
+                    self.StartReturnToAnchor()
+                else:
+                    self.StartBossFind()
+                return
+
+            if self.boss_state == BOSS_RETURN_POSITION:
+                if player_position is not None:
+                    dx = player_position[0] - self.anchor_position[0]
+                    dy = player_position[1] - self.anchor_position[1]
+                    if (dx * dx + dy * dy) ** 0.5 <= BOSS_RETURN_DISTANCE:
+                        self.StopBossSweep("Sweep complete; back on CH%d at anchor" %
+                                           self.anchor_channel, True)
+                        return
+                if now >= self.boss_deadline:
+                    self.StopBossSweep("Sweep complete on CH%d; return movement timed out" %
+                                       self.anchor_channel, True)
+                return
+        except Exception as exc:
+            problem = ascii_text(exc)
+            if problem != self.boss_last_error:
+                self.AddLine("Boss Sweep error: %s" % problem)
+                self.boss_last_error = problem
+            self.StopBossSweep("Boss Sweep stopped after error", False)
+
+    def TogglePanel(self):
+        if self.IsShow():
+            self.Hide()
+            disk_log("Panel minimized with Left Ctrl+F8")
+        else:
+            self.Show()
+            disk_log("Panel opened with Left Ctrl+F8")
+
+    def PollHotkey(self):
+        try:
+            down = bool(app.IsPressed(app.DIK_LCONTROL) and app.IsPressed(app.DIK_F8))
+        except Exception:
+            return
+        if down and not self.hotkey_down:
+            self.TogglePanel()
+        self.hotkey_down = down
+
+    def ReadRadius(self):
+        text = self.radius_edit.GetText().strip()
+        if not text.isdigit():
+            raise ValueError("radius must be a whole number")
+        radius = int(text)
+        if radius < MIN_RADIUS or radius > MAX_RADIUS:
+            raise ValueError("radius must be %d-%d" % (MIN_RADIUS, MAX_RADIUS))
+        return radius
+
+    def Start(self):
+        try:
+            new_radius = self.ReadRadius()
+        except Exception as exc:
+            self.AddLine("Radius error: %s" % exc)
+            return
+        if self.running:
+            self.RefreshRadius()
+            self.AddLine("Already running; radius now %d" % self.radius)
+            return
+        self.radius = new_radius
+        self.running = True
+        self.next_scan = 0.0
+        self.last_radius_error = None
+        self.last_scan_error = None
+        self.state_label.SetText("Running. Radius: %d game units" % self.radius)
+        self.UpdateMapHeading()
+        self.AddLine("Started; radius=%d" % self.radius)
+
+    def Stop(self):
+        if self.boss_enabled:
+            self.StopBossSweep("Boss Sweep stopped", False)
+        self.running = False
+        self.hunter_enabled = False
+        self.hunter_button.SetText("OFF")
+        self.hunter_label.SetText("Queue: additions stopped")
+        self.ClearMap()
+        self.state_label.SetText("Stopped. Set radius, then click Start.")
+        self.AddLine("Stopped")
+
+    def Close(self):
+        if self.running:
+            self.Stop()
+        self.Hide()
+
+    def Dispose(self):
+        self.watcher.Hide()
+        self.Stop()
+        self.RemoveBossHPMonitor()
+        self.Hide()
+
+    def ToggleMetinHunter(self):
+        if self.boss_modes_paused:
+            self.AddLine("Metin Hunter unavailable during Boss Sweep")
+            return
+        if self.hunter_enabled:
+            self.hunter_enabled = False
+            self.hunter_button.SetText("OFF")
+            self.hunter_label.SetText("Queue: adding paused")
+            self.AddLine("Metin Hunter OFF; existing queue continues")
+            return
+        if not self.running:
+            self.Start()
+            if not self.running:
+                return
+        try:
+            if not player.MetinQueueIsEnabled():
+                player.MetinQueueSetEnabled(1)
+            cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
+            size = int(player.MetinQueueGetSize())
+            if cap <= 0 or size < 0:
+                raise ValueError("invalid metin queue capacity or size")
+        except Exception as exc:
+            self.AddLine("Metin Hunter unavailable: %s" % exc)
+            return
+        self.hunter_queued_vids.clear()
+        self.hunter_enabled = True
+        self.hunter_button.SetText("ON")
+        self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
+        self.AddLine("Metin Hunter ON; queue limit %d" % cap)
+
+    def FeedMetinQueue(self, candidates):
+        if not self.hunter_enabled:
+            return
+        if not player.MetinQueueIsEnabled():
+            self.hunter_enabled = False
+            self.hunter_button.SetText("OFF")
+            self.hunter_label.SetText("Queue: disabled")
+            self.AddLine("Metin Hunter paused: queue was disabled")
+            return
+        cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
+        size = int(player.MetinQueueGetSize())
+        self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
+        if size == 0:
+            self.hunter_queued_vids.clear()
+        if size >= cap:
+            return
+        for distance, vid, name in sorted(candidates):
+            if vid in self.hunter_queued_vids:
+                continue
+            result = player.MetinQueueAdd(vid)
+            new_size = int(player.MetinQueueGetSize())
+            self.hunter_queued_vids.add(vid)
+            if new_size > size:
+                self.hunter_label.SetText("Queue: %d/%d" % (new_size, cap))
+                self.AddLine("Queued %s [VID %d], distance %d (%d/%d)" %
+                             (name or "Metin", vid, distance, new_size, cap))
+                return
+            if not result:
+                self.AddLine("Queue rejected VID %d" % vid)
+                return
+
+    def Scan(self, player_position):
+        vids = visible_vids()
+        x, y = (self.anchor_position or player_position)[:2]
+        player_x, player_y = player_position[:2]
+        found = {}
+        metin_offsets = []
+        other_offsets = []
+        candidates = []
+        for vid in vids:
+            try:
+                vnum = chr.GetVirtualNumber(vid)
+                is_metin = nonplayer.IsMonsterStone(vnum)
+                if not is_metin and len(other_offsets) >= len(self.map_others):
+                    continue
+                px, py = chr.GetPixelPosition(vid)[:2]
+                circle_distance = int(((px - x) ** 2 + (py - y) ** 2) ** 0.5)
+                if circle_distance > self.radius:
+                    continue
+                if not is_metin:
+                    if circle_distance > 1 and len(other_offsets) < len(self.map_others):
+                        other_offsets.append((px - x, py - y))
+                    continue
+                if len(metin_offsets) < len(self.map_metins):
+                    metin_offsets.append((px - x, py - y))
+                name = ascii_text(chr.GetNameByVID(vid))
+                player_distance = int(((px - player_x) ** 2 + (py - player_y) ** 2) ** 0.5)
+                candidates.append((player_distance, vid, name))
+                key = (vnum, name)
+                if key not in found:
+                    found[key] = []
+                found[key].append(circle_distance)
+            except Exception:
+                continue  # Entity may have despawned after the native snapshot.
+        mode = "anchored" if self.anchor_position is not None else "following"
+        if found:
+            parts = []
+            for (vnum, name), distances in sorted(found.items()):
+                parts.append("%s [vnum %d] x%d, nearest %d" %
+                             (name or "Metin", vnum, len(distances), min(distances)))
+            summary = "radius=%d %s: %s" % (self.radius, mode, "; ".join(parts))
+        else:
+            summary = "radius=%d %s: no metins visible in range" % (self.radius, mode)
+        self.UpdateMap(metin_offsets, other_offsets)
+        self.AddLine(summary)
+        try:
+            self.FeedMetinQueue(candidates)
+        except Exception as exc:
+            self.hunter_enabled = False
+            self.hunter_button.SetText("OFF")
+            self.hunter_label.SetText("Queue: error")
+            self.AddLine("Metin Hunter error: %s" % exc)
+
+    def RefreshRadius(self):
+        try:
+            new_radius = self.ReadRadius()
+            self.last_radius_error = None
+        except ValueError as exc:
+            if self.last_radius_error != str(exc):
+                self.AddLine("Radius input: %s; using %d" % (exc, self.radius))
+                self.last_radius_error = str(exc)
+            return
+        if new_radius == self.radius:
+            return
+        self.radius = new_radius
+        self.state_label.SetText("Running. Radius: %d game units" % self.radius)
+        self.UpdateMapHeading()
+        self.ClearMap()
+        self.next_scan = 0.0
+        self.AddLine("Radius changed to %d" % self.radius)
+
+    def OnUpdate(self):
+        now = time.time()
+        if self.PollReactionGame(now):
+            return
+        self.ResumeAfterReaction(now)
+        if not self.running:
+            return
+        player_position = self.last_player_position
+        if now >= self.player_next_poll:
+            self.player_next_poll = now + PLAYER_POLL_SECONDS
+            try:
+                player_position = player.GetMainCharacterPosition()
+                self.last_player_position = player_position
+                self.UpdatePlayerMarker(player_position)
+            except Exception:
+                player_position = None
+                self.last_player_position = None
+        try:
+            self.RefreshRadius()
+        except Exception:
+            problem = ascii_text(traceback.format_exc().splitlines()[-1])
+            if problem != self.last_radius_error:
+                self.AddLine("Radius update error: %s" % problem)
+                self.last_radius_error = problem
+        self.UpdateBossSweep(now, player_position)
+        if now >= self.next_scan:
+            try:
+                if player_position is None:
+                    player_position = player.GetMainCharacterPosition()
+                self.Scan(player_position)
+                self.last_scan_error = None
+            except Exception:
+                problem = ascii_text(traceback.format_exc().splitlines()[-1])
+                if problem != self.last_scan_error:
+                    self.AddLine("Scan error: %s" % problem)
+                    self.last_scan_error = problem
+                self.ClearMap()
+            self.next_scan = now + 1.0
+
+
+try:
+    existing = getattr(__main__, "_lirin_metin_scanner", None)
+    if existing is not None and getattr(existing, "feature_version", 0) == FEATURE_VERSION:
+        existing.Show()
+        disk_log("Panel reopened in PID %d" % os.getpid())
+    else:
+        if existing is not None:
+            if hasattr(existing, "Dispose"):
+                existing.Dispose()
+            else:
+                existing.Stop()
+                existing.Hide()
+        __main__._lirin_metin_scanner = MetinScanner()
+        disk_log("Panel created in PID %d" % os.getpid())
+except:
+    disk_log("Panel creation failed: %s" % ascii_text(traceback.format_exc()))
+    raise

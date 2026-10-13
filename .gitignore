@@ -1,0 +1,34 @@
+# Compiled and injected binaries
+*.dll
+*.obj
+*.exe
+*.pdb
+client_feature_run_*.dll
+
+# Runtime state
+client_feature_active.txt
+client_feature_vids.txt
+metin_scanner.log
+*.loaded.txt
+*.status.txt
+
+# Generated probes and inventories
+python_modules_*.txt
+python_symbols_*.txt
+python_ingame_*.txt
+python_runtime_refs.txt
+python_init_callers.txt
+python_candidates.c
+
+# External cloned projects
+references/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Windows and editors
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
