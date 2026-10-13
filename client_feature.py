@@ -4,6 +4,7 @@ import __main__
 import gc
 import math
 import os
+import random
 import sys
 import time
 import traceback
@@ -22,14 +23,18 @@ except NameError:
     INTEGER_TYPES = (int,)
 
 
-DIRECTORY = r"C:\Users\andrej-pc\Documents\projects\decomp\dll_injection_test"
+# execfile preserves the real script filename on the executing frame even
+# when the embedded __main__ module has no reliable __file__ value.
+DIRECTORY = os.path.dirname(os.path.abspath(sys._getframe().f_code.co_filename))
 SNAPSHOT = os.path.join(DIRECTORY, "client_feature_vids.txt")
 LOG = os.path.join(DIRECTORY, "metin_scanner.log")
+CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
-DEFAULT_RADIUS = 1000
-FEATURE_VERSION = 11
+DEFAULT_RADIUS = 2500
+FEATURE_VERSION = 20
 HUNTER_LIMIT = 5
+HUNTER_REFILL_CHANCES = {3: 0.35, 2: 0.70, 1: 1.0, 0: 1.0}
 REACTION_POLL_SECONDS = 0.05
 REACTION_DISCOVERY_SECONDS = 5.0
 PLAYER_POLL_SECONDS = 0.1
@@ -37,7 +42,6 @@ BOSS_TIMER_POLL_SECONDS = 0.5
 BOSS_ACTIVE_POLL_SECONDS = 0.2
 BOSS_LOAD_SETTLE_SECONDS = 1.0
 BOSS_ABSENCE_GRACE_SECONDS = 3.0
-BOSS_HP_WAIT_SECONDS = 2.0
 BOSS_KILL_CONFIRM_SECONDS = 1.5
 BOSS_COMBAT_TIMEOUT_SECONDS = 90.0
 BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
@@ -46,12 +50,14 @@ BOSS_RETURN_DISTANCE = 120
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
 BOSS_FIND = "find"
-BOSS_WAIT_HP = "wait_hp"
 BOSS_ATTACK = "attack"
 BOSS_CHANGE_CHANNEL = "change_channel"
 BOSS_WAIT_CHANNEL = "wait_channel"
 BOSS_SETTLE_CHANNEL = "settle_channel"
 BOSS_RETURN_POSITION = "return_position"
+
+PHASE_LOADING = 4
+PHASE_GAME = 5
 
 
 def ascii_text(value):
@@ -70,6 +76,40 @@ def disk_log(message):
             written = os.write(fd, data[offset:])
             if written <= 0:
                 raise IOError("log write failed")
+            offset += written
+    finally:
+        os.close(fd)
+
+
+def read_config_file():
+    values = {}
+    try:
+        with open(CONFIG, "rb") as source:
+            data = source.read()
+        if sys.version_info[0] != 2:
+            data = data.decode("ascii")
+        for raw_line in data.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    except IOError:
+        pass
+    return values
+
+
+def write_config_file(values):
+    keys = sorted(values)
+    text = "\n".join("%s=%s" % (key, ascii_text(values[key])) for key in keys) + "\n"
+    data = text if sys.version_info[0] == 2 else text.encode("ascii")
+    fd = os.open(CONFIG, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+    try:
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise IOError("config write failed")
             offset += written
     finally:
         os.close(fd)
@@ -128,6 +168,42 @@ def make_radar_dot(parent, x, y, size, color, fallback):
     return dot
 
 
+class GameplayPhaseGuard(object):
+    """Observe the client's existing phase-window changes without replacing them."""
+
+    def __init__(self):
+        self.owner = None
+        self.current_phase = None
+        self.original = net.SetPhaseWindow
+
+        def phase_window(*args, **kwargs):
+            result = self.original(*args, **kwargs)
+            if args:
+                try:
+                    self.current_phase = int(args[0])
+                    owner = self.owner
+                    if owner is not None:
+                        owner.OnGameplayPhaseChanged(self.current_phase)
+                except Exception:
+                    # A phase observer must never break the client's own transition.
+                    pass
+            return result
+
+        self.phase_window = phase_window
+        net.SetPhaseWindow = self.phase_window
+
+    def SetOwner(self, owner):
+        self.owner = owner
+
+
+def get_gameplay_phase_guard():
+    guard = getattr(__main__, "_lirin_gameplay_phase_guard", None)
+    if guard is None or not hasattr(guard, "SetOwner"):
+        guard = GameplayPhaseGuard()
+        __main__._lirin_gameplay_phase_guard = guard
+    return guard
+
+
 class ScannerWatcher(ui.Window):
     """Keep scanning and the hotkey alive while the panel is hidden."""
 
@@ -158,16 +234,17 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hotkey_down = False
         self.hunter_enabled = False
         self.hunter_queued_vids = set()
+        self.hunter_initial_fill = True
         self.anchor_channel = None
         self.anchor_map = None
         self.boss_vnum = None
         self.boss_name = None
+        self.boss_position = None
+        self.boss_map = None
+        self.boss_mark_channel = None
         self.boss_enabled = False
         self.boss_state = BOSS_IDLE
         self.boss_timer = None
-        self.boss_target_board = None
-        self.boss_target_board_set_hp = None
-        self.boss_hp = {}
         self.boss_channels = []
         self.boss_channel_index = 0
         self.boss_target_channel = None
@@ -183,6 +260,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.boss_saved_mouse_func = None
         self.boss_switch_dialog = None
         self.boss_returning = False
+        self.boss_return_next_move = 0.0
         self.boss_last_error = None
         self.boss_next_poll = 0.0
         self.reaction_enabled = True
@@ -194,6 +272,11 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_pause_started = None
         self.player_next_poll = 0.0
         self.last_player_position = None
+        self.gameplay_phase = None
+        self.gameplay_available = True
+        self.gameplay_next_check = 0.0
+        self.gameplay_stopped = False
+        self.config_autoload = False
         self.radius = DEFAULT_RADIUS
         self.next_scan = 0.0
         self.last_radius_error = None
@@ -216,6 +299,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.start_button = make_button(self, 205, "Start", self.Start)
         self.stop_button = make_button(self, 315, "Stop", self.Stop)
         self.anchor_button = make_button(self, 425, "Anchor", self.ToggleAnchor)
+        self.config_save_button = make_button(self, 535, "Save", self.SaveConfig)
+        self.config_load_button = make_button(self, 625, "Load", self.LoadConfig)
+        self.config_auto_button = make_button(self, 715, "Auto OFF", self.ToggleConfigAutoload)
         self.hunter_title = make_text(self, 15, 327, "Metin Hunter")
         self.hunter_button = make_button(self, 110, "OFF", self.ToggleMetinHunter, 322)
         self.hunter_label = make_text(self, 205, 327, "Queue: idle")
@@ -261,6 +347,12 @@ class MetinScanner(ui.BoardWithTitleBar):
             bar.SetColor(grid_color)
             bar.Show()
             self.map_grid.append(bar)
+        self.map_compass = [
+            make_text(self, 646, 96, "N"),
+            make_text(self, 646, 333, "S"),
+            make_text(self, 761, 216, "E"),
+            make_text(self, 527, 216, "W"),
+        ]
         self.map_ring = []
         for index in range(96):
             angle = 2.0 * math.pi * index / 96.0
@@ -288,7 +380,18 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_title = make_text(self, 15, 432, "Auto Reaction")
         self.reaction_button = make_button(self, 110, "ON", self.ToggleReaction, 427)
         self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
+        self.phase_guard = get_gameplay_phase_guard()
+        self.phase_guard.SetOwner(self)
+        self.gameplay_phase = self.phase_guard.current_phase
         self.AddLine("Ready. Log file: metin_scanner.log")
+        try:
+            saved_config = read_config_file()
+            self.config_autoload = saved_config.get("autoload", "0") == "1"
+            self.UpdateConfigAutoloadButton()
+            if self.config_autoload:
+                self.ApplyConfig(saved_config, True)
+        except Exception as exc:
+            self.AddLine("Configuration auto-load error: %s" % exc)
         self.Show()
         self.watcher = ScannerWatcher(self)
 
@@ -305,6 +408,219 @@ class MetinScanner(ui.BoardWithTitleBar):
         for dot in self.map_metins + self.map_others:
             dot.Hide()
         self.map_count_label.SetText("Yellow: you  Red: metin  White: other")
+
+    def UpdateConfigAutoloadButton(self):
+        self.config_auto_button.SetText("Auto ON" if self.config_autoload else "Auto OFF")
+
+    def ConfigValues(self):
+        radius = self.ReadRadius()
+        values = {
+            "version": "1",
+            "autoload": "1" if self.config_autoload else "0",
+            "radius": str(radius),
+            "reaction_enabled": "1" if self.reaction_enabled else "0",
+            "anchor_enabled": "1" if self.anchor_position is not None else "0",
+            "boss_marked": "1" if self.boss_vnum is not None and self.boss_position is not None else "0",
+        }
+        if self.anchor_position is not None:
+            values.update({
+                "anchor_x": str(int(self.anchor_position[0])),
+                "anchor_y": str(int(self.anchor_position[1])),
+                "anchor_channel": str(int(self.anchor_channel)),
+                "anchor_map": ascii_text(self.anchor_map or ""),
+            })
+        if self.boss_vnum is not None and self.boss_position is not None:
+            values.update({
+                "boss_vnum": str(int(self.boss_vnum)),
+                "boss_name": ascii_text(self.boss_name or "Boss"),
+                "boss_x": str(int(self.boss_position[0])),
+                "boss_y": str(int(self.boss_position[1])),
+                "boss_channel": str(int(self.boss_mark_channel or self.anchor_channel)),
+                "boss_map": ascii_text(self.boss_map or self.anchor_map or ""),
+            })
+        return values
+
+    def SaveConfig(self, quiet=False):
+        try:
+            write_config_file(self.ConfigValues())
+            if not quiet:
+                self.AddLine("Configuration saved%s" %
+                             (" with auto-load" if self.config_autoload else ""))
+            return True
+        except Exception as exc:
+            self.AddLine("Configuration save error: %s" % exc)
+            return False
+
+    def ApplyConfig(self, values, automatic=False):
+        try:
+            if values.get("version") != "1":
+                raise ValueError("unsupported or missing config version")
+            radius = int(values["radius"])
+            if radius < MIN_RADIUS or radius > MAX_RADIUS:
+                raise ValueError("saved radius is outside %d-%d" % (MIN_RADIUS, MAX_RADIUS))
+            if self.boss_enabled:
+                self.StopBossSweep("Boss Sweep stopped for configuration load", False)
+            self.radius = radius
+            self.radius_edit.SetText(str(radius))
+            self.reaction_enabled = values.get("reaction_enabled", "0") == "1"
+            self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
+            self.reaction_label.SetText("Watches the yin-yang reaction game" if self.reaction_enabled
+                                        else "Disabled; no reaction window discovery")
+            if values.get("anchor_enabled", "0") == "1":
+                anchor_channel = int(values["anchor_channel"])
+                if anchor_channel <= 0 or anchor_channel > 20:
+                    raise ValueError("saved anchor channel is invalid")
+                self.anchor_position = (int(values["anchor_x"]), int(values["anchor_y"]))
+                self.anchor_channel = anchor_channel
+                self.anchor_map = ascii_text(values["anchor_map"])
+                self.anchor_button.SetText("Unanchor")
+                self.anchor_label.SetText("Circle: anchored at %d, %d on CH%d" %
+                                          (self.anchor_position[0], self.anchor_position[1],
+                                           self.anchor_channel))
+            else:
+                self.anchor_position = None
+                self.anchor_channel = None
+                self.anchor_map = None
+                self.anchor_button.SetText("Anchor")
+                self.anchor_label.SetText("Circle: following character")
+            if values.get("boss_marked", "0") == "1":
+                boss_vnum = int(values["boss_vnum"])
+                boss_channel = int(values["boss_channel"])
+                if boss_vnum <= 0 or boss_channel <= 0 or boss_channel > 20:
+                    raise ValueError("saved boss identity is invalid")
+                self.boss_vnum = boss_vnum
+                self.boss_name = ascii_text(values.get("boss_name", "Boss")) or "Boss"
+                self.boss_position = (int(values["boss_x"]), int(values["boss_y"]))
+                self.boss_mark_channel = boss_channel
+                self.boss_map = ascii_text(values["boss_map"])
+                self.boss_label.SetText("%s [vnum %d], CH%d" %
+                                        (self.boss_name, self.boss_vnum,
+                                         self.boss_mark_channel))
+            else:
+                self.boss_vnum = None
+                self.boss_name = None
+                self.boss_position = None
+                self.boss_mark_channel = None
+                self.boss_map = None
+                self.boss_label.SetText("Select a boss, then mark its spot")
+            self.config_autoload = values.get("autoload", "0") == "1"
+            self.UpdateConfigAutoloadButton()
+            self.UpdateMapHeading()
+            self.ClearMap()
+            self.next_scan = 0.0
+            self.AddLine("Configuration auto-loaded" if automatic else "Configuration loaded")
+            return True
+        except Exception as exc:
+            self.AddLine("Configuration load error: %s" % exc)
+            return False
+
+    def LoadConfig(self):
+        try:
+            values = read_config_file()
+        except Exception as exc:
+            self.AddLine("Configuration load error: %s" % exc)
+            return False
+        if not values:
+            self.AddLine("Configuration load error: no saved configuration")
+            return False
+        return self.ApplyConfig(values, False)
+
+    def ToggleConfigAutoload(self):
+        self.config_autoload = not self.config_autoload
+        self.UpdateConfigAutoloadButton()
+        if self.SaveConfig(True):
+            self.AddLine("Configuration auto-load %s" %
+                         ("ON" if self.config_autoload else "OFF"))
+
+    def HasPlayableCharacter(self):
+        try:
+            return (int(player.GetMainCharacterIndex()) > 0 and
+                    bool(ascii_text(player.GetMainCharacterName()).strip()))
+        except Exception:
+            return False
+
+    def HasLiveConnection(self):
+        try:
+            return bool(net.IsConnect())
+        except Exception:
+            return False
+
+    def ClearNativeAutomation(self):
+        try:
+            player.SetAttackKeyState(False)
+        except Exception:
+            pass
+        try:
+            player.MetinQueueClear()
+            player.MetinQueueSetEnabled(0)
+        except Exception:
+            pass
+        try:
+            player.ClearTarget()
+        except Exception:
+            pass
+        self.hunter_queued_vids.clear()
+        self.hunter_initial_fill = True
+
+    def EmergencyStopForGameplayExit(self, reason):
+        self.ClearNativeAutomation()
+        self.running = False
+        self.hunter_enabled = False
+        self.hunter_button.SetText("OFF")
+        self.hunter_label.SetText("Queue: stopped outside game")
+        self.boss_enabled = False
+        self.boss_modes_paused = False
+        self.boss_state = BOSS_IDLE
+        self.boss_target_vid = 0
+        self.boss_target_missing_since = None
+        self.boss_button.SetText("OFF")
+        self.boss_label.SetText("Boss Sweep stopped outside game")
+        self.ClearMap()
+        self.state_label.SetText("Stopped: not in the playable game world.")
+        if not self.gameplay_stopped:
+            self.AddLine("Automation stopped: %s" % reason)
+        self.gameplay_stopped = True
+
+    def OnGameplayPhaseChanged(self, phase):
+        self.gameplay_phase = int(phase)
+        self.gameplay_available = (self.gameplay_phase == PHASE_GAME)
+        self.gameplay_next_check = 0.0
+        if self.gameplay_available:
+            self.gameplay_stopped = False
+            self.AddLine("Playable game phase entered")
+            if self.running and self.hunter_enabled and not self.boss_modes_paused:
+                try:
+                    player.MetinQueueSetEnabled(1)
+                except Exception:
+                    pass
+            return
+        self.ClearNativeAutomation()
+        if self.gameplay_phase == PHASE_LOADING:
+            self.state_label.SetText("Paused while the game is loading.")
+            return
+        self.EmergencyStopForGameplayExit("client phase changed to %d" % self.gameplay_phase)
+
+    def IsGameplayAvailable(self, now=None):
+        if self.gameplay_phase is not None and self.gameplay_phase != PHASE_GAME:
+            return False
+        if now is None:
+            now = time.time()
+        if now < self.gameplay_next_check:
+            return self.gameplay_available
+        self.gameplay_next_check = now + PLAYER_POLL_SECONDS
+        if not self.HasLiveConnection():
+            self.gameplay_available = False
+            self.ClearNativeAutomation()
+            if (self.boss_enabled and self.boss_state in
+                    (BOSS_CHANGE_CHANNEL, BOSS_WAIT_CHANNEL, BOSS_SETTLE_CHANNEL)):
+                return False
+            self.EmergencyStopForGameplayExit("game connection is closed")
+            return False
+        available = self.HasPlayableCharacter()
+        self.gameplay_available = available
+        if not available:
+            self.EmergencyStopForGameplayExit("main character is unavailable")
+        return available
 
     def UpdateMapPool(self, dots, offsets):
         for index, dot in enumerate(dots):
@@ -420,12 +736,8 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.boss_switch_dialog = self.FindRuntimeObject(
                 "MoveChannelDialog",
                 ("GetChannelCount", "GetChannelNumber", "AcceptButton"))
-        if self.boss_target_board is None:
-            self.boss_target_board = self.FindRuntimeObject(
-                "TargetBoard", ("GetTargetVID", "SetHP"))
         return (self.boss_timer is not None and
-                self.boss_switch_dialog is not None and
-                self.boss_target_board is not None)
+                self.boss_switch_dialog is not None)
 
     def ToggleReaction(self):
         self.reaction_enabled = not self.reaction_enabled
@@ -512,53 +824,6 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.boss_target_missing_since += elapsed
         self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
 
-    def InstallBossHPMonitor(self):
-        if self.boss_target_board_set_hp is not None:
-            return True
-        if self.boss_target_board is None:
-            return False
-        board = self.boss_target_board
-        original = board.SetHP
-        panel = self
-
-        def capture_hp(*args):
-            try:
-                target_vid = int(board.GetTargetVID())
-                if args:
-                    percentage = float(args[0])
-                    current_hp = None
-                    maximum_hp = None
-                    if len(args) >= 3:
-                        try:
-                            current_hp = float(args[1])
-                            maximum_hp = float(args[2])
-                            if maximum_hp > 0:
-                                percentage = current_hp * 100.0 / maximum_hp
-                        except Exception:
-                            current_hp = None
-                            maximum_hp = None
-                    panel.boss_hp[target_vid] = (percentage, time.time(),
-                                                 current_hp, maximum_hp)
-            except Exception:
-                pass
-            return original(*args)
-
-        try:
-            board.SetHP = capture_hp
-        except Exception:
-            return False
-        self.boss_target_board_set_hp = original
-        return True
-
-    def RemoveBossHPMonitor(self):
-        if self.boss_target_board is None or self.boss_target_board_set_hp is None:
-            return
-        try:
-            self.boss_target_board.SetHP = self.boss_target_board_set_hp
-        except Exception:
-            pass
-        self.boss_target_board_set_hp = None
-
     def ReadBossTimer(self):
         if self.boss_timer is None:
             return None
@@ -576,41 +841,49 @@ class MetinScanner(ui.BoardWithTitleBar):
                 raise ValueError("select the boss first")
             vnum = int(chr.GetVirtualNumber(vid))
             name = ascii_text(chr.GetNameByVID(vid))
-            position = tuple(player.GetMainCharacterPosition()[:2])
+            boss_position = tuple(chr.GetPixelPosition(vid)[:2])
+            player_position = tuple(player.GetMainCharacterPosition()[:2])
             channel = int(net.GetChannelNumber())
             map_name = ascii_text(background.GetCurrentMapName())
             if channel <= 0:
                 raise ValueError("current channel is unavailable")
+            if self.anchor_position is not None and self.anchor_map != map_name:
+                raise ValueError("boss and Metin anchor must be on the same map")
         except Exception as exc:
             self.AddLine("Mark Boss error: %s" % exc)
             return
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep stopped for new mark", False)
-        self.anchor_position = position
-        self.anchor_channel = channel
-        self.anchor_map = map_name
+        if self.anchor_position is None:
+            self.anchor_position = player_position
+            self.anchor_channel = channel
+            self.anchor_map = map_name
+            self.anchor_button.SetText("Unanchor")
+            self.anchor_label.SetText("Circle: anchored at %d, %d on CH%d" %
+                                      (player_position[0], player_position[1], channel))
         self.boss_vnum = vnum
         self.boss_name = name or "Boss"
-        self.anchor_button.SetText("Unanchor")
-        self.anchor_label.SetText("Circle: anchored at %d, %d on CH%d" %
-                                  (position[0], position[1], channel))
+        self.boss_position = boss_position
+        self.boss_map = map_name
+        self.boss_mark_channel = channel
         self.boss_label.SetText("%s [vnum %d], CH%d" %
                                 (self.boss_name, self.boss_vnum, channel))
         self.UpdateMapHeading()
         self.ClearMap()
         self.next_scan = 0.0
-        self.AddLine("Boss marked: %s [vnum %d] at %d, %d on CH%d" %
-                     (self.boss_name, self.boss_vnum, position[0], position[1],
-                      channel))
+        self.AddLine("Boss marked: %s [vnum %d] at %d, %d on CH%d; return anchor %d, %d on CH%d" %
+                     (self.boss_name, self.boss_vnum,
+                      boss_position[0], boss_position[1], channel,
+                      self.anchor_position[0], self.anchor_position[1],
+                      self.anchor_channel))
         self.FindBossRuntime()
-        hp_monitor = self.InstallBossHPMonitor()
         try:
             channel_count = int(self.boss_switch_dialog.GetChannelCount())
         except Exception:
             channel_count = 0
-        self.AddLine("Boss runtime check: timer=%s hp=%s channels=%d" %
+        self.AddLine("Boss runtime check: timer=%s channels=%d" %
                      ("yes" if self.boss_timer is not None else "no",
-                      "yes" if hp_monitor else "no", channel_count))
+                      channel_count))
 
     def GetBossChannels(self):
         count = int(self.boss_switch_dialog.GetChannelCount())
@@ -626,7 +899,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep OFF", False)
             return
-        if self.boss_vnum is None or self.anchor_position is None or self.anchor_channel is None:
+        if (self.boss_vnum is None or self.boss_position is None or
+                self.anchor_position is None or self.anchor_channel is None):
             self.AddLine("Boss Sweep: select the boss and click Mark Boss first")
             return
         if not self.running:
@@ -639,13 +913,8 @@ class MetinScanner(ui.BoardWithTitleBar):
             missing.append("boss timer (open M map once)")
         if self.boss_switch_dialog is None:
             missing.append("channel changer")
-        if self.boss_target_board is None:
-            missing.append("target board")
         if missing:
             self.AddLine("Boss Sweep unavailable: %s" % ", ".join(missing))
-            return
-        if not self.InstallBossHPMonitor():
-            self.AddLine("Boss Sweep unavailable: cannot monitor boss HP")
             return
         try:
             self.boss_channels = self.GetBossChannels()
@@ -673,6 +942,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
         self.hunter_queued_vids.clear()
+        self.hunter_initial_fill = True
         player.MetinQueueClear()
         player.MetinQueueSetEnabled(0)
         self.boss_modes_paused = True
@@ -694,6 +964,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.hunter_enabled = bool(self.boss_saved_hunter_enabled)
             self.hunter_button.SetText("ON" if self.hunter_enabled else "OFF")
             if self.hunter_enabled:
+                self.hunter_initial_fill = True
                 self.hunter_label.SetText("Queue: refilling after boss")
             else:
                 self.hunter_label.SetText("Queue: boss sweep finished")
@@ -745,7 +1016,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def FindMarkedBoss(self):
         best = None
-        center_x, center_y = self.anchor_position
+        center_x, center_y = self.boss_position
         for vid in visible_vids():
             try:
                 if int(chr.GetVirtualNumber(vid)) != self.boss_vnum:
@@ -761,24 +1032,10 @@ class MetinScanner(ui.BoardWithTitleBar):
                 continue
         return best
 
-    def SelectBossForHP(self, candidate):
+    def StartBossAttack(self, candidate):
         distance, vid, px, py = candidate
         self.boss_target_vid = vid
-        self.boss_hp.pop(vid, None)
         player.SetAttackKeyState(False)
-        player.SetTarget(vid)
-        self.boss_state = BOSS_WAIT_HP
-        self.boss_state_started = time.time()
-        self.boss_deadline = self.boss_state_started + BOSS_HP_WAIT_SECONDS
-        self.boss_label.SetText("CH%d: reading %s HP" %
-                                (int(net.GetChannelNumber()), self.boss_name))
-        self.AddLine("CH%d: boss found [VID %d], distance %d; reading HP" %
-                     (int(net.GetChannelNumber()), vid, distance))
-
-    def StartBossAttack(self):
-        vid = self.boss_target_vid
-        player.SetAttackKeyState(False)
-        player.SetTarget(vid)
         player.MetinQueueClear()
         player.AddMetinQueueAllowedRace(self.boss_vnum)
         player.MetinQueueSetEnabled(1)
@@ -793,8 +1050,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.boss_target_missing_since = None
         self.boss_label.SetText("CH%d: attacking %s" %
                                 (int(net.GetChannelNumber()), self.boss_name))
-        self.AddLine("CH%d: boss HP full; one-target chase queue started" %
-                     int(net.GetChannelNumber()))
+        self.AddLine("CH%d: boss found [VID %d], distance %d; one-target chase queue started" %
+                     (int(net.GetChannelNumber()), vid, distance))
 
     def StopBossAttack(self):
         try:
@@ -866,12 +1123,11 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.boss_state = BOSS_RETURN_POSITION
         self.boss_state_started = time.time()
         self.boss_deadline = self.boss_state_started + 30.0
+        self.boss_return_next_move = 0.0
         self.boss_label.SetText("Returning to marked spot on CH%d" % self.anchor_channel)
-        try:
-            chr.MoveToDestPosition(player.GetMainCharacterIndex(),
-                                   self.anchor_position[0], self.anchor_position[1])
-        except Exception as exc:
-            self.AddLine("Return movement unavailable: %s" % exc)
+        self.AddLine("Returning to Metin anchor %d, %d on CH%d" %
+                     (self.anchor_position[0], self.anchor_position[1],
+                      self.anchor_channel))
 
     def BossVIDVisible(self, vid):
         try:
@@ -914,35 +1170,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             if self.boss_state == BOSS_FIND:
                 candidate = self.FindMarkedBoss()
                 if candidate is not None:
-                    self.SelectBossForHP(candidate)
+                    self.StartBossAttack(candidate)
                 elif now >= self.boss_deadline:
                     self.AddLine("CH%d: boss absent after 3-second scan" %
                                  int(net.GetChannelNumber()))
                     self.AdvanceBossChannel()
                 return
 
-            if self.boss_state == BOSS_WAIT_HP:
-                hp = self.boss_hp.get(self.boss_target_vid)
-                if hp is not None and hp[1] >= self.boss_state_started:
-                    if hp[0] >= 99.999:
-                        self.StartBossAttack()
-                    else:
-                        self.AddLine("CH%d: boss HP %.1f%%; skipping" %
-                                     (int(net.GetChannelNumber()), hp[0]))
-                        self.AdvanceBossChannel()
-                elif now >= self.boss_deadline:
-                    self.AddLine("CH%d: no fresh boss HP; skipping safely" %
-                                 int(net.GetChannelNumber()))
-                    self.AdvanceBossChannel()
-                return
-
             if self.boss_state == BOSS_ATTACK:
-                hp = self.boss_hp.get(self.boss_target_vid)
-                dead_by_hp = hp is not None and hp[0] <= 0.0
-                if dead_by_hp or not self.BossVIDVisible(self.boss_target_vid):
+                if not self.BossVIDVisible(self.boss_target_vid):
                     if self.boss_target_missing_since is None:
                         self.boss_target_missing_since = now
-                    if dead_by_hp or now - self.boss_target_missing_since >= BOSS_KILL_CONFIRM_SECONDS:
+                    if now - self.boss_target_missing_since >= BOSS_KILL_CONFIRM_SECONDS:
                         self.AddLine("CH%d: boss kill confirmed" %
                                      int(net.GetChannelNumber()))
                         self.AdvanceBossChannel()
@@ -983,13 +1222,18 @@ class MetinScanner(ui.BoardWithTitleBar):
                 return
 
             if self.boss_state == BOSS_RETURN_POSITION:
-                if player_position is not None:
-                    dx = player_position[0] - self.anchor_position[0]
-                    dy = player_position[1] - self.anchor_position[1]
-                    if (dx * dx + dy * dy) ** 0.5 <= BOSS_RETURN_DISTANCE:
-                        self.StopBossSweep("Sweep complete; back on CH%d at anchor" %
-                                           self.anchor_channel, True)
-                        return
+                fresh_position = tuple(player.GetMainCharacterPosition()[:2])
+                dx = fresh_position[0] - self.anchor_position[0]
+                dy = fresh_position[1] - self.anchor_position[1]
+                distance = (dx * dx + dy * dy) ** 0.5
+                if distance <= BOSS_RETURN_DISTANCE:
+                    self.StopBossSweep("Sweep complete; back on CH%d at Metin anchor" %
+                                       self.anchor_channel, True)
+                    return
+                if now >= self.boss_return_next_move:
+                    chr.MoveToDestPosition(player.GetMainCharacterIndex(),
+                                           self.anchor_position[0], self.anchor_position[1])
+                    self.boss_return_next_move = now + 1.0
                 if now >= self.boss_deadline:
                     self.StopBossSweep("Sweep complete on CH%d; return movement timed out" %
                                        self.anchor_channel, True)
@@ -1028,6 +1272,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         return radius
 
     def Start(self):
+        if not self.IsGameplayAvailable():
+            self.AddLine("Start blocked: enter the playable game world first")
+            return
         try:
             new_radius = self.ReadRadius()
         except Exception as exc:
@@ -1049,10 +1296,11 @@ class MetinScanner(ui.BoardWithTitleBar):
     def Stop(self):
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep stopped", False)
+        self.ClearNativeAutomation()
         self.running = False
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
-        self.hunter_label.SetText("Queue: additions stopped")
+        self.hunter_label.SetText("Queue: stopped and cleared")
         self.ClearMap()
         self.state_label.SetText("Stopped. Set radius, then click Start.")
         self.AddLine("Stopped")
@@ -1065,7 +1313,6 @@ class MetinScanner(ui.BoardWithTitleBar):
     def Dispose(self):
         self.watcher.Hide()
         self.Stop()
-        self.RemoveBossHPMonitor()
         self.Hide()
 
     def ToggleMetinHunter(self):
@@ -1074,9 +1321,10 @@ class MetinScanner(ui.BoardWithTitleBar):
             return
         if self.hunter_enabled:
             self.hunter_enabled = False
+            self.ClearNativeAutomation()
             self.hunter_button.SetText("OFF")
-            self.hunter_label.SetText("Queue: adding paused")
-            self.AddLine("Metin Hunter OFF; existing queue continues")
+            self.hunter_label.SetText("Queue: stopped and cleared")
+            self.AddLine("Metin Hunter OFF; queue cleared")
             return
         if not self.running:
             self.Start()
@@ -1093,6 +1341,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Metin Hunter unavailable: %s" % exc)
             return
         self.hunter_queued_vids.clear()
+        self.hunter_initial_fill = True
         self.hunter_enabled = True
         self.hunter_button.SetText("ON")
         self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
@@ -1113,19 +1362,49 @@ class MetinScanner(ui.BoardWithTitleBar):
         if size == 0:
             self.hunter_queued_vids.clear()
         if size >= cap:
+            self.hunter_initial_fill = False
             return
+        fill_to_capacity = self.hunter_initial_fill
+        if not fill_to_capacity:
+            chance = HUNTER_REFILL_CHANCES.get(size, 0.0)
+            if chance <= 0.0 or random.random() >= chance:
+                return
         for distance, vid, name in sorted(candidates):
             if vid in self.hunter_queued_vids:
                 continue
+            try:
+                vnum = chr.GetVirtualNumber(vid)
+                if not nonplayer.IsMonsterStone(vnum):
+                    continue
+                px, py = chr.GetPixelPosition(vid)[:2]
+                player_x, player_y = player.GetMainCharacterPosition()[:2]
+                distance = int(((px - player_x) ** 2 +
+                                (py - player_y) ** 2) ** 0.5)
+                if distance > self.radius:
+                    continue
+                center_x, center_y = (self.anchor_position or
+                                      (player_x, player_y))[:2]
+                circle_distance = int(((px - center_x) ** 2 +
+                                       (py - center_y) ** 2) ** 0.5)
+                if circle_distance > self.radius:
+                    continue
+            except Exception:
+                continue  # Entity disappeared or changed before queue admission.
             result = player.MetinQueueAdd(vid)
             new_size = int(player.MetinQueueGetSize())
-            self.hunter_queued_vids.add(vid)
             if new_size > size:
+                self.hunter_queued_vids.add(vid)
+                size = new_size
                 self.hunter_label.SetText("Queue: %d/%d" % (new_size, cap))
                 self.AddLine("Queued %s [VID %d], distance %d (%d/%d)" %
                              (name or "Metin", vid, distance, new_size, cap))
-                return
-            if not result:
+                if not fill_to_capacity or size >= cap:
+                    self.hunter_initial_fill = False
+                    return
+                continue
+            if result:
+                self.hunter_queued_vids.add(vid)
+            else:
                 self.AddLine("Queue rejected VID %d" % vid)
                 return
 
@@ -1155,7 +1434,8 @@ class MetinScanner(ui.BoardWithTitleBar):
                     metin_offsets.append((px - x, py - y))
                 name = ascii_text(chr.GetNameByVID(vid))
                 player_distance = int(((px - player_x) ** 2 + (py - player_y) ** 2) ** 0.5)
-                candidates.append((player_distance, vid, name))
+                if player_distance <= self.radius:
+                    candidates.append((player_distance, vid, name))
                 key = (vnum, name)
                 if key not in found:
                     found[key] = []
@@ -1201,6 +1481,8 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def OnUpdate(self):
         now = time.time()
+        if not self.IsGameplayAvailable(now):
+            return
         if self.PollReactionGame(now):
             return
         self.ResumeAfterReaction(now)

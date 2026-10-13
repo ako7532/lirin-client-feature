@@ -8,6 +8,7 @@ client_feature_run_*.dll
 # Runtime state
 client_feature_active.txt
 client_feature_vids.txt
+client_feature_config.txt
 metin_scanner.log
 *.loaded.txt
 *.status.txt
@@ -26,6 +27,10 @@ references/
 # Python caches
 __pycache__/
 *.py[cod]
+
+# .NET build output
+**/bin/
+**/obj/
 
 # Windows and editors
 .vscode/

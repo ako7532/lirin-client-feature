@@ -4,15 +4,51 @@ See [TEST_RESULTS.md](TEST_RESULTS.md) for the chronological test log and
 verified results.
 For a new-chat project handover, see [HANDOVER_FEATURE.md](HANDOVER_FEATURE.md).
 
+## Windows injector UI
+
+`LirinFeatureLauncher` is a .NET 8 WinForms x64 controller for the existing
+injection path. It lists only running 64-bit processes whose resolved image is
+exactly `C:\Program Files (x86)\Lirin\app\Lirin.exe`; the installation-root
+32-bit launcher is excluded. Select one PID, then click **Inject** to run
+`run_client_feature.ps1 -TargetPid <pid>`. Standard output and standard error
+are streamed into the window, with Ready, Injecting, Injected, and Failed
+states.
+
+The executable has a `requireAdministrator` manifest. It also revalidates the
+selected PID, architecture, and exact path immediately before starting the
+runner. The existing `inject.py` validation remains the final guard; the UI
+does not contain a second native injector.
+
+Build and run it from this repository:
+
+```powershell
+dotnet build .\LirinFeatureLauncher\LirinFeatureLauncher.csproj -c Release
+& '.\LirinFeatureLauncher\bin\Release\net8.0-windows\LirinFeatureLauncher.exe'
+```
+
+Run the dependency-free local checks without injecting into Lirin:
+
+```powershell
+dotnet run --project .\LirinFeatureLauncher.Tests\LirinFeatureLauncher.Tests.csproj -c Release
+```
+
+The current marker, snapshot, status, and feature-log files are shared. This
+MVP therefore manages only one successfully injected PID at a time and warns
+before replacing it with a different PID. During the first live UI test,
+switch **Auto Reaction OFF** immediately after the v11 panel appears. It
+defaults to ON, and the general Stop button does not disable it.
+
 ## Metin radius scanner feature
 
 The first feature is implemented in `client_feature.py`. It opens an in-game
 panel with Start and Stop, a radius field, recent scan messages, and a large
-coordinate map with a radius ring and nearby entity markers. Every second while running, it checks visible characters for
+coordinate map with a radius ring, N/S/E/W labels, and nearby entity markers.
+The default radius is 2500 game units. Every second while running, it checks visible characters for
 metin stones within the selected radius. The optional Metin Hunter toggle adds
 the nearest eligible stone to the client's existing metin queue, up to five
 targets and no more than the client's current native capacity. Turning the
-toggle off stops new additions without clearing the queue. It also appends the scan output to
+toggle off clears and disables the queue, releases the current attack/target,
+and stops new additions. Stop applies the same cleanup. It also appends the scan output to
 `metin_scanner.log` in this directory.
 
 Anchor fixes the circle at the character's current world position. While
@@ -21,14 +57,14 @@ Unanchor makes the circle follow the character again. Left Ctrl+F8 hides or
 opens the panel. Scanning continues while the panel is hidden. V7 adds the
 client's movable panel flag so the title bar can be dragged.
 
-V9 includes Mark Boss and Boss Sweep. Mark Boss saves a selected boss together
-with the anchor map, position, and current channel. Boss Sweep watches the
-large-map timer, pauses and clears the normal Metin queue, attacks only after a fresh
-100% HP reading, then uses a temporary one-target native queue after explicitly
-allowing the marked boss race so the client chases it instead of swinging in place.
-It checks each channel with one second of post-load settling and
-a three-second absence scan, then returns to the saved channel and position.
-This flow has passed the local mock only and needs incremental live testing.
+Mark Boss stores the selected boss type and exact world position separately
+from the Metin farming anchor. Boss Sweep watches the large-map timer, pauses
+and clears the normal Metin queue, and uses a temporary one-target native queue
+so the client chases the boss instead of swinging in place. It checks each
+channel with one second of post-load settling and a three-second absence scan,
+then returns to the original Metin channel and anchor. Return movement is
+retried until the character is within 120 units or the 30-second timeout is
+reached.
 
 V10 adds Auto Reaction, ON by default. When the yin-yang themed reaction
 window appears, it requests Start through that window and clicks each new lit
@@ -36,6 +72,25 @@ slot through the existing UI handler. It logs each action and pauses Boss Sweep
 deadlines until the reaction window closes. Local behavior passed the mock;
 live hit/score and attack resumption still need verification. The panel toggle
 can turn this automation off.
+
+V19 tightens native-queue safety. Hunter candidates must remain valid Metin
+entities and stay within the selected radius of both the current player and
+the fixed anchor immediately before admission. Stop and Hunter OFF now clear
+and disable the native queue. Rejected VIDs are not remembered as queued, and
+Boss Sweep relies on the one-target native queue instead of sending a separate
+pre-queue target selection.
+
+V20 fills the Hunter queue immediately on activation, up to the native capacity
+and the five-target feature limit. After that initial fill it waits until the
+queue has three or fewer entries and attempts one replacement per scan: 35%
+at three entries, 70% at two, and 100% at one or zero. Queue sizes four and
+five are left alone.
+
+V16 adds Save, Load, and Auto-load controls. The local
+`client_feature_config.txt` stores the radius, Metin anchor, boss identity and
+exact position, and Auto Reaction preference. Auto-load restores only these
+static settings; it never starts the scanner, Metin Hunter, Boss Sweep,
+attacks, or channel changes.
 
 Build the dedicated loader when changing its C++ code:
 
