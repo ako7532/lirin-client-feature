@@ -16,6 +16,7 @@ import net
 import nonplayer
 import player
 import ui
+import wndMgr
 
 try:
     INTEGER_TYPES = (int, long)
@@ -32,11 +33,15 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 20
+FEATURE_VERSION = 26
 HUNTER_LIMIT = 5
+HUNTER_ADD_DELAY_MIN = 0.65
+HUNTER_ADD_DELAY_MAX = 1.45
 HUNTER_REFILL_CHANCES = {3: 0.35, 2: 0.70, 1: 1.0, 0: 1.0}
 REACTION_POLL_SECONDS = 0.05
 REACTION_DISCOVERY_SECONDS = 5.0
+REACTION_SAFETY_POLL_SECONDS = 0.25
+REACTION_SAFETY_DISCOVERY_SECONDS = 1.0
 PLAYER_POLL_SECONDS = 0.1
 BOSS_TIMER_POLL_SECONDS = 0.5
 BOSS_ACTIVE_POLL_SECONDS = 0.2
@@ -58,6 +63,8 @@ BOSS_RETURN_POSITION = "return_position"
 
 PHASE_LOADING = 4
 PHASE_GAME = 5
+NATIVE_QUEUE_WRAPPER_ACTIVE = bool(
+    getattr(__main__, "_lirin_native_queue_wrapper", False))
 
 
 def ascii_text(value):
@@ -67,7 +74,12 @@ def ascii_text(value):
 
 
 def disk_log(message):
-    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), ascii_text(message))
+    now = time.time()
+    whole = int(now)
+    milliseconds = int((now - whole) * 1000.0)
+    line = "%s.%03d %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(whole)),
+                               milliseconds, ascii_text(message))
     data = line if sys.version_info[0] == 2 else line.encode("ascii")
     fd = os.open(LOG, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
     try:
@@ -169,21 +181,27 @@ def make_radar_dot(parent, x, y, size, color, fallback):
 
 
 class GameplayPhaseGuard(object):
-    """Observe the client's existing phase-window changes without replacing them."""
+    """Observe registrations of the client's existing phase UI windows."""
 
-    def __init__(self):
+    observer_version = 3
+
+    def __init__(self, original=None, original_disconnect=None):
         self.owner = None
         self.current_phase = None
-        self.original = net.SetPhaseWindow
+        self.original = original or net.SetPhaseWindow
+        self.original_disconnect = original_disconnect or net.Disconnect
 
         def phase_window(*args, **kwargs):
             result = self.original(*args, **kwargs)
-            if args:
+            # SetPhaseWindow registers a UI object for a phase index; it does
+            # not change the native network phase.  Ignore unregister calls.
+            if len(args) >= 2 and args[1] is not None:
                 try:
                     self.current_phase = int(args[0])
                     owner = self.owner
                     if owner is not None:
-                        owner.OnGameplayPhaseChanged(self.current_phase)
+                        owner.OnGameplayPhaseWindowRegistered(
+                            self.current_phase, args[1])
                 except Exception:
                     # A phase observer must never break the client's own transition.
                     pass
@@ -192,15 +210,100 @@ class GameplayPhaseGuard(object):
         self.phase_window = phase_window
         net.SetPhaseWindow = self.phase_window
 
+        def disconnect(*args, **kwargs):
+            owner = self.owner
+            if owner is not None:
+                try:
+                    owner.OnPythonNetDisconnect(args, kwargs,
+                                                traceback.extract_stack()[:-1])
+                except Exception:
+                    pass
+            return self.original_disconnect(*args, **kwargs)
+
+        self.disconnect = disconnect
+        net.Disconnect = self.disconnect
+
     def SetOwner(self, owner):
         self.owner = owner
 
 
 def get_gameplay_phase_guard():
     guard = getattr(__main__, "_lirin_gameplay_phase_guard", None)
-    if guard is None or not hasattr(guard, "SetOwner"):
-        guard = GameplayPhaseGuard()
+    if (guard is None or not hasattr(guard, "SetOwner") or
+            getattr(guard, "observer_version", 0) != GameplayPhaseGuard.observer_version):
+        original = getattr(guard, "original", net.SetPhaseWindow)
+        original_disconnect = getattr(guard, "original_disconnect", net.Disconnect)
+        guard = GameplayPhaseGuard(original, original_disconnect)
         __main__._lirin_gameplay_phase_guard = guard
+    return guard
+
+
+class MetinQueueAdmissionGuard(object):
+    """Mirror native per-VID exclusions set through the player bindings."""
+
+    observer_version = 1
+
+    def __init__(self, original_immune=None, original_untargetable=None):
+        self.owner = None
+        self.immune_vids = set()
+        self.untargetable_vids = set()
+        self.original_immune = (original_immune or
+                                player.SetMetinQueueVIDImmune)
+        self.original_untargetable = (original_untargetable or
+                                      player.SetMetinQueueVIDUntargetable)
+
+        def set_immune(vid, enabled):
+            result = self.original_immune(vid, enabled)
+            self._Update(self.immune_vids, "immune", vid, enabled)
+            return result
+
+        def set_untargetable(vid, enabled):
+            result = self.original_untargetable(vid, enabled)
+            self._Update(self.untargetable_vids, "untargetable", vid, enabled)
+            return result
+
+        self.set_immune = set_immune
+        self.set_untargetable = set_untargetable
+        player.SetMetinQueueVIDImmune = self.set_immune
+        player.SetMetinQueueVIDUntargetable = self.set_untargetable
+
+    def _Update(self, values, kind, vid, enabled):
+        vid = int(vid)
+        enabled = bool(enabled)
+        if vid == 0:
+            changed = bool(values)
+            values.clear()
+        elif enabled:
+            changed = vid not in values
+            values.add(vid)
+        else:
+            changed = vid in values
+            values.discard(vid)
+        owner = self.owner
+        if owner is not None and changed:
+            owner.OnNativeQueueVIDState(kind, vid, enabled)
+
+    def SetOwner(self, owner):
+        self.owner = owner
+
+    def RejectionReason(self, vid):
+        if int(vid) in self.untargetable_vids:
+            return "native untargetable VID"
+        if int(vid) in self.immune_vids:
+            return "native immune VID"
+        return None
+
+def get_metin_queue_admission_guard():
+    guard = getattr(__main__, "_lirin_metin_queue_admission_guard", None)
+    if (guard is None or not hasattr(guard, "SetOwner") or
+            getattr(guard, "observer_version", 0) !=
+            MetinQueueAdmissionGuard.observer_version):
+        original_immune = getattr(guard, "original_immune",
+                                  player.SetMetinQueueVIDImmune)
+        original_untargetable = getattr(
+            guard, "original_untargetable", player.SetMetinQueueVIDUntargetable)
+        guard = MetinQueueAdmissionGuard(original_immune, original_untargetable)
+        __main__._lirin_metin_queue_admission_guard = guard
     return guard
 
 
@@ -223,6 +326,7 @@ class MetinScanner(ui.BoardWithTitleBar):
     def __init__(self):
         ui.BoardWithTitleBar.__init__(self)
         self.feature_version = FEATURE_VERSION
+        self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
         self.AddFlag("movable")
         self.AddFlag("float")
         self.SetSize(820, 485)
@@ -234,7 +338,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hotkey_down = False
         self.hunter_enabled = False
         self.hunter_queued_vids = set()
+        self.hunter_logged_rejections = set()
         self.hunter_initial_fill = True
+        self.hunter_batch_add_count = 0
+        self.hunter_next_add = 0.0
         self.anchor_channel = None
         self.anchor_map = None
         self.boss_vnum = None
@@ -270,6 +377,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_last_ball = None
         self.reaction_last_error = None
         self.reaction_pause_started = None
+        self.reaction_native_paused = False
+        self.reaction_saved_hunter_enabled = False
+        self.reaction_saved_queue_enabled = False
+        self.reaction_saved_boss_attack = False
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -382,8 +493,12 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
+        self.queue_admission_guard = get_metin_queue_admission_guard()
+        self.queue_admission_guard.SetOwner(self)
         self.gameplay_phase = self.phase_guard.current_phase
         self.AddLine("Ready. Log file: metin_scanner.log")
+        self.AddLine("Native manual queue wrapper: %s" %
+                     ("active" if self.native_queue_wrapper_active else "UNAVAILABLE"))
         try:
             saved_config = read_config_file()
             self.config_autoload = saved_config.get("autoload", "0") == "1"
@@ -464,8 +579,8 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.radius_edit.SetText(str(radius))
             self.reaction_enabled = values.get("reaction_enabled", "0") == "1"
             self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
-            self.reaction_label.SetText("Watches the yin-yang reaction game" if self.reaction_enabled
-                                        else "Disabled; no reaction window discovery")
+            self.reaction_label.SetText("Watches and solves the reaction game" if self.reaction_enabled
+                                        else "Manual reaction; combat safety remains active")
             if values.get("anchor_enabled", "0") == "1":
                 anchor_channel = int(values["anchor_channel"])
                 if anchor_channel <= 0 or anchor_channel > 20:
@@ -545,14 +660,26 @@ class MetinScanner(ui.BoardWithTitleBar):
         except Exception:
             return False
 
+    def DisableAndClearMetinQueue(self):
+        """Disable/clear once; native true-to-false already performs a clear."""
+        try:
+            enabled = bool(player.MetinQueueIsEnabled())
+        except Exception:
+            enabled = None
+        if enabled:
+            player.MetinQueueSetEnabled(0)
+            return
+        player.MetinQueueClear()
+        if enabled is None:
+            player.MetinQueueSetEnabled(0)
+
     def ClearNativeAutomation(self):
         try:
             player.SetAttackKeyState(False)
         except Exception:
             pass
         try:
-            player.MetinQueueClear()
-            player.MetinQueueSetEnabled(0)
+            self.DisableAndClearMetinQueue()
         except Exception:
             pass
         try:
@@ -560,10 +687,19 @@ class MetinScanner(ui.BoardWithTitleBar):
         except Exception:
             pass
         self.hunter_queued_vids.clear()
+        self.hunter_logged_rejections.clear()
         self.hunter_initial_fill = True
+        self.hunter_batch_add_count = 0
+        self.hunter_next_add = 0.0
+
+    def HasActiveNativeAutomation(self):
+        return bool(self.hunter_enabled or self.boss_modes_paused or
+                    self.reaction_native_paused or
+                    (self.boss_enabled and self.boss_state == BOSS_ATTACK))
 
     def EmergencyStopForGameplayExit(self, reason):
-        self.ClearNativeAutomation()
+        if self.HasActiveNativeAutomation():
+            self.ClearNativeAutomation()
         self.running = False
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
@@ -581,24 +717,42 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Automation stopped: %s" % reason)
         self.gameplay_stopped = True
 
-    def OnGameplayPhaseChanged(self, phase):
+    def OnGameplayPhaseWindowRegistered(self, phase, window):
         self.gameplay_phase = int(phase)
         self.gameplay_available = (self.gameplay_phase == PHASE_GAME)
         self.gameplay_next_check = 0.0
+        window_name = ascii_text(getattr(type(window), "__name__", "unknown"))
         if self.gameplay_available:
             self.gameplay_stopped = False
-            self.AddLine("Playable game phase entered")
+            self.AddLine("Playable game window registered: %s" % window_name)
             if self.running and self.hunter_enabled and not self.boss_modes_paused:
                 try:
                     player.MetinQueueSetEnabled(1)
                 except Exception:
                     pass
             return
-        self.ClearNativeAutomation()
         if self.gameplay_phase == PHASE_LOADING:
+            if self.HasActiveNativeAutomation():
+                self.ClearNativeAutomation()
             self.state_label.SetText("Paused while the game is loading.")
             return
-        self.EmergencyStopForGameplayExit("client phase changed to %d" % self.gameplay_phase)
+        self.EmergencyStopForGameplayExit(
+            "phase window %d registered: %s" % (self.gameplay_phase, window_name))
+
+    def OnPythonNetDisconnect(self, args, kwargs, stack):
+        frames = []
+        for filename, line, function, source in stack[-8:]:
+            frames.append("%s:%d:%s" %
+                          (os.path.basename(filename), int(line), function))
+        self.AddLine("Python net.Disconnect called args=%r kwargs=%r stack=%s" %
+                     (args, kwargs, " > ".join(frames)))
+
+    def OnNativeQueueVIDState(self, kind, vid, enabled):
+        if int(vid) == 0:
+            self.AddLine("Native queue %s VID set cleared" % kind)
+        else:
+            self.AddLine("Native queue %s VID %d: %s" %
+                         (kind, int(vid), "ON" if enabled else "OFF"))
 
     def IsGameplayAvailable(self, now=None):
         if self.gameplay_phase is not None and self.gameplay_phase != PHASE_GAME:
@@ -610,9 +764,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.gameplay_next_check = now + PLAYER_POLL_SECONDS
         if not self.HasLiveConnection():
             self.gameplay_available = False
-            self.ClearNativeAutomation()
             if (self.boss_enabled and self.boss_state in
                     (BOSS_CHANGE_CHANNEL, BOSS_WAIT_CHANNEL, BOSS_SETTLE_CHANNEL)):
+                if self.HasActiveNativeAutomation():
+                    self.ClearNativeAutomation()
                 return False
             self.EmergencyStopForGameplayExit("game connection is closed")
             return False
@@ -742,16 +897,39 @@ class MetinScanner(ui.BoardWithTitleBar):
     def ToggleReaction(self):
         self.reaction_enabled = not self.reaction_enabled
         self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
+        self.reaction_label.SetText("Watches and solves the reaction game" if self.reaction_enabled
+                                    else "Manual reaction; combat safety remains active")
         self.reaction_next_poll = 0.0
         self.AddLine("Auto Reaction %s" % ("ON" if self.reaction_enabled else "OFF"))
 
+    def PauseNativeAutomationForReaction(self):
+        if self.reaction_native_paused:
+            return
+        self.reaction_saved_hunter_enabled = bool(self.hunter_enabled)
+        try:
+            self.reaction_saved_queue_enabled = bool(player.MetinQueueIsEnabled())
+        except Exception:
+            self.reaction_saved_queue_enabled = False
+        self.reaction_saved_boss_attack = bool(
+            self.boss_enabled and self.boss_state == BOSS_ATTACK)
+        self.reaction_native_paused = True
+        self.ClearNativeAutomation()
+        if self.reaction_saved_hunter_enabled:
+            self.hunter_label.SetText("Queue: paused for reaction")
+        if self.reaction_saved_boss_attack:
+            self.boss_label.SetText("Boss attack paused for reaction")
+
     def PollReactionGame(self, now):
-        if not self.reaction_enabled and self.reaction_pause_started is None:
-            return False
         if now < self.reaction_next_poll:
             return self.reaction_pause_started is not None
-        self.reaction_next_poll = now + (REACTION_POLL_SECONDS if self.reaction_window
-                                         else REACTION_DISCOVERY_SECONDS)
+        if self.reaction_window is not None:
+            interval = (REACTION_POLL_SECONDS if
+                        (self.reaction_enabled or self.reaction_pause_started is not None)
+                        else REACTION_SAFETY_POLL_SECONDS)
+        else:
+            interval = (REACTION_DISCOVERY_SECONDS if self.reaction_enabled
+                        else REACTION_SAFETY_DISCOVERY_SECONDS)
+        self.reaction_next_poll = now + interval
         try:
             window = self.reaction_window
             if window is None:
@@ -767,8 +945,12 @@ class MetinScanner(ui.BoardWithTitleBar):
                 return False
             self.reaction_next_poll = now + REACTION_POLL_SECONDS
             if self.reaction_pause_started is None:
-                self.AddLine("Reaction game visible; combat paused")
                 self.reaction_pause_started = now
+                self.PauseNativeAutomationForReaction()
+                if self.reaction_enabled:
+                    self.AddLine("Reaction game visible; native automation paused")
+                else:
+                    self.AddLine("Manual reaction required; native automation paused")
             if not self.reaction_enabled:
                 return True
             if bool(getattr(window, "isPlaying", False)):
@@ -822,6 +1004,26 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.boss_missing_since += elapsed
             if self.boss_target_missing_since is not None:
                 self.boss_target_missing_since += elapsed
+        if self.reaction_native_paused:
+            if (self.reaction_saved_boss_attack and self.boss_enabled and
+                    self.boss_state == BOSS_ATTACK):
+                self.StartBossFind()
+            elif (self.reaction_saved_hunter_enabled and self.hunter_enabled and
+                    self.running and self.reaction_saved_queue_enabled and
+                    self.gameplay_available):
+                try:
+                    player.MetinQueueSetEnabled(1)
+                    self.hunter_initial_fill = True
+                    self.hunter_label.SetText("Queue: refilling after reaction")
+                except Exception as exc:
+                    self.hunter_enabled = False
+                    self.hunter_button.SetText("OFF")
+                    self.hunter_label.SetText("Queue: reaction restore failed")
+                    self.AddLine("Reaction queue restore error: %s" % exc)
+            self.reaction_native_paused = False
+            self.reaction_saved_hunter_enabled = False
+            self.reaction_saved_queue_enabled = False
+            self.reaction_saved_boss_attack = False
         self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
 
     def ReadBossTimer(self):
@@ -903,6 +1105,9 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.anchor_position is None or self.anchor_channel is None):
             self.AddLine("Boss Sweep: select the boss and click Mark Boss first")
             return
+        if not self.native_queue_wrapper_active:
+            self.AddLine("Boss Sweep unavailable: native manual queue wrapper missing")
+            return
         if not self.running:
             self.Start()
             if not self.running:
@@ -943,8 +1148,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_button.SetText("OFF")
         self.hunter_queued_vids.clear()
         self.hunter_initial_fill = True
-        player.MetinQueueClear()
-        player.MetinQueueSetEnabled(0)
+        self.hunter_batch_add_count = 0
+        self.hunter_next_add = 0.0
+        self.DisableAndClearMetinQueue()
         self.boss_modes_paused = True
         self.hunter_label.SetText("Queue: paused for boss")
 
@@ -965,7 +1171,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.hunter_button.SetText("ON" if self.hunter_enabled else "OFF")
             if self.hunter_enabled:
                 self.hunter_initial_fill = True
-                self.hunter_label.SetText("Queue: refilling after boss")
+                self.hunter_batch_add_count = 0
+                self.hunter_next_add = 0.0
+                self.hunter_label.SetText("Queue: starting paced batch after boss")
             else:
                 self.hunter_label.SetText("Queue: boss sweep finished")
         self.boss_modes_paused = False
@@ -1033,6 +1241,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         return best
 
     def StartBossAttack(self, candidate):
+        if not self.native_queue_wrapper_active:
+            raise RuntimeError("native manual queue wrapper missing")
         distance, vid, px, py = candidate
         self.boss_target_vid = vid
         player.SetAttackKeyState(False)
@@ -1060,8 +1270,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             pass
         if self.boss_modes_paused:
             try:
-                player.MetinQueueClear()
-                player.MetinQueueSetEnabled(0)
+                self.DisableAndClearMetinQueue()
             except Exception:
                 pass
         try:
@@ -1296,7 +1505,8 @@ class MetinScanner(ui.BoardWithTitleBar):
     def Stop(self):
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep stopped", False)
-        self.ClearNativeAutomation()
+        if self.HasActiveNativeAutomation():
+            self.ClearNativeAutomation()
         self.running = False
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
@@ -1326,6 +1536,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.hunter_label.SetText("Queue: stopped and cleared")
             self.AddLine("Metin Hunter OFF; queue cleared")
             return
+        if not self.native_queue_wrapper_active:
+            self.AddLine("Metin Hunter unavailable: native manual queue wrapper missing")
+            return
         if not self.running:
             self.Start()
             if not self.running:
@@ -1341,7 +1554,10 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Metin Hunter unavailable: %s" % exc)
             return
         self.hunter_queued_vids.clear()
-        self.hunter_initial_fill = True
+        self.hunter_logged_rejections.clear()
+        self.hunter_initial_fill = (size == 0)
+        self.hunter_batch_add_count = 0
+        self.hunter_next_add = time.time() + random.uniform(0.2, 0.6)
         self.hunter_enabled = True
         self.hunter_button.SetText("ON")
         self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
@@ -1358,23 +1574,71 @@ class MetinScanner(ui.BoardWithTitleBar):
             return
         cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
         size = int(player.MetinQueueGetSize())
+        now = time.time()
         self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
-        if size == 0:
-            self.hunter_queued_vids.clear()
         if size >= cap:
             self.hunter_initial_fill = False
             return
-        fill_to_capacity = self.hunter_initial_fill
-        if not fill_to_capacity:
+        if now < self.hunter_next_add:
+            return
+        if not self.hunter_initial_fill:
             chance = HUNTER_REFILL_CHANCES.get(size, 0.0)
-            if chance <= 0.0 or random.random() >= chance:
+            if chance <= 0.0:
                 return
+            if chance < 1.0 and random.random() >= chance:
+                self.hunter_label.SetText("Queue: %d/%d; refill chance %d%%" %
+                                          (size, cap, int(chance * 100)))
+                return
+        if self.hunter_batch_add_count >= cap and self.hunter_initial_fill:
+            self.hunter_initial_fill = False
+            return
         for distance, vid, name in sorted(candidates):
             if vid in self.hunter_queued_vids:
                 continue
             try:
                 vnum = chr.GetVirtualNumber(vid)
                 if not nonplayer.IsMonsterStone(vnum):
+                    continue
+                is_stone = getattr(chr, "IsStone", None)
+                if not callable(is_stone) or not is_stone(vid):
+                    reason = "native actor is not a stone"
+                    rejection = (int(vid), reason)
+                    if rejection not in self.hunter_logged_rejections:
+                        self.hunter_logged_rejections.add(rejection)
+                        self.AddLine("Skipped %s [VID %d]: %s" %
+                                     (name or "Metin", vid, reason))
+                    continue
+                get_project = getattr(chr, "GetProjectPosition", None)
+                if (not callable(get_project) or
+                        not callable(getattr(wndMgr, "GetScreenWidth", None)) or
+                        not callable(getattr(wndMgr, "GetScreenHeight", None))):
+                    reason = "screen-pick projection is unavailable"
+                    rejection = (int(vid), reason)
+                    if rejection not in self.hunter_logged_rejections:
+                        self.hunter_logged_rejections.add(rejection)
+                        self.AddLine("Skipped %s [VID %d]: %s" %
+                                     (name or "Metin", vid, reason))
+                    continue
+                screen_x, screen_y = get_project(vid, 0)[:2]
+                screen_width = int(wndMgr.GetScreenWidth())
+                screen_height = int(wndMgr.GetScreenHeight())
+                if (screen_width <= 0 or screen_height <= 0 or
+                        screen_x < 0 or screen_y < 0 or
+                        screen_x >= screen_width or screen_y >= screen_height):
+                    reason = "actor is outside the screen-pick area"
+                    rejection = (int(vid), reason)
+                    if rejection not in self.hunter_logged_rejections:
+                        self.hunter_logged_rejections.add(rejection)
+                        self.AddLine("Skipped %s [VID %d]: %s" %
+                                     (name or "Metin", vid, reason))
+                    continue
+                reason = self.queue_admission_guard.RejectionReason(vid)
+                if reason is not None:
+                    rejection = (int(vid), reason)
+                    if rejection not in self.hunter_logged_rejections:
+                        self.hunter_logged_rejections.add(rejection)
+                        self.AddLine("Skipped %s [VID %d]: %s" %
+                                     (name or "Metin", vid, reason))
                     continue
                 px, py = chr.GetPixelPosition(vid)[:2]
                 player_x, player_y = player.GetMainCharacterPosition()[:2]
@@ -1388,25 +1652,47 @@ class MetinScanner(ui.BoardWithTitleBar):
                                        (py - center_y) ** 2) ** 0.5)
                 if circle_distance > self.radius:
                     continue
+                can_attack = getattr(player, "CanAttackInstance", None)
+                if callable(can_attack) and not can_attack(vid):
+                    continue
             except Exception:
                 continue  # Entity disappeared or changed before queue admission.
+            old_size = size
+            add_started = time.time()
             result = player.MetinQueueAdd(vid)
+            add_elapsed_ms = (time.time() - add_started) * 1000.0
             new_size = int(player.MetinQueueGetSize())
             if new_size > size:
                 self.hunter_queued_vids.add(vid)
                 size = new_size
+                self.hunter_batch_add_count += 1
+                delay = random.uniform(HUNTER_ADD_DELAY_MIN,
+                                       HUNTER_ADD_DELAY_MAX)
+                self.hunter_next_add = now + delay
                 self.hunter_label.SetText("Queue: %d/%d" % (new_size, cap))
-                self.AddLine("Queued %s [VID %d], distance %d (%d/%d)" %
-                             (name or "Metin", vid, distance, new_size, cap))
-                if not fill_to_capacity or size >= cap:
+                self.AddLine("Queued %s [VID %d], distance %d, queue %d->%d/%d, call %.2fms; next add >= %.2fs" %
+                             (name or "Metin", vid, distance, old_size, new_size,
+                              cap, add_elapsed_ms, delay))
+                if self.hunter_initial_fill and (self.hunter_batch_add_count >= cap or
+                                                 size >= cap):
                     self.hunter_initial_fill = False
-                    return
-                continue
-            if result:
-                self.hunter_queued_vids.add(vid)
-            else:
-                self.AddLine("Queue rejected VID %d" % vid)
+                    self.AddLine("Metin Hunter initial queue filled with %d additions" %
+                                 self.hunter_batch_add_count)
                 return
+            if not result:
+                self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
+                             (vid, old_size, new_size, add_elapsed_ms))
+            else:
+                self.AddLine("Queue accepted VID %d without size change, queue %d->%d, call %.2fms; no retry" %
+                             (vid, old_size, new_size, add_elapsed_ms))
+                self.hunter_queued_vids.add(vid)
+            self.hunter_next_add = now + random.uniform(HUNTER_ADD_DELAY_MIN,
+                                                        HUNTER_ADD_DELAY_MAX)
+            return
+        if self.hunter_initial_fill and self.hunter_batch_add_count:
+            self.hunter_initial_fill = False
+            self.AddLine("Metin Hunter initial queue armed with %d additions" %
+                         self.hunter_batch_add_count)
 
     def Scan(self, player_position):
         vids = visible_vids()

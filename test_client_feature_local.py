@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -46,6 +47,11 @@ for name in ("Window", "BoardWithTitleBar", "TextLine", "Button", "SlotBar", "Ed
 ui.GenerateColor = lambda *components: 0xFFFFFFFF
 sys.modules["ui"] = ui
 
+wndMgr = types.ModuleType("wndMgr")
+wndMgr.GetScreenWidth = lambda: 1920
+wndMgr.GetScreenHeight = lambda: 1080
+sys.modules["wndMgr"] = wndMgr
+
 app = types.ModuleType("app")
 app.DIK_LCONTROL = 29
 app.DIK_F8 = 66
@@ -65,6 +71,8 @@ net.SetChannelNumber = lambda channel: channel_state.__setitem__("current", int(
 net.IsConnect = lambda: connection_state["connected"]
 phase_window_calls = []
 net.SetPhaseWindow = lambda phase, window: phase_window_calls.append((phase, window))
+disconnect_calls = []
+net.Disconnect = lambda *args, **kwargs: disconnect_calls.append((args, kwargs))
 sys.modules["net"] = net
 
 chr_module = types.ModuleType("chr")
@@ -84,6 +92,12 @@ chr_module.GetNameByVID = lambda vid: {
     7: "Jealousy Metin", 8: "Battle Metin", 9: "Jealousy Metin",
     10: "Test Boss"
 }[vid]
+actor_stone_overrides = {}
+chr_module.IsStone = lambda vid: actor_stone_overrides.get(
+    vid, chr_module.GetVirtualNumber(vid) in (8003, 8004))
+project_position_overrides = {}
+chr_module.GetProjectPosition = lambda vid, height: project_position_overrides.get(
+    vid, (960, 540))
 move_requests = []
 chr_module.MoveToDestPosition = lambda vid, x, y: move_requests.append((vid, x, y))
 sys.modules["chr"] = chr_module
@@ -97,9 +111,18 @@ player_position = [0, 0, 0]
 player.GetMainCharacterPosition = lambda: tuple(player_position)
 queue = []
 queue_state = {"enabled": False, "max_size": 5}
+queue_clear_state = {"count": 0}
 allowed_queue_races = set()
 player.MetinQueueIsEnabled = lambda: queue_state["enabled"]
-player.MetinQueueSetEnabled = lambda enabled: queue_state.__setitem__("enabled", bool(enabled))
+def clear_metin_queue():
+    queue_clear_state["count"] += 1
+    queue[:] = []
+def set_metin_queue_enabled(enabled):
+    old_enabled = queue_state["enabled"]
+    queue_state["enabled"] = bool(enabled)
+    if old_enabled and not queue_state["enabled"]:
+        clear_metin_queue()
+player.MetinQueueSetEnabled = set_metin_queue_enabled
 player.MetinQueueGetSize = lambda: len(queue)
 player.MetinQueueGetMaxSize = lambda: queue_state["max_size"]
 def add_metin(vid):
@@ -110,8 +133,23 @@ def add_metin(vid):
     queue.append(vid)
     return True
 player.MetinQueueAdd = add_metin
-player.MetinQueueClear = lambda: queue.__setitem__(slice(None), [])
+player.MetinQueueClear = clear_metin_queue
 player.AddMetinQueueAllowedRace = lambda vnum: allowed_queue_races.add(int(vnum))
+player.CanAttackInstance = lambda vid: vid in range(1, 11)
+native_immune_vids = set()
+native_untargetable_vids = set()
+def set_native_vid_state(values, vid, enabled):
+    vid = int(vid)
+    if vid == 0:
+        values.clear()
+    elif enabled:
+        values.add(vid)
+    else:
+        values.discard(vid)
+player.SetMetinQueueVIDImmune = lambda vid, enabled: set_native_vid_state(
+    native_immune_vids, vid, enabled)
+player.SetMetinQueueVIDUntargetable = lambda vid, enabled: set_native_vid_state(
+    native_untargetable_vids, vid, enabled)
 target_state = {"vid": 0, "attack": False, "mouse": 17}
 player.GetTargetVID = lambda: target_state["vid"]
 player.SetTarget = lambda vid: target_state.__setitem__("vid", int(vid))
@@ -196,6 +234,7 @@ target_board = TargetBoard()
 boss_timer = CursedBossAtlasPanel()
 channel_dialog = MoveChannelDialog()
 reaction_window = ReactionGameWindow()
+sys.modules["__main__"]._lirin_native_queue_wrapper = True
 
 source_path = Path(__file__).with_name("client_feature.py")
 source = source_path.read_text(encoding="ascii")
@@ -212,20 +251,61 @@ with tempfile.TemporaryDirectory() as directory:
     panel = sys.modules["__main__"]._lirin_metin_scanner
     assert panel.radius == 2500 and panel.radius_edit.GetText() == "2500"
     assert [label.text for label in panel.map_compass] == ["N", "S", "E", "W"]
+    panel.native_queue_wrapper_active = False
+    panel.ToggleMetinHunter()
+    assert not panel.hunter_enabled
+    try:
+        panel.StartBossAttack((100, 10, 100, 100))
+        raise AssertionError("Boss attack must require the native queue wrapper")
+    except RuntimeError as exc:
+        assert "native manual queue wrapper missing" in str(exc)
+    panel.native_queue_wrapper_active = True
+    # Scanner-only Stop must not clear a native queue the feature does not own.
+    panel.running = True
+    queue_state["enabled"] = True
+    queue[:] = [1]
+    target_state["vid"] = 1
+    panel.Stop()
+    assert queue == [1] and queue_state["enabled"] and target_state["vid"] == 1
+    queue[:] = []
+    queue_state["enabled"] = False
+    target_state["vid"] = 0
     original_find_runtime = panel.FindRuntimeObject
     disabled_discovery_calls = []
     panel.reaction_enabled = False
-    panel.FindRuntimeObject = lambda name, methods: disabled_discovery_calls.append(name)
+    def find_disabled_reaction(name, methods):
+        disabled_discovery_calls.append(name)
+        return reaction_window if name == "ReactionGameWindow" else None
+    panel.FindRuntimeObject = find_disabled_reaction
     reaction_window.visible = True
-    panel.reaction_window = reaction_window
+    panel.reaction_window = None
     disabled_start_count = reaction_window.start_count
     disabled_click_count = len(reaction_window.clicked)
-    assert not panel.PollReactionGame(9.0)
-    assert disabled_discovery_calls == []
+    panel.running = True
+    panel.hunter_enabled = True
+    queue_state["enabled"] = True
+    queue[:] = [1, 2]
+    target_state["vid"] = 1
+    target_state["attack"] = True
+    assert panel.PollReactionGame(9.0)
+    assert disabled_discovery_calls == ["ReactionGameWindow"]
     assert reaction_window.start_count == disabled_start_count
     assert len(reaction_window.clicked) == disabled_click_count
+    assert not queue and not queue_state["enabled"]
+    assert target_state["vid"] == 0 and not target_state["attack"]
+    assert panel.hunter_enabled and panel.reaction_native_paused
+    assert "Manual reaction required" in Path(directory, "metin_scanner.log").read_text(encoding="ascii")
+    reaction_window.visible = False
+    panel.reaction_next_poll = 0.0
+    assert not panel.PollReactionGame(9.1)
+    panel.ResumeAfterReaction(9.1)
+    assert queue_state["enabled"] and panel.hunter_initial_fill
+    clear_count = queue_clear_state["count"]
+    panel.ClearNativeAutomation()
+    assert queue_clear_state["count"] == clear_count + 1
+    panel.hunter_enabled = False
+    panel.running = False
     panel.reaction_enabled = True
-    panel.reaction_window = None
     panel.reaction_next_poll = 0.0
     panel.FindRuntimeObject = lambda name, methods: (
         reaction_window if name == "ReactionGameWindow"
@@ -301,52 +381,86 @@ with tempfile.TemporaryDirectory() as directory:
     )
     panel.ToggleMetinHunter()
     assert panel.hunter_enabled and queue_state["enabled"]
-    panel.next_scan = 0
-    panel.OnUpdate()
+    for expected_size in range(1, 6):
+        panel.hunter_next_add = 0
+        panel.next_scan = 0
+        panel.OnUpdate()
+        assert len(queue) == expected_size, queue
     assert queue == [1, 4, 5, 6, 2], queue
     assert not panel.hunter_initial_fill
     panel.next_scan = 0
     panel.OnUpdate()
     assert queue == [1, 4, 5, 6, 2], queue
 
-    # Refill is increasingly likely at 3/2/1 entries and guaranteed at one.
-    feed_function = getattr(panel.FeedMetinQueue, "__func__", panel.FeedMetinQueue)
-    feature_random = feed_function.__globals__["random"]
-    original_random = feature_random.random
+    # Continuous refill uses increasing 35/70/100 percent chances at 3/2/1.
     panel.hunter_initial_fill = False
     panel.hunter_queued_vids.clear()
     queue[:] = [90, 91, 92]
-    feature_random.random = lambda: 0.99
+    feature_random = panel.FeedMetinQueue.__globals__["random"]
+    original_random = feature_random.random
+    feature_random.random = lambda: 0.90
+    panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert queue == [90, 91, 92]
-    feature_random.random = lambda: 0.0
+    feature_random.random = lambda: 0.10
+    panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert queue == [90, 91, 92, 7]
-    panel.hunter_queued_vids.clear()
     queue[:] = [90, 91]
-    feature_random.random = lambda: 0.69
-    panel.FeedMetinQueue([(1500, 8, "Battle Metin")])
-    assert queue == [90, 91, 8]
     panel.hunter_queued_vids.clear()
+    feature_random.random = lambda: 0.69
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert queue == [90, 91, 7]
     queue[:] = [90]
-    feature_random.random = lambda: 0.999999
-    panel.FeedMetinQueue([(1600, 9, "Jealousy Metin")])
-    assert queue == [90, 9]
+    panel.hunter_queued_vids.clear()
+    feature_random.random = lambda: (_ for _ in ()).throw(
+        AssertionError("size-one refill must be guaranteed"))
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert queue == [90, 7]
+    queue[:] = []
+    panel.hunter_queued_vids.clear()
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert queue == [7]
     feature_random.random = original_random
-    panel.ToggleMetinHunter()
-    assert not panel.hunter_enabled and not queue and not queue_state["enabled"]
-    queue[:] = [90, 91, 92, 93]
-    panel.ToggleMetinHunter()
-    panel.next_scan = 0
-    panel.OnUpdate()
-    assert len(queue) == 5 and queue[-1] == 1, queue
-    panel.next_scan = 0
-    panel.OnUpdate()
-    assert len(queue) == 5, queue
+
+    # Native actor type and per-VID exclusions are enforced before low-level add.
+    queue[:] = []
+    panel.hunter_queued_vids.clear()
+    actor_stone_overrides[7] = False
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert not queue
+    actor_stone_overrides.pop(7)
+    project_position_overrides[7] = (-100, -100)
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert not queue
+    project_position_overrides.pop(7)
+    player.SetMetinQueueVIDImmune(7, 1)
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert not queue
+    player.SetMetinQueueVIDImmune(7, 0)
+    player.SetMetinQueueVIDUntargetable(7, 1)
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert not queue
+    player.SetMetinQueueVIDUntargetable(7, 0)
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert queue == [7]
+    queue_guard_log = log_path.read_text(encoding="ascii")
+    assert "native immune VID" in queue_guard_log
+    assert "native untargetable VID" in queue_guard_log
+    assert "outside the screen-pick area" in queue_guard_log
     panel.ToggleMetinHunter()
     queue[:] = [90, 91, 92]
     queue_state["max_size"] = 3
     panel.ToggleMetinHunter()
+    panel.hunter_next_add = 0
     panel.next_scan = 0
     panel.OnUpdate()
     assert len(queue) == 3 and "3/3" in panel.hunter_label.text, queue
@@ -362,6 +476,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert panel.anchor_position == (0, 0)
     player_position[0] = 2000
     panel.ToggleMetinHunter()
+    panel.hunter_next_add = 0
     panel.next_scan = 0
     panel.player_next_poll = 0
     panel.watcher.OnUpdate()
@@ -483,6 +598,7 @@ with tempfile.TemporaryDirectory() as directory:
     panel.radius_edit.SetText("2000")
     panel.next_scan = 0
     panel.OnUpdate()
+    panel.hunter_next_add = 0
     panel.next_scan = 0
     panel.OnUpdate()
     assert queue == [2, 1], queue
@@ -496,14 +612,23 @@ with tempfile.TemporaryDirectory() as directory:
     # Queue admission revalidates the entity and remembers only accepted VIDs.
     panel.running = True
     panel.hunter_enabled = True
+    panel.hunter_initial_fill = True
+    panel.hunter_batch_add_count = 0
+    panel.hunter_next_add = 0
     queue_state["enabled"] = True
     panel.radius = 2000
     player_position[0] = 0
+    original_can_attack = player.CanAttackInstance
+    player.CanAttackInstance = lambda vid: False
+    panel.FeedMetinQueue([(500, 1, "Battle Metin")])
+    assert 1 not in panel.hunter_queued_vids and not queue
+    player.CanAttackInstance = original_can_attack
     original_queue_add = player.MetinQueueAdd
     player.MetinQueueAdd = lambda vid: False
     panel.FeedMetinQueue([(500, 1, "Battle Metin")])
     assert 1 not in panel.hunter_queued_vids and not queue
     player.MetinQueueAdd = original_queue_add
+    panel.hunter_next_add = 0
     panel.FeedMetinQueue([(100, 9999, "Stale Metin")])
     assert 9999 not in panel.hunter_queued_vids and not queue
     panel.Stop()
@@ -523,6 +648,10 @@ with tempfile.TemporaryDirectory() as directory:
     net.SetPhaseWindow(5, object())
     assert queue_state["enabled"]
 
+    net.Disconnect("local-diagnostic")
+    assert disconnect_calls[-1][0] == ("local-diagnostic",)
+    assert "Python net.Disconnect called" in log_path.read_text(encoding="ascii")
+
     # A socket loss is detected before the client eventually changes to login phase.
     connection_state["connected"] = False
     panel.gameplay_next_check = 0
@@ -534,6 +663,8 @@ with tempfile.TemporaryDirectory() as directory:
     panel.gameplay_next_check = 0
     panel.Start()
     panel.ToggleMetinHunter()
+    assert panel.running and panel.hunter_enabled
+    net.SetPhaseWindow(1, None)
     assert panel.running and panel.hunter_enabled
     net.SetPhaseWindow(1, object())
     assert phase_window_calls[-1][0] == 1

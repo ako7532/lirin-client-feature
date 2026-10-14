@@ -26,7 +26,94 @@ static char g_feature_dll_name[MAX_PATH] = {};
 static const char* g_snapshot_error = "snapshot not attempted";
 static ULONGLONG g_last_snapshot_error = 0;
 static constexpr ULONG_PTR RVA_CHARACTER_MANAGER = 0x07A6B450;
+static constexpr ULONG_PTR RVA_PLAYER_SINGLETON = 0x07A6B6B0;
+static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_METHOD = 0x072ECA18;
+static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_BINDING = 0x003F6360;
+static constexpr ULONG_PTR RVA_PARSE_TUPLE_INTEGER = 0x00897B40;
+static constexpr ULONG_PTR RVA_ARGUMENT_ERROR = 0x00897E40;
+static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00A6B650;
+static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x066E218C;
+static constexpr ULONG_PTR RVA_GET_MAIN_ACTOR = 0x003D1DA0;
+static constexpr ULONG_PTR RVA_ACTOR_CLICK = 0x003EBDD0;
 static void AppendStatus(const wchar_t* status_path, const char* message);
+static BYTE* g_game_base = nullptr;
+static bool g_native_queue_wrapper_installed = false;
+
+using ParseTupleInteger = char (*)(void*, int, int*);
+using ArgumentError = void* (*)(int);
+using BuildValue = void* (*)(const char*, ...);
+using GetMainActor = void* (*)(void*);
+using ActorClick = void (*)(void*, void*, int, char);
+
+static void* NativeMetinQueueAdd(void*, void* args) {
+    auto parse_integer = reinterpret_cast<ParseTupleInteger>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
+    auto argument_error = reinterpret_cast<ArgumentError>(g_game_base + RVA_ARGUMENT_ERROR);
+    auto build_value = reinterpret_cast<BuildValue>(g_game_base + RVA_BUILD_VALUE);
+    int vid = 0;
+    if (!parse_integer(args, 0, &vid)) return argument_error(0);
+
+    int added = 0;
+    __try {
+        BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+        if (player) {
+            auto get_main_actor = reinterpret_cast<GetMainActor>(g_game_base + RVA_GET_MAIN_ACTOR);
+            void* main_actor = get_main_actor(player);
+            if (main_actor) {
+                auto begin = *reinterpret_cast<DWORD**>(player + 0x4588);
+                auto end = *reinterpret_cast<DWORD**>(player + 0x4590);
+                size_t before = 0;
+                if (begin && end && end >= begin) before = static_cast<size_t>(end - begin);
+                auto actor_click = reinterpret_cast<ActorClick>(g_game_base + RVA_ACTOR_CLICK);
+                // Zero is the normal left-button actor-click path used by
+                // CPythonPlayer::SetMouseState.
+                actor_click(player, main_actor, vid, 0);
+                begin = *reinterpret_cast<DWORD**>(player + 0x4588);
+                end = *reinterpret_cast<DWORD**>(player + 0x4590);
+                size_t after = 0;
+                if (begin && end && end >= begin) after = static_cast<size_t>(end - begin);
+                added = after > before;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AppendStatus(g_feature_status_path, "native queue wrapper access fault");
+        added = 0;
+    }
+    return build_value(reinterpret_cast<const char*>(g_game_base + RVA_INTEGER_FORMAT), added);
+}
+
+static bool InstallNativeMetinQueueWrapper(BYTE* base) {
+    void** method = reinterpret_cast<void**>(base + RVA_METIN_QUEUE_ADD_METHOD);
+    void* expected = base + RVA_METIN_QUEUE_ADD_BINDING;
+    if (*method != expected) {
+        AppendStatus(g_feature_status_path,
+                     "native queue wrapper skipped: binding already changed");
+        return false;
+    }
+    DWORD old_protection = 0;
+    if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) {
+        AppendStatus(g_feature_status_path,
+                     "native queue wrapper skipped: method table is protected");
+        return false;
+    }
+    *method = reinterpret_cast<void*>(&NativeMetinQueueAdd);
+    DWORD ignored = 0;
+    VirtualProtect(method, sizeof(*method), old_protection, &ignored);
+    g_native_queue_wrapper_installed = true;
+    AppendStatus(g_feature_status_path, "native manual queue wrapper installed");
+    return true;
+}
+
+static void RestoreNativeMetinQueueWrapper() {
+    if (!g_native_queue_wrapper_installed || !g_game_base) return;
+    void** method = reinterpret_cast<void**>(g_game_base + RVA_METIN_QUEUE_ADD_METHOD);
+    if (*method != reinterpret_cast<void*>(&NativeMetinQueueAdd)) return;
+    DWORD old_protection = 0;
+    if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) return;
+    *method = g_game_base + RVA_METIN_QUEUE_ADD_BINDING;
+    DWORD ignored = 0;
+    VirtualProtect(method, sizeof(*method), old_protection, &ignored);
+    g_native_queue_wrapper_installed = false;
+}
 
 struct CharacterNode {
     CharacterNode* left;
@@ -216,12 +303,6 @@ static DWORD WINAPI RunProbe(void* module_ptr) {
         if (*c == '\\') *c = '/';
         if (*c == '\'') { AppendStatus(status_path, "quote in script path unsupported"); return 9; }
     }
-    char source[MAX_PATH * 3 + 40] = {};
-    if (sprintf_s(source, "execfile(r'%s')", script_path_utf8) <= 0) {
-        AppendStatus(status_path, "Python source construction failed");
-        return 10;
-    }
-
     auto ensure = reinterpret_cast<GilEnsure>(base + RVA_GIL_ENSURE);
     auto release = reinterpret_cast<GilRelease>(base + RVA_GIL_RELEASE);
     auto add_module = reinterpret_cast<ImportAddModule>(base + RVA_IMPORT_ADD_MODULE);
@@ -241,10 +322,33 @@ static DWORD WINAPI RunProbe(void* module_ptr) {
     AppendStatus(status_path, "waiting for Python GIL");
     int gil_state = ensure();
     AppendStatus(status_path, "Python GIL acquired");
+#ifdef USE_FEATURE_SCRIPT
+    g_game_base = base;
+    InstallNativeMetinQueueWrapper(base);
+    char source[MAX_PATH * 3 + 120] = {};
+    if (sprintf_s(source,
+                  "import __main__; __main__._lirin_native_queue_wrapper=%s; execfile(r'%s')",
+                  g_native_queue_wrapper_installed ? "True" : "False", script_path_utf8) <= 0) {
+        RestoreNativeMetinQueueWrapper();
+        release(gil_state);
+        AppendStatus(status_path, "Python source construction failed");
+        return 10;
+    }
+#else
+    char source[MAX_PATH * 3 + 32] = {};
+    if (sprintf_s(source, "execfile(r'%s')", script_path_utf8) <= 0) {
+        release(gil_state);
+        AppendStatus(status_path, "Python source construction failed");
+        return 10;
+    }
+#endif
     void* main_module = add_module("__main__");
     void* main_dict = main_module ? get_dict(main_module) : nullptr;
     void* result = main_dict ? run_string(source, 0x101, main_dict, main_dict, nullptr) : nullptr;
     AppendStatus(status_path, result ? "Python script returned successfully" : "Python call failed");
+#ifdef USE_FEATURE_SCRIPT
+    if (!result) RestoreNativeMetinQueueWrapper();
+#endif
     // A single probe run leaves one result reference; avoid guessing a deallocator address.
     release(gil_state);
     AppendStatus(status_path, "Python GIL released");
@@ -297,7 +401,14 @@ static LRESULT CALLBACK WindowHook(int code, WPARAM wparam, LPARAM lparam) {
             return next;
         }
         InterlockedExchange(&g_ready, 1);
-        return CallNextHookEx(g_hook, code, wparam, lparam);
+        // The feature snapshot has its own worker thread.  Keeping this hook
+        // installed would make every later window message pass through the
+        // injected DLL and synchronously re-read the marker file for no gain.
+        HHOOK hook = g_hook;
+        g_hook = nullptr;
+        LRESULT next = CallNextHookEx(hook, code, wparam, lparam);
+        if (hook) UnhookWindowsHookEx(hook);
+        return next;
 #else
         (void)probe_result;
         HHOOK hook = g_hook;

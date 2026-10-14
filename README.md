@@ -86,6 +86,60 @@ queue has three or fewer entries and attempts one replacement per scan: 35%
 at three entries, 70% at two, and 100% at one or zero. Queue sizes four and
 five are left alone.
 
+V21 separates reaction safety from automatic solving. The feature now watches
+for a visible reaction window even when Auto Reaction is OFF. It immediately
+clears/disables the native queue and releases attack/target state. OFF leaves
+the challenge for manual completion; ON uses the existing Start/click handler.
+Hunter is restored and refilled only after the reaction window closes. A Boss
+attack interrupted by the reaction restarts through the normal boss-find path.
+
+V22 is a one-shot Hunter diagnostic for the repeated remote disconnect. Hunter
+adds one initial batch of up to five valid Metins, never replenishes that batch,
+and automatically clears/disables itself after the native queue becomes empty.
+This isolates initial queue processing from the repeated queue-add cadence.
+
+V23 follows the client click path more closely. Each candidate must also pass
+the exposed live `CanAttackInstance` check. Adds are serialized with a random
+0.65-1.45 second delay instead of a same-frame burst. Once a batch is armed it
+is never topped up; after the queue becomes completely empty, Hunter waits a
+random 8-15 seconds before beginning another paced batch.
+
+V24 removes the successful loader's no-longer-needed persistent window hook.
+It also treats `net.SetPhaseWindow` correctly as phase-window registration,
+ignores registrations whose window is `None`, avoids duplicate exit cleanup,
+and does not clear a native queue or target during scanner-only Stop/exit when
+Hunter, Boss Sweep, and reaction safety do not own active automation. Auto
+Reaction behavior and Hunter batching are unchanged. Queue shutdown now also
+uses the native enabled-to-disabled clear instead of issuing a second explicit
+clear first.
+
+V25 restores continuous Hunter refill: after the paced initial fill, queue
+sizes 3/2/1 use 35/70/100 percent refill chances and zero refills immediately
+when a candidate exists. It closes the verified actor-type difference from
+manual queue admission by requiring the live actor to pass `chr.IsStone`, and
+it observes the client's Python immune/untargetable VID setters before calling
+the low-level queue binding. Queue-add logs now include millisecond
+timestamps, pre/post sizes, and call duration, and Python `net.Disconnect`
+calls record a bounded caller stack. These checks remove a concrete unsafe
+admission path but are not proof of the remote-close cause. Exclusions already
+present before injection, or changed only through native code, are not visible
+to the observer. The next test must remain Hunter-only with Auto Reaction and
+Boss Sweep off.
+
+V26 removes the remaining verified difference between scripted and manual
+queue admission. The stock Python `player.MetinQueueAdd` binding calls the
+low-level queue insertion routine directly; a real actor click instead passes
+through the native actor-click wrapper, which checks the live actor, the full
+queue predicate, button mode, a global application state, duplicate handling,
+and the 500 ms same-VID debounce. On the supported executable build, the
+feature loader redirects that Python binding to the native actor-click wrapper
+on the game's window/Python thread. Hunter also requires the actor's projected
+point to be on screen as a conservative approximation of the preceding mouse
+pick. If the exact wrapper cannot be installed, Hunter and Boss Sweep refuse to
+start. This is locally verified but still needs a fresh-client live test; it
+does not prove whether prior remote closes were caused by the bypass or by a
+server-side policy.
+
 V16 adds Save, Load, and Auto-load controls. The local
 `client_feature_config.txt` stores the radius, Metin anchor, boss identity and
 exact position, and Auto Reaction preference. Auto-load restores only these
