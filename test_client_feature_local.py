@@ -28,6 +28,12 @@ class Widget:
     def SetPosition(self, x, y):
         self.position = (x, y)
 
+    def SetEvent(self, callback):
+        self.event = callback
+
+    def SetCloseEvent(self, callback):
+        self.close_event = callback
+
     def GetText(self):
         return self.text
 
@@ -46,11 +52,6 @@ for name in ("Window", "BoardWithTitleBar", "TextLine", "Button", "SlotBar", "Ed
     setattr(ui, name, type(name, (Widget,), {}))
 ui.GenerateColor = lambda *components: 0xFFFFFFFF
 sys.modules["ui"] = ui
-
-wndMgr = types.ModuleType("wndMgr")
-wndMgr.GetScreenWidth = lambda: 1920
-wndMgr.GetScreenHeight = lambda: 1080
-sys.modules["wndMgr"] = wndMgr
 
 app = types.ModuleType("app")
 app.DIK_LCONTROL = 29
@@ -434,11 +435,15 @@ with tempfile.TemporaryDirectory() as directory:
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert not queue
     actor_stone_overrides.pop(7)
+    # V27 deliberately leaves camera direction out of admission; the exact
+    # native actor-click wrapper remains the authoritative eligibility gate.
     project_position_overrides[7] = (-100, -100)
     panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert not queue
+    assert queue == [7]
     project_position_overrides.pop(7)
+    queue[:] = []
+    panel.hunter_queued_vids.clear()
     player.SetMetinQueueVIDImmune(7, 1)
     panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
@@ -455,7 +460,6 @@ with tempfile.TemporaryDirectory() as directory:
     queue_guard_log = log_path.read_text(encoding="ascii")
     assert "native immune VID" in queue_guard_log
     assert "native untargetable VID" in queue_guard_log
-    assert "outside the screen-pick area" in queue_guard_log
     panel.ToggleMetinHunter()
     queue[:] = [90, 91, 92]
     queue_state["max_size"] = 3
@@ -489,6 +493,18 @@ with tempfile.TemporaryDirectory() as directory:
     panel.watcher.OnUpdate()
     assert queue == [2], queue
     assert panel.map_player.visible
+
+    running_before_minimize = panel.running
+    hunter_before_minimize = panel.hunter_enabled
+    queue_before_minimize = list(queue)
+    assert "minimize_button" not in panel.__dict__
+    panel.close_event()
+    assert not panel.visible
+    assert panel.running == running_before_minimize
+    assert panel.hunter_enabled == hunter_before_minimize
+    assert queue == queue_before_minimize
+    panel.TogglePanel()
+    assert panel.visible
 
     pressed_keys.update((app.DIK_LCONTROL, app.DIK_F8))
     panel.watcher.OnUpdate()

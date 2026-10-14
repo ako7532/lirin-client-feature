@@ -123,8 +123,8 @@ timestamps, pre/post sizes, and call duration, and Python `net.Disconnect`
 calls record a bounded caller stack. These checks remove a concrete unsafe
 admission path but are not proof of the remote-close cause. Exclusions already
 present before injection, or changed only through native code, are not visible
-to the observer. The next test must remain Hunter-only with Auto Reaction and
-Boss Sweep off.
+to the observer. The later controlled Hunter tests kept Auto Reaction and Boss
+Sweep off.
 
 V26 removes the remaining verified difference between scripted and manual
 queue admission. The stock Python `player.MetinQueueAdd` binding calls the
@@ -136,9 +136,19 @@ feature loader redirects that Python binding to the native actor-click wrapper
 on the game's window/Python thread. Hunter also requires the actor's projected
 point to be on screen as a conservative approximation of the preceding mouse
 pick. If the exact wrapper cannot be installed, Hunter and Boss Sweep refuse to
-start. This is locally verified but still needs a fresh-client live test; it
-does not prove whether prior remote closes were caused by the bypass or by a
-server-side policy.
+start. The subsequent v26 live test ran substantially beyond every earlier
+failure window without logout. That supports the bypass as the corrected
+client defect, although it cannot independently prove server-side intent.
+
+V26 then completed approximately 40 minutes 42 seconds of user-controlled
+Hunter operation without a logout, including a final uninterrupted run of
+about 24 minutes 14 seconds. V27 keeps the native wrapper and every actor/
+queue safety check, but removes the extra camera projection restriction so an
+eligible Metin does not require manual camera rotation. V27 also completed a
+full eight-channel Boss Sweep and returned to the anchor before restoring the
+paced Hunter queue. V28 removes the extra `Min` title-bar button and changes X
+to hide the panel without stopping scanning, Hunter, or Boss Sweep. Left
+Ctrl+F8 uses the same non-stopping hide/show behavior.
 
 V16 adds Save, Load, and Auto-load controls. The local
 `client_feature_config.txt` stores the radius, Metin anchor, boss identity and

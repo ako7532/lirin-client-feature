@@ -1,20 +1,24 @@
 # Lirin Client Feature - Continuation Handover
 
-Updated: 2026-10-14 after implementing and building the v26 native-wrapper fix
+Updated: 2026-10-15 after the successful v27 live Boss Sweep and v28 UI change
 
 ## Current continuation brief - read before the historical sections
 
-The user requests investigation and a fix for repeated Hunter logouts. Current
-Python source is v26. V25 restored the requested continuous refill behavior
+The user requested investigation and a fix for repeated Hunter logouts. Current
+Python source is v28. V25 restored the requested continuous refill behavior
 and added partial actor checks, but its live test still disconnected during
 sustained Hunter operation. Native comparison then verified the remaining
 structural defect: Python `player.MetinQueueAdd` called low-level insertion
 directly, bypassing the complete native actor-click wrapper used by a manual
 click. V26 changes the loader to redirect that binding through the exact
-native wrapper, adds an on-screen projection guard, and fails closed if the
-wrapper is unavailable. The v26 loader is built and local tests pass, but it
-has not been injected or live-tested. Do not revert to the rejected one-shot
-or repeated 8-15 second batch behavior.
+native wrapper, added an on-screen projection guard, and fails closed if the
+wrapper is unavailable. V26 then ran for approximately 40 minutes 42 seconds
+without a logout, including a final uninterrupted 24-minute segment. The user
+accepts this as the logout fix. V27 keeps the native wrapper, removes the
+unproven camera projection restriction, and passed live Hunter and full Boss
+Sweep use. V28 removes the separate Min button and makes X hide the panel
+without stopping automation. Do not revert to the rejected one-shot or
+repeated 8-15 second batch behavior.
 
 ### Required Hunter behavior
 
@@ -31,6 +35,27 @@ or repeated 8-15 second batch behavior.
 - Preserve Auto Reaction behavior. Do not tune it during this investigation.
 
 ### Latest controlled live evidence
+
+V26 fresh-client PID 46112; Auto Reaction and Boss Sweep OFF:
+
+1. The loader installed the native manual queue wrapper and the panel reported
+   it active at 23:40:24.436.
+2. Hunter ran 23:41:14.331-23:45:41.434, restarted at 23:45:54.529, was
+   toggled OFF/ON at 23:57:56, and then ran continuously until Stop at
+   00:22:10.263.
+3. These intervals total approximately 40 minutes 42 seconds of active Hunter,
+   with a final uninterrupted interval of approximately 24 minutes 14 seconds.
+   Queue additions continued normally throughout the final log interval.
+4. No Python `net.Disconnect`, login-window registration, or automation-stop
+   event occurred. The user remained connected and declared the repeated
+   logout fixed. No game log was created after the prior 20:52 event, so this
+   result is supported by the feature log and user observation rather than a
+   second game-log source.
+
+Conclusion: the v26 native-wrapper correction is the first Hunter version to
+substantially exceed all prior failure windows. Preserve it as the fix. V27
+tests only removal of the separate camera projection restriction; it must not
+remove or bypass the native wrapper.
 
 V25 fresh-client PID 620; Auto Reaction and Boss Sweep OFF:
 
@@ -113,9 +138,10 @@ before applying them to another EXE.
   actor, predicate 0x1403e31f0, a zero application-state float, and a 500 ms
   same-VID debounce before low-level insertion; it also handles duplicates.
 - `chr.GetProjectPosition` at 0x140528aa0 exposes live-actor screen projection.
-  V26 combines it with `wndMgr.GetScreenWidth/Height` to reject off-screen
-  candidates. This approximates the preceding manual screen-pick gate; it does
-  not prove that the actor is unoccluded beneath a particular cursor pixel.
+  V26 used it with `wndMgr.GetScreenWidth/Height` to reject off-screen
+  candidates. This was an unproven approximation of the preceding manual
+  screen pick, not a predicate inside wrapper 0x1403ebdd0. V27 deliberately
+  removes only this camera-direction rule while retaining the wrapper.
 - Queue processor 0x1403e4400, called from player update 0x1403d5940.
 - Clear 0x1403f63b0 -> 0x1403e4300. Add/clear update queue state/count through
   0x140243ac0 -> serializer 0x14022e4a0 when native phase byte +0x199 equals 5.
@@ -142,7 +168,7 @@ before applying them to another EXE.
   position 0x1403d1d50. Position access copies a scratch/cache coordinate value;
   no movement, target, attack, or network send was found in these paths.
 
-### Implemented v24-v26 fixes and remaining risks
+### Implemented v24-v27 fixes and remaining risks
 
 Verified local fixes: loader removes its successful one-shot WH_CALLWNDPROC
 hook; phase observer ignores None and logs UI registration accurately; terminal
@@ -174,7 +200,16 @@ could not be installed. Hunter additionally rejects candidates whose
 ASCII parsing, `git diff --check`, the feature DLL build, and the non-feature
 window-loader build pass. Built `client_feature_loader.dll` is 144,384 bytes,
 SHA-256 `330E1C30B6223BBB6D92399AE029C291B7FC751BE5EF14B14D97E42CBA27AEEB`.
-No live v26 injection has occurred.
+The v26 live run then accumulated approximately 40 minutes 42 seconds without
+a logout, including a final uninterrupted 24-minute segment.
+
+V27 removes the `GetProjectPosition`/screen-bounds admission rule so camera
+direction does not block an otherwise eligible Metin. It completed a live
+eight-channel Boss Sweep, returned to the original CH7 anchor, and restored the
+paced Hunter queue. V28 removes the separate `Min` title-bar button and wires X
+to the same non-stopping hide behavior used by Left Ctrl+F8. The native wrapper,
+`chr.IsStone`, observed exclusion filters, distance limits, and refill cadence
+are unchanged.
 
 The observed exclusion sets are deliberately conservative but incomplete:
 state already present before injection and state changed only by native calls
@@ -187,10 +222,9 @@ the 20:04 remote close.
 Remaining risks to review, not confirmed causes:
 
 - User-proposed hypothesis: a dummy/bait Metin entity could be classified as a
-  stone yet be hidden or non-interactive. V26 now routes admission through the
-  full native actor-click predicate and rejects off-screen projections, but
-  projection is not an exact occlusion/cursor-pick test. There is no evidence
-  that this server deliberately creates bait entities.
+  stone yet be hidden or non-interactive. The native actor-click wrapper now
+  enforces its complete eligibility predicate. There is no evidence that this
+  server deliberately creates bait entities or requires camera projection.
 - Native snapshot worker traverses the entity tree without synchronization or
   lifetime protection. SEH catches faults, not inconsistent reads.
 - FindRuntimeObject processes up to 10000 objects but can accumulate many more
@@ -208,7 +242,7 @@ Remaining risks to review, not confirmed causes:
 ### Concrete next work
 
 Read the required files below and preserve the worktree. The manual-versus-
-Python queue comparison is now complete enough for the bounded v26 test.
+Python queue comparison and bounded v26 test are complete.
 Separately, the original event entering MainStream.SetLoginPhase and the code
 emitting remote-close logs remain unidentified. Plain `Remote disconnected
 from` string search in the copied EXE did not locate the message; existing code
@@ -225,22 +259,15 @@ duration, and millisecond timestamps. Native calls may bypass Python hooks;
 raw TCP capture can distinguish FIN/RST/timeout but may reveal no server reason.
 Avoid a broad intrusive packet hook until its necessity and method are clear.
 
-The next bounded test is a clean v26 Hunter-only run: fresh game process,
-Auto Reaction OFF, Boss Sweep OFF, Start, then Hunter ON for 15 minutes. Record
-the feature log and game log without changing other modes. This exceeds the
-previous uninterrupted v24 failure interval of about 6 minutes 20 seconds.
-Do not claim success from immediate responsiveness; compare every queue add and
-any rejection or Python disconnect record against the millisecond remote-close
-time. The optional rare 5-15 second pause remains unimplemented and separate
-from this defect test. A fresh process is required because an already injected
-DLL leaves its method pointer in process memory and a later loader deliberately
-refuses to overwrite an unexpected binding. No live injection, commit, or push
-is currently requested.
+The next bounded test is a clean v28 UI run in a fresh game process. Start
+Hunter, click X, and confirm scanning and queue activity continue; Left
+Ctrl+F8 must reopen the panel. Do not add automatic camera rotation unless live
+evidence proves it necessary. A fresh process is required because an already
+injected DLL leaves its method pointer in process memory and a later loader
+deliberately refuses to overwrite an unexpected binding.
 
-Current modified tracked files to preserve:
-`HANDOVER_NEXT_CHAT.md`, `README.md`, `TEST_RESULTS.md`, `client_feature.py`,
-`python_loader.cpp`, `test_client_feature_local.py`. Earlier v21-v24 changes
-remain uncommitted; check git status/diff rather than replacing with HEAD.
+Current v28 modified tracked files must be checked with `git status`; preserve
+them rather than replacing them with HEAD.
 Launcher remains usable at `LirinFeatureLauncher\bin\Release\net8.0-windows`;
 it invokes the repository runner and rebuilt loader. For new loader behavior,
 fully restart the game before injection so old injected DLLs cannot remain.
@@ -318,7 +345,7 @@ acceptance.
 
 ## 4. Current source and live-version state
 
-The working source is now `FEATURE_VERSION = 26` in `client_feature.py`.
+The working source is now `FEATURE_VERSION = 28` in `client_feature.py`.
 The default radius is 2500.
 
 The latest source changes are local only:
@@ -366,9 +393,15 @@ The latest source changes are local only:
   seconds of active Hunter time.
 - v26: redirects the exact-build Python queue-add binding through the native
   manual actor-click wrapper, requires an on-screen actor projection, and
-  disables Hunter/Boss Sweep if the redirect is unavailable. Local tests and
-  both affected C++ loader builds pass; v26 has not been live-tested, and the
-  disconnect cause remains unverified until that bounded test.
+  disables Hunter/Boss Sweep if the redirect is unavailable. It completed
+  approximately 40 minutes 42 seconds of live Hunter use without logout and is
+  accepted as the repeated-logout fix.
+- v27: removed only the unproven on-screen projection gate while preserving the
+  native wrapper and all other admission/safety behavior. Live Hunter use was
+  successful, followed by a complete eight-channel Boss Sweep and Hunter
+  restoration.
+- v28: removes the separate Min button and changes X to hide without stopping
+  automation. Left Ctrl+F8 retains the same non-stopping hide/show behavior.
 
 V20 was live-tested with Hunter and disconnected after about seven minutes.
 V21 was live-tested with Hunter and disconnected again after about 3 minutes

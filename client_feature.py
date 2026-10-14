@@ -16,7 +16,6 @@ import net
 import nonplayer
 import player
 import ui
-import wndMgr
 
 try:
     INTEGER_TYPES = (int, long)
@@ -33,7 +32,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 26
+FEATURE_VERSION = 28
 HUNTER_LIMIT = 5
 HUNTER_ADD_DELAY_MIN = 0.65
 HUNTER_ADD_DELAY_MAX = 1.45
@@ -332,7 +331,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.SetSize(820, 485)
         self.SetPosition(40, 80)
         self.SetTitleName("Metin Radius Scanner")
-        self.SetCloseEvent(self.Close)
+        self.SetCloseEvent(self.MinimizePanel)
         self.running = False
         self.anchor_position = None
         self.hotkey_down = False
@@ -1456,11 +1455,14 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def TogglePanel(self):
         if self.IsShow():
-            self.Hide()
-            disk_log("Panel minimized with Left Ctrl+F8")
+            self.MinimizePanel()
         else:
             self.Show()
             disk_log("Panel opened with Left Ctrl+F8")
+
+    def MinimizePanel(self):
+        self.Hide()
+        disk_log("Panel minimized; automation continues")
 
     def PollHotkey(self):
         try:
@@ -1514,11 +1516,6 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.ClearMap()
         self.state_label.SetText("Stopped. Set radius, then click Start.")
         self.AddLine("Stopped")
-
-    def Close(self):
-        if self.running:
-            self.Stop()
-        self.Hide()
 
     def Dispose(self):
         self.watcher.Hide()
@@ -1602,30 +1599,6 @@ class MetinScanner(ui.BoardWithTitleBar):
                 is_stone = getattr(chr, "IsStone", None)
                 if not callable(is_stone) or not is_stone(vid):
                     reason = "native actor is not a stone"
-                    rejection = (int(vid), reason)
-                    if rejection not in self.hunter_logged_rejections:
-                        self.hunter_logged_rejections.add(rejection)
-                        self.AddLine("Skipped %s [VID %d]: %s" %
-                                     (name or "Metin", vid, reason))
-                    continue
-                get_project = getattr(chr, "GetProjectPosition", None)
-                if (not callable(get_project) or
-                        not callable(getattr(wndMgr, "GetScreenWidth", None)) or
-                        not callable(getattr(wndMgr, "GetScreenHeight", None))):
-                    reason = "screen-pick projection is unavailable"
-                    rejection = (int(vid), reason)
-                    if rejection not in self.hunter_logged_rejections:
-                        self.hunter_logged_rejections.add(rejection)
-                        self.AddLine("Skipped %s [VID %d]: %s" %
-                                     (name or "Metin", vid, reason))
-                    continue
-                screen_x, screen_y = get_project(vid, 0)[:2]
-                screen_width = int(wndMgr.GetScreenWidth())
-                screen_height = int(wndMgr.GetScreenHeight())
-                if (screen_width <= 0 or screen_height <= 0 or
-                        screen_x < 0 or screen_y < 0 or
-                        screen_x >= screen_width or screen_y >= screen_height):
-                    reason = "actor is outside the screen-pick area"
                     rejection = (int(vid), reason)
                     if rejection not in self.hunter_logged_rejections:
                         self.hunter_logged_rejections.add(rejection)
