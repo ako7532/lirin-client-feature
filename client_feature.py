@@ -1273,6 +1273,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         if card is None:
             self._DuelDebugLog("Yin Yang Duel: card %d missing from playerCards" % value)
             return False
+        self._DuelDebugLog("Yin Yang Duel: card key=%d value=%r played=%r faceUp=%r" %
+                           (value, getattr(card, "value", None),
+                            getattr(card, "played", None),
+                            getattr(card, "faceUp", None)))
         can_pick = getattr(window, "CanPickCard", None)
         if callable(can_pick):
             try:
@@ -1283,20 +1287,24 @@ class MetinScanner(ui.BoardWithTitleBar):
             except Exception as exc:
                 self._DuelDebugLog("Yin Yang Duel: CanPickCard error %s" % ascii_text(exc))
         emit_synthetic_click()
+        # A real click on the card goes through its own mouse handler; try that
+        # first, then the window's OnCardClicked with the raw value.
         try:
-            onclick = getattr(window, "OnCardClicked", None)
-            if callable(onclick):
-                result = onclick(card)
-                self._DuelDebugLog("Yin Yang Duel: OnCardClicked(%d) -> %r" %
-                                   (value, result))
-            else:
-                card.OnMouseLeftButtonDown()
+            card.OnMouseLeftButtonDown()
+            self._DuelDebugLog("Yin Yang Duel: clicked card %d via OnMouseLeftButtonDown" %
+                               value)
         except Exception as exc:
-            self._DuelDebugLog("Yin Yang Duel: OnCardClicked error %s" % ascii_text(exc))
+            self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc))
             try:
-                card.OnMouseLeftButtonDown()
+                onclick = getattr(window, "OnCardClicked", None)
+                if callable(onclick):
+                    result = onclick(value)
+                    self._DuelDebugLog("Yin Yang Duel: OnCardClicked(%d) -> %r" %
+                                       (value, result))
+                else:
+                    raise RuntimeError("OnCardClicked unavailable")
             except Exception as exc2:
-                self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc2))
+                self._DuelDebugLog("Yin Yang Duel: OnCardClicked error %s" % ascii_text(exc2))
                 return False
         self.AddLine("Yin Yang Duel: played %d (%s)" %
                      (value, "lead" if leads else opponent_color))
