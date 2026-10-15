@@ -119,6 +119,42 @@ def emit_synthetic_click():
         pass
 
 
+# --- Yin Yang Duel strategy (cards 0..8; even=black, odd=white) ---
+# Both players hold the same 9-card hand (0..8).  Each round the higher card
+# wins; ties score nothing.  You only ever see the colour of the opponent's
+# card, so the opponent's exact remaining values are unknowable.
+
+YINYANG_DUEL_BLACK = (0, 2, 4, 6, 8)
+YINYANG_DUEL_WHITE = (1, 3, 5, 7)
+
+
+def duel_card_color(value):
+    return "black" if (int(value) % 2) == 0 else "white"
+
+
+def choose_duel_card(my_hand, opponent_color):
+    """Minimal-winner heuristic for one Yin Yang Duel round.
+
+    my_hand: remaining card values we still hold.
+    opponent_color: 'black'/'white' when the opponent led and we can see their
+    card colour, or None when we lead blind.
+
+    - Follower: play the smallest card that beats the opponent's median card of
+      that colour (win cheaply); if that is impossible, sacrifice our lowest.
+    - Leader: play the median of our hand as a balanced blind move.
+    """
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    if opponent_color is None:
+        return hand[len(hand) // 2]
+    possible = YINYANG_DUEL_BLACK if opponent_color == "black" else YINYANG_DUEL_WHITE
+    target = sorted(possible)[len(possible) // 2]
+    winners = [value for value in hand if value > target]
+    return winners[0] if winners else hand[0]
+
+
+
 def disk_log(message):
     now = time.time()
     whole = int(now)
