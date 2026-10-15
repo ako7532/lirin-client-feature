@@ -65,6 +65,7 @@ BOSS_TIMER_POLL_SECONDS = 0.5
 BOSS_ACTIVE_POLL_SECONDS = 0.2
 BOSS_LOAD_SETTLE_SECONDS = 1.0
 BOSS_ABSENCE_GRACE_SECONDS = 3.0
+BOSS_SPAWN_GRACE_SECONDS = 30.0
 BOSS_KILL_CONFIRM_SECONDS = 1.5
 BOSS_COMBAT_TIMEOUT_SECONDS = 90.0
 BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
@@ -74,6 +75,7 @@ BOSS_RETURN_PROGRESS_DISTANCE = 25
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
+BOSS_WAIT_SPAWN = "wait_spawn"
 BOSS_FIND = "find"
 BOSS_ATTACK = "attack"
 BOSS_CHANGE_CHANNEL = "change_channel"
@@ -1286,6 +1288,16 @@ class MetinScanner(ui.BoardWithTitleBar):
         else:
             self.StartBossFind()
 
+    def StartBossSpawnWait(self):
+        now = time.time()
+        self.boss_state = BOSS_WAIT_SPAWN
+        self.boss_state_started = now
+        self.boss_deadline = now + BOSS_SPAWN_GRACE_SECONDS
+        self.boss_timer_armed = False
+        self.boss_label.SetText("Waiting for %s to appear" % self.boss_name)
+        self.AddLine("Boss timer reached zero; waiting %.0fs for %s to appear" %
+                     (BOSS_SPAWN_GRACE_SECONDS, self.boss_name))
+
     def StartBossFind(self):
         now = time.time()
         self.boss_state = BOSS_FIND
@@ -1458,7 +1470,24 @@ class MetinScanner(ui.BoardWithTitleBar):
                                             (self.boss_name, int(remaining)))
                     return
                 if self.boss_timer_armed:
+                    self.StartBossSpawnWait()
+                return
+
+            if self.boss_state == BOSS_WAIT_SPAWN:
+                candidate = self.FindMarkedBoss()
+                if candidate is not None:
+                    self.AddLine("%s appeared; starting sweep" % self.boss_name)
                     self.BeginBossSweep()
+                    return
+                if now >= self.boss_deadline:
+                    self.AddLine("%s did not appear within %.0fs; waiting for next timer" %
+                                 (self.boss_name, BOSS_SPAWN_GRACE_SECONDS))
+                    self.boss_state = BOSS_WAIT_TIMER
+                    self.boss_label.SetText("Waiting for %s timer" % self.boss_name)
+                    return
+                self.boss_label.SetText("Waiting for %s to appear (%.0fs)" %
+                                        (self.boss_name,
+                                         max(0.0, self.boss_deadline - now)))
                 return
 
             if self.boss_state == BOSS_FIND:
