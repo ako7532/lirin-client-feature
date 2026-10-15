@@ -839,6 +839,7 @@ with tempfile.TemporaryDirectory() as directory:
     # Yin Yang Duel strategy (cards 0..8; even=black, odd=white).
     duel_globals = panel.PollYinYangDuel.__globals__
     choose_duel_card = duel_globals["choose_duel_card"]
+    choose_duel_card_follow = duel_globals["choose_duel_card_follow"]
     duel_card_color = duel_globals["duel_card_color"]
     assert duel_card_color(0) == "black" and duel_card_color(1) == "white"
     assert choose_duel_card([0, 1, 2, 3, 4, 5, 6, 7, 8], "black") == 5
@@ -846,4 +847,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert choose_duel_card([0, 1], "black") == 0
     assert choose_duel_card([0, 1, 2, 3, 4, 5, 6, 7, 8], None) == 4
     assert choose_duel_card([], "black") is None
+    assert choose_duel_card_follow([0, 1, 2, 3, 4, 5, 6, 7, 8], 6) == 7
+    assert choose_duel_card_follow([0, 1, 2, 3], 8) == 0
+    assert choose_duel_card_follow([], 3) is None
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")

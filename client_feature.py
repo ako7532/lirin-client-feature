@@ -154,6 +154,16 @@ def choose_duel_card(my_hand, opponent_color):
     return winners[0] if winners else hand[0]
 
 
+def choose_duel_card_follow(my_hand, opponent_led_value):
+    """Follower with exact knowledge of the opponent's led card: beat it by the
+    smallest margin, or sacrifice our lowest card if we cannot win."""
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    winners = [value for value in hand if value > opponent_led_value]
+    return winners[0] if winners else hand[0]
+
+
 
 def disk_log(message):
     now = time.time()
@@ -478,6 +488,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
         self.yinyang_duel_debug = None
+        self.yinyang_duel_opponent_played = set()
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -1224,42 +1235,58 @@ class MetinScanner(ui.BoardWithTitleBar):
                 pass
         return 0.0
 
-    def _DuelRemainingHand(self, window):
-        cards = getattr(window, "playerCards", None)
-        if not cards:
-            return []
-        hand = []
-        for key, card in cards.items():
-            try:
-                if getattr(card, "played", False):
-                    continue
-                hand.append(int(getattr(card, "value", key)))
-            except Exception:
-                continue
-        return hand
-
     def _DuelDebugLog(self, message):
         if message != self.yinyang_duel_debug:
             self.yinyang_duel_debug = message
             self.AddLine(message)
 
+    def _DuelRemainingValues(self, cards_dict):
+        values = set()
+        for key, card in (cards_dict or {}).items():
+            try:
+                if not getattr(card, "played", False):
+                    values.add(int(getattr(card, "value", key)))
+            except Exception:
+                continue
+        return values
+
     def _DuelTryPlay(self, window):
         """If it is our turn, pick and play a card.  Returns True when played."""
+        if getattr(window, "state", None) != 2:
+            return False
         lead_info = getattr(window, "leadInfo", None)
-        self._DuelDebugLog("Yin Yang Duel: try play window=%s lead=%r" %
-                           (id(window), lead_info))
         if not lead_info:
             return False
-        hand = self._DuelRemainingHand(window)
+        hand = sorted(self._DuelRemainingValues(getattr(window, "playerCards", None)))
         if not hand:
-            self._DuelDebugLog("Yin Yang Duel: no cards in hand")
             return False
         leads = bool(lead_info.get("leads", False))
-        opponent_color = (None if leads else
-                          ("black" if lead_info.get("black", False) else "white"))
-        value = choose_duel_card(hand, opponent_color)
+        opp_cards = getattr(window, "opponentCards", None) or {}
+        opp_played_now = set()
+        for key, card in opp_cards.items():
+            try:
+                if getattr(card, "played", False):
+                    opp_played_now.add(int(getattr(card, "value", key)))
+            except Exception:
+                continue
+        if not opp_played_now:
+            self.yinyang_duel_opponent_played = set()
+        newly_played = opp_played_now - self.yinyang_duel_opponent_played
+        self.yinyang_duel_opponent_played = opp_played_now
+
+        if leads:
+            value = choose_duel_card(hand, None)
+            opponent_led = None
+        else:
+            opponent_led = newly_played.pop() if len(newly_played) == 1 else None
+            if opponent_led is not None:
+                value = choose_duel_card_follow(hand, opponent_led)
+            else:
+                color = "black" if lead_info.get("black", False) else "white"
+                value = choose_duel_card(hand, color)
         if value is None:
             return False
+
         cards = getattr(window, "playerCards", None) or {}
         card = cards.get(value)
         if card is None:
@@ -1271,46 +1298,25 @@ class MetinScanner(ui.BoardWithTitleBar):
                 except Exception:
                     continue
         if card is None:
-            self._DuelDebugLog("Yin Yang Duel: card %d missing from playerCards" % value)
             return False
-        self._DuelDebugLog("Yin Yang Duel: card key=%d value=%r played=%r faceUp=%r" %
-                           (value, getattr(card, "value", None),
-                            getattr(card, "played", None),
-                            getattr(card, "faceUp", None)))
+
         can_pick = getattr(window, "CanPickCard", None)
         if callable(can_pick):
             try:
-                allowed = can_pick()
-                if not allowed:
-                    self._DuelDebugLog("Yin Yang Duel: CanPickCard()=False")
+                if not can_pick():
                     return False
-            except Exception as exc:
-                self._DuelDebugLog("Yin Yang Duel: CanPickCard error %s" % ascii_text(exc))
+            except Exception:
+                pass
         emit_synthetic_click()
-        # A real click on the card goes through its own mouse handler; try that
-        # first, then the window's OnCardClicked with the raw value.
         try:
             card.OnMouseLeftButtonDown()
-            self._DuelDebugLog("Yin Yang Duel: clicked card %d via OnMouseLeftButtonDown" %
-                               value)
         except Exception as exc:
             self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc))
-            try:
-                onclick = getattr(window, "OnCardClicked", None)
-                if callable(onclick):
-                    result = onclick(value)
-                    self._DuelDebugLog("Yin Yang Duel: OnCardClicked(%d) -> %r" %
-                                       (value, result))
-                else:
-                    raise RuntimeError("OnCardClicked unavailable")
-            except Exception as exc2:
-                self._DuelDebugLog("Yin Yang Duel: OnCardClicked error %s" % ascii_text(exc2))
-                return False
-        self.AddLine("Yin Yang Duel: played %d (%s)" %
-                     (value, "lead" if leads else opponent_color))
-        self.yinyang_duel_label.SetText(
-            "Yin Yang Duel: played %d (%s)" %
-            (value, "lead" if leads else opponent_color))
+            return False
+        note = " vs %d" % opponent_led if opponent_led is not None else ""
+        self.AddLine("Yin Yang Duel: played %d (%s)%s" %
+                     (value, "lead" if leads else ("black" if lead_info.get("black", False) else "white"), note))
+        self.yinyang_duel_label.SetText("Yin Yang Duel: played %d" % value)
         return True
 
     def _DuelEnsureStarted(self, window, state):
@@ -1343,9 +1349,6 @@ class MetinScanner(ui.BoardWithTitleBar):
             if window is None:
                 self.yinyang_duel_label.SetText("Yin Yang Duel: window not found")
                 return
-            self._DuelDebugLog("Yin Yang Duel: poll window=%s state=%s lead=%r" %
-                               (id(window), getattr(window, "state", None),
-                                getattr(window, "leadInfo", None)))
             used = int(getattr(window, "duelsUsedHwid", 0) or 0)
             maximum = int(getattr(window, "duelsMaxHwid", 0) or 0)
             if maximum > 0 and used >= maximum:
