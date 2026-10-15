@@ -1203,6 +1203,96 @@ class MetinScanner(ui.BoardWithTitleBar):
             except Exception as exc:
                 self.AddLine("  duel %s card dump error: %s" % (label, exc))
 
+    def _DuelCooldownRemaining(self, window):
+        get_cd = getattr(window, "GetCooldownRemaining", None)
+        if callable(get_cd):
+            try:
+                value = get_cd()
+                if isinstance(value, (tuple, list)):
+                    value = value[0] if value else 0
+                return float(value)
+            except Exception:
+                pass
+        return 0.0
+
+    def _DuelRemainingHand(self, window):
+        cards = getattr(window, "playerCards", None)
+        if not cards:
+            return []
+        hand = []
+        for key, card in cards.items():
+            try:
+                if getattr(card, "played", False):
+                    continue
+                hand.append(int(getattr(card, "value", key)))
+            except Exception:
+                continue
+        return hand
+
+    def _DuelTryPlay(self, window):
+        """If it is our turn, pick and play a card.  Returns True when played."""
+        lead_info = getattr(window, "leadInfo", None)
+        if not lead_info:
+            return False
+        hand = self._DuelRemainingHand(window)
+        if not hand:
+            return False
+        leads = bool(lead_info.get("leads", False))
+        opponent_color = (None if leads else
+                          ("black" if lead_info.get("black", False) else "white"))
+        value = choose_duel_card(hand, opponent_color)
+        if value is None:
+            return False
+        cards = getattr(window, "playerCards", None) or {}
+        card = cards.get(value)
+        if card is None:
+            for candidate in cards.values():
+                try:
+                    if int(getattr(candidate, "value", -1)) == value:
+                        card = candidate
+                        break
+                except Exception:
+                    continue
+        if card is None:
+            return False
+        can_pick = getattr(window, "CanPickCard", None)
+        if callable(can_pick):
+            try:
+                if not can_pick(card):
+                    return False
+            except Exception:
+                pass
+        emit_synthetic_click()
+        try:
+            onclick = getattr(window, "OnCardClicked", None)
+            if callable(onclick):
+                onclick(card)
+            else:
+                card.OnMouseLeftButtonDown()
+        except Exception as exc:
+            self.AddLine("Yin Yang Duel: play error %s" % ascii_text(exc))
+            return False
+        self.yinyang_duel_label.SetText(
+            "Yin Yang Duel: played %d (%s)" %
+            (value, "lead" if leads else opponent_color))
+        return True
+
+    def _DuelEnsureStarted(self, window, state):
+        try:
+            if not window.IsShow():
+                window.Open()
+                self.yinyang_duel_label.SetText("Yin Yang Duel: opening window")
+                return
+        except Exception:
+            pass
+        if state == 0:
+            start = getattr(window, "_YinYangDuelWindow__OnStartClicked", None)
+            if callable(start):
+                start()
+                self.yinyang_duel_label.SetText("Yin Yang Duel: starting")
+                return
+        self.yinyang_duel_label.SetText("Yin Yang Duel: idle (state %s)" % state)
+
     def PollYinYangDuel(self, now):
         if not self.yinyang_duel_enabled:
             return
@@ -1215,25 +1305,23 @@ class MetinScanner(ui.BoardWithTitleBar):
         try:
             window = self.FindRuntimeObject("YinYangDuelWindow", ())
             if window is None:
-                self.yinyang_duel_label.SetText("Yin Yang Duel: window not open")
+                self.yinyang_duel_label.SetText("Yin Yang Duel: window not found")
                 return
-            cooldown = None
-            get_cd = getattr(window, "GetCooldownRemaining", None)
-            if callable(get_cd):
-                try:
-                    value = get_cd()
-                    if isinstance(value, (tuple, list)):
-                        value = value[0] if value else 0
-                    cooldown = float(value)
-                except Exception:
-                    cooldown = None
-            if cooldown is not None and cooldown > 0:
+            used = int(getattr(window, "duelsUsedHwid", 0) or 0)
+            maximum = int(getattr(window, "duelsMaxHwid", 0) or 0)
+            if maximum > 0 and used >= maximum:
                 self.yinyang_duel_label.SetText(
-                    "Yin Yang Duel: cooldown %.0fs" % cooldown)
+                    "Yin Yang Duel: daily limit %d/%d" % (used, maximum))
                 return
-            # TODO: start the duel (__OnStartClicked) and play cards optimally
-            # once the rules and runtime API are confirmed via the diagnostic.
-            self.yinyang_duel_label.SetText("Yin Yang Duel: ready (strategy TODO)")
+            cooldown = self._DuelCooldownRemaining(window)
+            if cooldown > 0:
+                self.yinyang_duel_label.SetText(
+                    "Yin Yang Duel: cooldown %ds (%d/%d used)" %
+                    (int(cooldown), used, maximum))
+                return
+            if self._DuelTryPlay(window):
+                return
+            self._DuelEnsureStarted(window, getattr(window, "state", None))
         except Exception as exc:
             problem = ascii_text(exc)
             if problem != self.yinyang_duel_last_error:
