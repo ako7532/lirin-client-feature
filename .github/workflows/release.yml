@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Run local feature tests
+        shell: pwsh
+        run: python .\test_client_feature_local.py
+
+      - name: Build feature loader DLL
+        shell: pwsh
+        run: .\build.ps1 -FeatureOnly
+
+      - name: Publish launcher
+        shell: pwsh
+        run: dotnet publish .\LirinFeatureLauncher\LirinFeatureLauncher.csproj -c Release -o .\publish\launcher
+
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .\staging | Out-Null
+          Copy-Item .\publish\launcher\* .\staging\
+          Copy-Item .\client_feature_loader.dll .\staging\
+          Copy-Item .\client_feature.py .\staging\
+          Copy-Item .\inject.py .\staging\
+          Copy-Item .\run_client_feature.ps1 .\staging\
+
+      - name: Zip release
+        shell: pwsh
+        run: Compress-Archive -Path .\staging\* -DestinationPath .\release.zip
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: autobuild-${{ github.sha }}
+          name: Autobuild ${{ github.sha }}
+          body: |
+            Automated build from commit `${{ github.sha }}`.
+
+            **${{ github.event.head_commit.message }}**
+          files: release.zip
+          draft: false
+          prerelease: false
