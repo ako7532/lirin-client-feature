@@ -72,6 +72,8 @@ BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
 BOSS_RETURN_DISTANCE = 120
 BOSS_RETURN_STALL_SECONDS = 3.0
 BOSS_RETURN_PROGRESS_DISTANCE = 25
+YINYANG_DUEL_POLL_SECONDS = 1.0
+YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -373,7 +375,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
         self.AddFlag("movable")
         self.AddFlag("float")
-        self.SetSize(820, 485)
+        self.SetSize(820, 520)
         self.SetPosition(40, 80)
         self.SetTitleName("Metin Radius Scanner")
         self.SetCloseEvent(self.MinimizePanel)
@@ -435,6 +437,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_saved_hunter_enabled = False
         self.reaction_saved_queue_enabled = False
         self.reaction_saved_boss_attack = False
+        self.yinyang_duel_enabled = False
+        self.yinyang_duel_window = None
+        self.yinyang_duel_next_poll = 0.0
+        self.yinyang_duel_last_error = None
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -545,6 +551,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_title = make_text(self, 15, 432, "Auto Reaction")
         self.reaction_button = make_button(self, 110, "ON", self.ToggleReaction, 427)
         self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
+        self.yinyang_duel_title = make_text(self, 15, 466, "Yin Yang Duel")
+        self.yinyang_duel_button = make_button(self, 110, "OFF", self.ToggleYinYangDuel, 461)
+        self.yinyang_duel_label = make_text(self, 205, 466, "Plays the Yin Yang Duel minigame")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
         self.queue_admission_guard = get_metin_queue_admission_guard()
@@ -1103,6 +1112,76 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.reaction_saved_queue_enabled = False
             self.reaction_saved_boss_attack = False
         self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
+
+    def ToggleYinYangDuel(self):
+        self.yinyang_duel_enabled = not self.yinyang_duel_enabled
+        self.yinyang_duel_button.SetText("ON" if self.yinyang_duel_enabled else "OFF")
+        self.yinyang_duel_next_poll = 0.0
+        self.yinyang_duel_last_error = None
+        if self.yinyang_duel_enabled:
+            self.yinyang_duel_label.SetText("Yin Yang Duel: probing runtime")
+            self.AddLine("Yin Yang Duel ON")
+            self.DiagnosticYinYangDuel()
+        else:
+            self.yinyang_duel_label.SetText("Yin Yang Duel off")
+            self.AddLine("Yin Yang Duel OFF")
+
+    def DiagnosticYinYangDuel(self):
+        """Dump the YinYangDuelWindow runtime API so the minigame can be driven."""
+        window = self.FindRuntimeObject("YinYangDuelWindow", ())
+        if window is None:
+            self.AddLine("YinYangDuelWindow not found in runtime objects")
+            return
+        self.AddLine("YinYangDuelWindow type=%s" % ascii_text(type(window).__name__))
+        try:
+            for name in dir(window):
+                if not name.startswith("__"):
+                    self.AddLine("  duel attr %s" % name)
+        except Exception as exc:
+            self.AddLine("dir(window) failed: %s" % exc)
+        try:
+            for key, value in getattr(window, "__dict__", {}).items():
+                self.AddLine("  duel field %s = %s" %
+                             (key, ascii_text(repr(value))[:80]))
+        except Exception as exc:
+            self.AddLine("__dict__ dump failed: %s" % exc)
+
+    def PollYinYangDuel(self, now):
+        if not self.yinyang_duel_enabled:
+            return
+        if self.boss_enabled:
+            self.yinyang_duel_label.SetText("Yin Yang Duel: waiting for Boss Sweep")
+            return
+        if now < self.yinyang_duel_next_poll:
+            return
+        self.yinyang_duel_next_poll = now + YINYANG_DUEL_POLL_SECONDS
+        try:
+            window = self.FindRuntimeObject("YinYangDuelWindow", ())
+            if window is None:
+                self.yinyang_duel_label.SetText("Yin Yang Duel: window not open")
+                return
+            cooldown = None
+            get_cd = getattr(window, "GetCooldownRemaining", None)
+            if callable(get_cd):
+                try:
+                    value = get_cd()
+                    if isinstance(value, (tuple, list)):
+                        value = value[0] if value else 0
+                    cooldown = float(value)
+                except Exception:
+                    cooldown = None
+            if cooldown is not None and cooldown > 0:
+                self.yinyang_duel_label.SetText(
+                    "Yin Yang Duel: cooldown %.0fs" % cooldown)
+                return
+            # TODO: start the duel (__OnStartClicked) and play cards optimally
+            # once the rules and runtime API are confirmed via the diagnostic.
+            self.yinyang_duel_label.SetText("Yin Yang Duel: ready (strategy TODO)")
+        except Exception as exc:
+            problem = ascii_text(exc)
+            if problem != self.yinyang_duel_last_error:
+                self.AddLine("Yin Yang Duel error: %s" % problem)
+                self.yinyang_duel_last_error = problem
 
     def ReadBossTimer(self):
         if self.boss_timer is None:
@@ -2034,6 +2113,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.AddLine("Radius update error: %s" % problem)
                 self.last_radius_error = problem
         self.UpdateBossSweep(now, player_position)
+        self.PollYinYangDuel(now)
         if now >= self.next_scan:
             try:
                 if player_position is None:
