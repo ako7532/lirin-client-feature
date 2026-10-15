@@ -33,8 +33,10 @@ static constexpr ULONG_PTR RVA_PARSE_TUPLE_INTEGER = 0x00897B40;
 static constexpr ULONG_PTR RVA_ARGUMENT_ERROR = 0x00897E40;
 static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00A6B650;
 static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x066E218C;
-static constexpr ULONG_PTR RVA_GET_MAIN_ACTOR = 0x003D1DA0;
-static constexpr ULONG_PTR RVA_ACTOR_CLICK = 0x003EBDD0;
+static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x003D1D40;
+static constexpr ULONG_PTR RVA_SET_MOUSE_STATE = 0x003E5940;
+static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
+static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
 static BYTE* g_game_base = nullptr;
 static bool g_native_queue_wrapper_installed = false;
@@ -42,8 +44,8 @@ static bool g_native_queue_wrapper_installed = false;
 using ParseTupleInteger = char (*)(void*, int, int*);
 using ArgumentError = void* (*)(int);
 using BuildValue = void* (*)(const char*, ...);
-using GetMainActor = void* (*)(void*);
-using ActorClick = void (*)(void*, void*, int, char);
+using GetActorByVid = void* (*)(void*, int);
+using SetMouseState = void (*)(void*, int, char);
 
 static void* NativeMetinQueueAdd(void*, void* args) {
     auto parse_integer = reinterpret_cast<ParseTupleInteger>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
@@ -55,18 +57,33 @@ static void* NativeMetinQueueAdd(void*, void* args) {
     int added = 0;
     __try {
         BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
-        if (player) {
-            auto get_main_actor = reinterpret_cast<GetMainActor>(g_game_base + RVA_GET_MAIN_ACTOR);
-            void* main_actor = get_main_actor(player);
-            if (main_actor) {
+        BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
+        if (player && manager && player[PLAYER_MOUSE_DOWN_OFFSET] == 0) {
+            auto get_actor = reinterpret_cast<GetActorByVid>(g_game_base + RVA_GET_ACTOR_BY_VID);
+            void* target_actor = get_actor(player, vid);
+            if (target_actor) {
                 auto begin = *reinterpret_cast<DWORD**>(player + 0x4588);
                 auto end = *reinterpret_cast<DWORD**>(player + 0x4590);
                 size_t before = 0;
                 if (begin && end && end >= begin) before = static_cast<size_t>(end - begin);
-                auto actor_click = reinterpret_cast<ActorClick>(g_game_base + RVA_ACTOR_CLICK);
-                // Zero is the normal left-button actor-click path used by
-                // CPythonPlayer::SetMouseState.
-                actor_click(player, main_actor, vid, 0);
+
+                // Route the requested actor through the same CPythonPlayer
+                // mouse press/release path used by a normal smart left click.
+                // The picker override is scoped to this synchronous call and
+                // restored before Python regains control.
+                void** picked_actor = reinterpret_cast<void**>(
+                    manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
+                void* saved_picked_actor = *picked_actor;
+                auto set_mouse_state = reinterpret_cast<SetMouseState>(
+                    g_game_base + RVA_SET_MOUSE_STATE);
+                *picked_actor = target_actor;
+                __try {
+                    set_mouse_state(player, 1, 0);
+                    set_mouse_state(player, 0, 0);
+                } __finally {
+                    *picked_actor = saved_picked_actor;
+                }
+
                 begin = *reinterpret_cast<DWORD**>(player + 0x4588);
                 end = *reinterpret_cast<DWORD**>(player + 0x4590);
                 size_t after = 0;
@@ -75,7 +92,7 @@ static void* NativeMetinQueueAdd(void*, void* args) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        AppendStatus(g_feature_status_path, "native queue wrapper access fault");
+        AppendStatus(g_feature_status_path, "native input queue wrapper access fault");
         added = 0;
     }
     return build_value(reinterpret_cast<const char*>(g_game_base + RVA_INTEGER_FORMAT), added);
@@ -99,7 +116,7 @@ static bool InstallNativeMetinQueueWrapper(BYTE* base) {
     DWORD ignored = 0;
     VirtualProtect(method, sizeof(*method), old_protection, &ignored);
     g_native_queue_wrapper_installed = true;
-    AppendStatus(g_feature_status_path, "native manual queue wrapper installed");
+    AppendStatus(g_feature_status_path, "native full-input queue wrapper installed");
     return true;
 }
 

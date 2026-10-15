@@ -32,15 +32,30 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 28
+FEATURE_VERSION = 35
 HUNTER_LIMIT = 5
 HUNTER_ADD_DELAY_MIN = 0.65
 HUNTER_ADD_DELAY_MAX = 1.45
 HUNTER_REFILL_CHANCES = {3: 0.35, 2: 0.70, 1: 1.0, 0: 1.0}
+PRIORITY_EVENT_METIN_NAME = "legendary metinstone"
+PRIORITY_EVENT_MISSING_SECONDS = 1.5
 REACTION_POLL_SECONDS = 0.05
 REACTION_DISCOVERY_SECONDS = 5.0
 REACTION_SAFETY_POLL_SECONDS = 0.25
 REACTION_SAFETY_DISCOVERY_SECONDS = 1.0
+REACTION_CLICK_DELAY_MIN = 0.30
+REACTION_CLICK_DELAY_MAX = 0.99
+REACTION_CLICK_DELAY_JITTER = 0.025
+# Thirty-seven clean manual samples from four local recorder rounds. Samples
+# with a wrong click were excluded because this solver never clicks a wrong
+# slot; a small jitter prevents exact replay of a recorded millisecond value.
+REACTION_CLICK_DELAY_SAMPLES = (
+    0.305, 0.404, 0.414, 0.421, 0.429, 0.430, 0.444, 0.451, 0.455,
+    0.479, 0.480, 0.482, 0.484, 0.498, 0.505, 0.506, 0.507, 0.513,
+    0.522, 0.530, 0.537, 0.538, 0.538, 0.546, 0.548, 0.567, 0.588,
+    0.591, 0.597, 0.600, 0.601, 0.626, 0.656, 0.660, 0.756, 0.760,
+    0.984,
+)
 PLAYER_POLL_SECONDS = 0.1
 BOSS_TIMER_POLL_SECONDS = 0.5
 BOSS_ACTIVE_POLL_SECONDS = 0.2
@@ -50,6 +65,8 @@ BOSS_KILL_CONFIRM_SECONDS = 1.5
 BOSS_COMBAT_TIMEOUT_SECONDS = 90.0
 BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
 BOSS_RETURN_DISTANCE = 120
+BOSS_RETURN_STALL_SECONDS = 3.0
+BOSS_RETURN_PROGRESS_DISTANCE = 25
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -70,6 +87,14 @@ def ascii_text(value):
     if not isinstance(value, (str, unicode)):
         value = repr(value)
     return "".join("%c" % ord(ch) if 32 <= ord(ch) < 127 else "?" for ch in value)
+
+
+def next_reaction_click_delay():
+    delay = (random.choice(REACTION_CLICK_DELAY_SAMPLES) +
+             random.uniform(-REACTION_CLICK_DELAY_JITTER,
+                            REACTION_CLICK_DELAY_JITTER))
+    return max(REACTION_CLICK_DELAY_MIN,
+               min(REACTION_CLICK_DELAY_MAX, delay))
 
 
 def disk_log(message):
@@ -341,6 +366,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_initial_fill = True
         self.hunter_batch_add_count = 0
         self.hunter_next_add = 0.0
+        self.priority_event_vid = 0
+        self.priority_event_vnum = 0
+        self.priority_event_name = None
+        self.priority_event_missing_since = None
         self.anchor_channel = None
         self.anchor_map = None
         self.boss_vnum = None
@@ -366,7 +395,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.boss_saved_mouse_func = None
         self.boss_switch_dialog = None
         self.boss_returning = False
-        self.boss_return_next_move = 0.0
+        self.boss_return_best_distance = None
+        self.boss_return_last_progress = 0.0
+        self.boss_return_move_sent = False
         self.boss_last_error = None
         self.boss_next_poll = 0.0
         self.reaction_enabled = True
@@ -374,6 +405,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_next_poll = 0.0
         self.reaction_started = False
         self.reaction_last_ball = None
+        self.reaction_pending_ball = None
+        self.reaction_click_at = 0.0
         self.reaction_last_error = None
         self.reaction_pause_started = None
         self.reaction_native_paused = False
@@ -496,7 +529,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.queue_admission_guard.SetOwner(self)
         self.gameplay_phase = self.phase_guard.current_phase
         self.AddLine("Ready. Log file: metin_scanner.log")
-        self.AddLine("Native manual queue wrapper: %s" %
+        self.AddLine("Native full-input queue wrapper: %s" %
                      ("active" if self.native_queue_wrapper_active else "UNAVAILABLE"))
         try:
             saved_config = read_config_file()
@@ -690,6 +723,13 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_initial_fill = True
         self.hunter_batch_add_count = 0
         self.hunter_next_add = 0.0
+        self.ResetPriorityEventState()
+
+    def ResetPriorityEventState(self):
+        self.priority_event_vid = 0
+        self.priority_event_vnum = 0
+        self.priority_event_name = None
+        self.priority_event_missing_since = None
 
     def HasActiveNativeAutomation(self):
         return bool(self.hunter_enabled or self.boss_modes_paused or
@@ -941,6 +981,8 @@ class MetinScanner(ui.BoardWithTitleBar):
                     self.AddLine("Reaction game closed")
                 self.reaction_started = False
                 self.reaction_last_ball = None
+                self.reaction_pending_ball = None
+                self.reaction_click_at = 0.0
                 return False
             self.reaction_next_poll = now + REACTION_POLL_SECONDS
             if self.reaction_pause_started is None:
@@ -977,8 +1019,19 @@ class MetinScanner(ui.BoardWithTitleBar):
             ball_key = (ball_time, slot)
             if ball_key == self.reaction_last_ball:
                 return True
+            if ball_key != self.reaction_pending_ball:
+                delay = next_reaction_click_delay()
+                self.reaction_pending_ball = ball_key
+                self.reaction_click_at = now + delay
+                self.AddLine("Reaction game slot %d observed; click in %.2fs" %
+                             (slot, delay))
+                return True
+            if now < self.reaction_click_at:
+                return True
             window._ReactionGameWindow__OnClickSlot(slot)
             self.reaction_last_ball = ball_key
+            self.reaction_pending_ball = None
+            self.reaction_click_at = 0.0
             self.AddLine("Reaction game clicked slot %d" % slot)
             self.reaction_last_error = None
             return True
@@ -1105,7 +1158,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Boss Sweep: select the boss and click Mark Boss first")
             return
         if not self.native_queue_wrapper_active:
-            self.AddLine("Boss Sweep unavailable: native manual queue wrapper missing")
+            self.AddLine("Boss Sweep unavailable: native full-input queue wrapper missing")
             return
         if not self.running:
             self.Start()
@@ -1149,6 +1202,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_initial_fill = True
         self.hunter_batch_add_count = 0
         self.hunter_next_add = 0.0
+        self.ResetPriorityEventState()
         self.DisableAndClearMetinQueue()
         self.boss_modes_paused = True
         self.hunter_label.SetText("Queue: paused for boss")
@@ -1241,7 +1295,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def StartBossAttack(self, candidate):
         if not self.native_queue_wrapper_active:
-            raise RuntimeError("native manual queue wrapper missing")
+            raise RuntimeError("native full-input queue wrapper missing")
         distance, vid, px, py = candidate
         self.boss_target_vid = vid
         player.SetAttackKeyState(False)
@@ -1331,7 +1385,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.boss_state = BOSS_RETURN_POSITION
         self.boss_state_started = time.time()
         self.boss_deadline = self.boss_state_started + 30.0
-        self.boss_return_next_move = 0.0
+        self.boss_return_best_distance = None
+        self.boss_return_last_progress = self.boss_state_started
+        self.boss_return_move_sent = False
         self.boss_label.SetText("Returning to marked spot on CH%d" % self.anchor_channel)
         self.AddLine("Returning to Metin anchor %d, %d on CH%d" %
                      (self.anchor_position[0], self.anchor_position[1],
@@ -1363,6 +1419,11 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.boss_next_poll = now + BOSS_ACTIVE_POLL_SECONDS
         try:
             if self.boss_state == BOSS_WAIT_TIMER:
+                candidate = self.FindMarkedBoss()
+                if candidate is not None:
+                    self.AddLine("Boss visible while waiting; starting sweep without timer edge")
+                    self.BeginBossSweep()
+                    return
                 remaining = self.ReadBossTimer()
                 if remaining is None:
                     return
@@ -1438,10 +1499,26 @@ class MetinScanner(ui.BoardWithTitleBar):
                     self.StopBossSweep("Sweep complete; back on CH%d at Metin anchor" %
                                        self.anchor_channel, True)
                     return
-                if now >= self.boss_return_next_move:
+                if (self.boss_return_best_distance is None or
+                        distance <= (self.boss_return_best_distance -
+                                     BOSS_RETURN_PROGRESS_DISTANCE)):
+                    self.boss_return_best_distance = distance
+                    self.boss_return_last_progress = now
+                if not self.boss_return_move_sent:
                     chr.MoveToDestPosition(player.GetMainCharacterIndex(),
                                            self.anchor_position[0], self.anchor_position[1])
-                    self.boss_return_next_move = now + 1.0
+                    self.boss_return_move_sent = True
+                elif (now - self.boss_return_last_progress >=
+                      BOSS_RETURN_STALL_SECONDS):
+                    if distance <= self.radius:
+                        self.StopBossSweep(
+                            "Sweep complete on CH%d; return blocked inside Metin circle" %
+                            self.anchor_channel, True)
+                        return
+                    chr.MoveToDestPosition(player.GetMainCharacterIndex(),
+                                           self.anchor_position[0], self.anchor_position[1])
+                    self.boss_return_best_distance = distance
+                    self.boss_return_last_progress = now
                 if now >= self.boss_deadline:
                     self.StopBossSweep("Sweep complete on CH%d; return movement timed out" %
                                        self.anchor_channel, True)
@@ -1534,7 +1611,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Metin Hunter OFF; queue cleared")
             return
         if not self.native_queue_wrapper_active:
-            self.AddLine("Metin Hunter unavailable: native manual queue wrapper missing")
+            self.AddLine("Metin Hunter unavailable: native full-input queue wrapper missing")
             return
         if not self.running:
             self.Start()
@@ -1667,6 +1744,103 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Metin Hunter initial queue armed with %d additions" %
                          self.hunter_batch_add_count)
 
+    def StartPriorityEventMetin(self, candidate):
+        distance, vid, name, expected_vnum = candidate
+        try:
+            vnum = int(chr.GetVirtualNumber(vid))
+            live_name = ascii_text(chr.GetNameByVID(vid))
+            if (vnum != expected_vnum or
+                    PRIORITY_EVENT_METIN_NAME not in live_name.lower()):
+                return False
+            name = live_name
+            if not nonplayer.IsMonsterStone(vnum):
+                return False
+            is_stone = getattr(chr, "IsStone", None)
+            if not callable(is_stone) or not is_stone(vid):
+                return False
+            reason = self.queue_admission_guard.RejectionReason(vid)
+            if reason is not None:
+                raise RuntimeError(reason)
+            px, py = chr.GetPixelPosition(vid)[:2]
+            player_x, player_y = player.GetMainCharacterPosition()[:2]
+            distance = int(((px - player_x) ** 2 +
+                            (py - player_y) ** 2) ** 0.5)
+            center_x, center_y = (self.anchor_position or
+                                  (player_x, player_y))[:2]
+            circle_distance = int(((px - center_x) ** 2 +
+                                   (py - center_y) ** 2) ** 0.5)
+            if distance > self.radius or circle_distance > self.radius:
+                return False
+            can_attack = getattr(player, "CanAttackInstance", None)
+            if callable(can_attack) and not can_attack(vid):
+                raise RuntimeError("native actor cannot be attacked")
+            self.DisableAndClearMetinQueue()
+            self.hunter_queued_vids.clear()
+            self.hunter_initial_fill = True
+            self.hunter_batch_add_count = 0
+            self.hunter_next_add = 0.0
+            player.AddMetinQueueAllowedRace(vnum)
+            player.MetinQueueSetEnabled(1)
+            player.MetinQueueAdd(vid)
+            if int(player.MetinQueueGetSize()) < 1:
+                raise RuntimeError("one-target queue rejected VID %d" % vid)
+            self.priority_event_vid = int(vid)
+            self.priority_event_vnum = vnum
+            self.priority_event_name = name or "Legendary Metinstone"
+            self.priority_event_missing_since = None
+            self.hunter_label.SetText("Priority: %s" % self.priority_event_name)
+            self.AddLine("Priority event Metin found: %s [vnum %d, VID %d], distance %d; ordinary queue cancelled" %
+                         (self.priority_event_name, vnum, vid, distance))
+            return True
+        except Exception as exc:
+            try:
+                self.DisableAndClearMetinQueue()
+                if self.hunter_enabled:
+                    player.MetinQueueSetEnabled(1)
+            except Exception:
+                pass
+            self.ResetPriorityEventState()
+            self.hunter_initial_fill = True
+            self.hunter_batch_add_count = 0
+            self.hunter_next_add = 0.0
+            self.AddLine("Priority event Metin rejected safely: %s" % ascii_text(exc))
+            return False
+
+    def FinishPriorityEventMetin(self):
+        name = self.priority_event_name or "Legendary Metinstone"
+        self.DisableAndClearMetinQueue()
+        self.ResetPriorityEventState()
+        self.hunter_queued_vids.clear()
+        self.hunter_initial_fill = True
+        self.hunter_batch_add_count = 0
+        self.hunter_next_add = 0.0
+        if self.hunter_enabled:
+            player.MetinQueueSetEnabled(1)
+            self.hunter_label.SetText("Queue: refilling after priority Metin")
+        self.AddLine("Priority event Metin gone: %s; ordinary Hunter restored" % name)
+
+    def HandlePriorityEventMetin(self, candidates, now):
+        if not self.hunter_enabled or self.boss_modes_paused:
+            return False
+        candidates = sorted(candidates)
+        if self.priority_event_vid:
+            for candidate in candidates:
+                if int(candidate[1]) == self.priority_event_vid:
+                    self.priority_event_missing_since = None
+                    return True
+            if candidates:
+                return self.StartPriorityEventMetin(candidates[0])
+            if self.priority_event_missing_since is None:
+                self.priority_event_missing_since = now
+                return True
+            if now - self.priority_event_missing_since < PRIORITY_EVENT_MISSING_SECONDS:
+                return True
+            self.FinishPriorityEventMetin()
+            return False
+        if not candidates:
+            return False
+        return self.StartPriorityEventMetin(candidates[0])
+
     def Scan(self, player_position):
         vids = visible_vids()
         x, y = (self.anchor_position or player_position)[:2]
@@ -1675,6 +1849,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         metin_offsets = []
         other_offsets = []
         candidates = []
+        priority_event_candidates = []
         for vid in vids:
             try:
                 vnum = chr.GetVirtualNumber(vid)
@@ -1695,6 +1870,9 @@ class MetinScanner(ui.BoardWithTitleBar):
                 player_distance = int(((px - player_x) ** 2 + (py - player_y) ** 2) ** 0.5)
                 if player_distance <= self.radius:
                     candidates.append((player_distance, vid, name))
+                    if PRIORITY_EVENT_METIN_NAME in name.lower():
+                        priority_event_candidates.append(
+                            (player_distance, vid, name, int(vnum)))
                 key = (vnum, name)
                 if key not in found:
                     found[key] = []
@@ -1713,6 +1891,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.UpdateMap(metin_offsets, other_offsets)
         self.AddLine(summary)
         try:
+            now = time.time()
+            if self.HandlePriorityEventMetin(priority_event_candidates, now):
+                return
             self.FeedMetinQueue(candidates)
         except Exception as exc:
             self.hunter_enabled = False

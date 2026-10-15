@@ -148,7 +148,59 @@ eligible Metin does not require manual camera rotation. V27 also completed a
 full eight-channel Boss Sweep and returned to the anchor before restoring the
 paced Hunter queue. V28 removes the extra `Min` title-bar button and changes X
 to hide the panel without stopping scanning, Hunter, or Boss Sweep. Left
-Ctrl+F8 uses the same non-stopping hide/show behavior.
+Ctrl+F8 uses the same non-stopping hide/show behavior. V29 also checks the
+current actor snapshot every 0.5 seconds while Boss Sweep waits, so a visible
+marked boss starts a new sweep even when the map timer remains stale at zero.
+V30 waits a fresh random 0.50-0.85 seconds after observing each Reaction Game
+ball before clicking it. Boss Sweep now sends one return command and watches
+for progress; after three seconds without meaningful progress, it restores
+Hunter if the character is already inside the configured Metin circle. If the
+character is outside the circle, it retries at that slower stall interval.
+V31 recognizes any validated Metin whose case-insensitive name contains
+`Legendary Metinstone`. While Hunter is ON and the stone is inside the current
+circle/radius, it clears the ordinary queue and starts a one-target priority
+queue through the native manual-click wrapper. After the priority VID has been
+absent for 1.5 seconds, normal paced Hunter refill resumes. Reaction safety and
+an active Boss Sweep retain priority over this event path.
+V32 replaces v30's uniform Reaction delay with the user's measured manual
+profile: 37 clean clicks from four standalone-recorder rounds. Each ball draws
+one recorded clean latency plus random +/-25 ms jitter, clamped to 0.30-0.99
+seconds. The measured clean profile has a 522 ms median, 539 ms mean, and about
+658 ms p90. Three samples involving wrong clicks were deliberately excluded
+because Auto Reaction does not intentionally click an incorrect slot.
+V33 restores the conservative on-screen projection requirement for both
+ordinary and Legendary Metin queue admission. When Hunter has at most two
+queued targets, at least one eligible Metin remains inside the configured
+circle, and none of those Metins is currently projected inside the client
+window, the client-native `app.RotateCamera` control rotates the camera. A
+10 Hz visibility check stops rotation as soon as an in-circle Metin becomes
+visible and schedules an immediate scan. Rotation also stops for Hunter OFF,
+Stop, Reaction safety, Boss Sweep, gameplay exit, or a queue above two. Each
+search is capped at eight seconds and waits two seconds before retrying.
+V34 corrects the first live camera-search defect: visibility from a stone that
+is already in the native queue no longer suppresses rotation. Camera search
+filters out every VID already admitted by Hunter and the active Legendary VID,
+then asks whether any remaining unqueued in-circle target is visible. Thus a
+visible current combat target can coexist with camera rotation searching for
+the next target.
+
+V35 removes the projected-on-screen admission filter and the entire camera
+rotation/search path. It also replaces the partial native actor-click wrapper:
+each Hunter/Boss queue request now resolves the live native actor, scopes it as
+the character manager's picked actor, and executes the client's complete
+mouse-state press/release handler before restoring the prior picker state. This
+runs the higher client input/player/item/terrain gates that the v26-v34 wrapper
+skipped. Continuous Hunter refill and the other automation modes are unchanged.
+The implementation passes local regression and x64 build checks but still
+requires a fresh Hunter-only live test; it is not yet a confirmed logout cure.
+
+Auto Reaction has also completed a live Reaction Game: it requested Play,
+clicked all five observed slots, detected the window closing, and ended the
+safety pause without an error. That live v29 sequence used uniformly fast
+53-55 ms clicks; v30's requested randomized timing has passed local tests but
+still requires a fresh live Reaction Game. The isolated solver test had Hunter
+and Boss Sweep OFF; manual-reaction testing separately verified Hunter
+pause/restoration.
 
 V16 adds Save, Load, and Auto-load controls. The local
 `client_feature_config.txt` stores the radius, Metin anchor, boss identity and

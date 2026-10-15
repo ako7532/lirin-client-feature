@@ -1,11 +1,11 @@
 # Lirin Client Feature - Continuation Handover
 
-Updated: 2026-10-15 after the successful v27 live Boss Sweep and v28 UI change
+Updated: 2026-10-15 after the v35 full-input native queue correction
 
 ## Current continuation brief - read before the historical sections
 
 The user requested investigation and a fix for repeated Hunter logouts. Current
-Python source is v28. V25 restored the requested continuous refill behavior
+Python source is v35. V25 restored the requested continuous refill behavior
 and added partial actor checks, but its live test still disconnected during
 sustained Hunter operation. Native comparison then verified the remaining
 structural defect: Python `player.MetinQueueAdd` called low-level insertion
@@ -13,12 +13,142 @@ directly, bypassing the complete native actor-click wrapper used by a manual
 click. V26 changes the loader to redirect that binding through the exact
 native wrapper, added an on-screen projection guard, and fails closed if the
 wrapper is unavailable. V26 then ran for approximately 40 minutes 42 seconds
-without a logout, including a final uninterrupted 24-minute segment. The user
-accepts this as the logout fix. V27 keeps the native wrapper, removes the
+without a logout, including a final uninterrupted 24-minute segment. That was
+initially accepted as the logout fix, but later controlled failures show it was
+only a successful run, not proof of a durable cure. V27 keeps the native wrapper, removes the
 unproven camera projection restriction, and passed live Hunter and full Boss
 Sweep use. V28 removes the separate Min button and makes X hide the panel
-without stopping automation. Do not revert to the rejected one-shot or
-repeated 8-15 second batch behavior.
+without stopping automation. V29 fixes a live-observed repeat-sweep gap by
+starting when the marked boss is visible even if the timer remains stale at
+zero. After the mixed v29 disconnect, the user explicitly requested v30:
+Reaction clicks now wait a fresh random 0.50-0.85 seconds per observed ball,
+and Boss return no longer repeats movement every second. It detects a
+three-second stall and restores Hunter when already inside the configured
+Metin circle; when outside, it retries at the stall interval. Do not revert to
+the rejected one-shot or repeated 8-15 second batch behavior.
+
+V31 is a separate user-requested event priority. Live PID 21568 exposed
+`Legendary Metinstone II` VNUM 39921 inside the configured circle from
+10:01:29.424 through 10:02:36.576. The implementation intentionally matches
+all validated stones whose case-insensitive name contains
+`Legendary Metinstone`, not that one VNUM. While Hunter is ON, an in-radius
+match cancels the ordinary queue and enters a one-target native-wrapper queue.
+After the selected VID is absent for 1.5 seconds, paced Hunter refill resumes.
+Reaction safety and an active Boss Sweep remain higher priority. Local tests
+pass using a different Legendary VNUM. The later live result is recorded below.
+
+V31 was subsequently injected into fresh game PID 25444 at 10:09:45 and the
+priority path ran successfully three times. Ordinary queues were cancelled,
+the Legendary stone became the sole queue target, and ordinary Hunter restored
+after disappearance. A full eight-channel Boss Sweep also completed and
+restored Hunter. The native game log then recorded a real remote disconnect at
+10:37:26.645; the feature observed `net.Disconnect`/`NewLoginWindow` at
+10:37:29.463. Auto Reaction was ON but no Reaction Game appeared and it made no
+start request or click in this PID. This occurrence therefore rules out solver
+click cadence as its cause. It remains a mixed Hunter/Boss/Legendary run and
+does not isolate the remaining queue, camera-admission, or channel-sweep paths.
+
+V32 uses the user's standalone timing recording at
+`C:\Users\andrej-pc\Documents\projects\reaction-timing-20261015-104324.csv`.
+It contains 40 manual clicks across four rounds, zero misses, and three clicks
+with a preceding wrong click. The 37 clean samples have a 522 ms median, 539 ms
+mean, 658 ms p90, and 984 ms maximum. Each new live ball now samples one of
+those clean delays plus independent +/-25 ms jitter, clamped to 300-990 ms.
+Wrong-click recovery times are excluded because the solver never deliberately
+clicks a wrong slot. Local tests pass; v32 was not injected into PID 25444.
+
+After the 10:37 disconnect, the user relogged in the same PID and started
+Hunter at 10:42:22. No Boss Sweep ran. Legendary priority ran twice and last
+restored ordinary Hunter at 10:44:46. No Reaction Game action occurred. The
+native log records another remote disconnect at 10:50:02.195 and the feature
+observed the login transition at 10:50:05.013. This second interval lasted
+about 7 minutes 40 seconds, but it reused the process and included priority
+transitions, so it was not a pure fresh-process ordinary-Hunter isolation.
+
+V33 restores the conservative projected-on-screen requirement for both
+ordinary and Legendary queue admission. If the native queue contains at most
+two targets, in-circle Metins exist, and none is on screen, the feature uses
+the client's native `app.RotateCamera` control. It polls projection at 10 Hz,
+stops immediately when an in-circle Metin becomes visible, and requests a new
+scan. Rotation stops for Hunter OFF, Stop, Reaction safety, Boss Sweep,
+priority combat, gameplay exit, or a queue above two. Each search is bounded
+to eight seconds with a two-second retry. Local regression and ASCII compile
+passed before injection. Fresh PID 7364 then showed the search trigger at
+11:11:35.013, followed by a projection-based stop only 305 ms later and an
+immediate 0->1 queue addition. The user did not observe camera movement and
+correctly identified that v33 counted already queued stones when deciding
+whether another target was visible.
+
+V34 filters camera-search candidates against `hunter_queued_vids` and excludes
+the active Legendary VID. A stone already being handled by the native queue
+can no longer suppress rotation toward a different off-screen stone. Rotation
+may continue during priority combat to locate a future ordinary target, while
+the existing priority handler still blocks ordinary queue admission. The local
+regression reproduces the visible-queued plus off-screen-unqueued case and
+passes; v34 has not been injected or live-tested.
+
+The later isolation supersedes the camera hypothesis. An exact isolated v28
+copy from commit `25ea2964f4518bbbe6fe6b301d569e060e9ac0a7` ran Hunter with
+Boss Sweep, Auto Reaction, Legendary priority, and camera rotation absent, yet
+returned to login after approximately 3 minutes 35 seconds. Fresh v33 restored
+the on-screen gate and also returned to login after approximately 8 minutes
+43 seconds. The user reports that comparable queue use without injection, done
+manually, does not log out. Therefore on-screen projection and camera rotation
+are not the root fix, and neither later mixed mode is required for the failure.
+
+Native decompilation then identified a deeper mismatch. The v26-v34 wrapper
+called `CPythonPlayer` actor-click at RVA `0x003EBDD0` directly with a scanner
+VID. A real smart left click first enters the mouse-state handler at RVA
+`0x003E5940`, consults the native character picker, and runs the higher input,
+player-state, item, terrain, and cooldown gates before actor-click. V35 removes
+all Python on-screen/camera logic and changes the patched `MetinQueueAdd`
+binding to resolve the live native actor, temporarily present it through the
+character manager's picked-actor slot, and execute a full press/release through
+`0x003E5940`. The prior picker pointer is restored synchronously even on an SEH
+unwind, and an already-held mouse state fails closed. Continuous Hunter refill,
+Boss Sweep, Legendary priority, and Auto Reaction behavior are otherwise
+preserved. Local regression, ASCII parsing, diff whitespace validation, and the
+x64 feature-loader build pass. V35 has not yet been injected or live-tested;
+do not describe it as a confirmed logout cure.
+
+### Standalone Reaction timing recorder
+
+The user requested a separate Windows program, independent of Lirin, for recording
+their natural Reaction Game timing. Do not force-open or reuse the live
+`ReactionGameWindow`: its Play and slot handlers are coupled to the game/server.
+The recorder must not inject a DLL, attach to/read/write the game process,
+import client modules, open a network connection, or submit any start, click,
+score, or result. It should be a standalone `.exe` in its own project under
+this repository (prefer the already-supported .NET 8 Windows toolchain).
+
+The local window should visually reproduce the six-slot circular interaction
+closely enough for timing practice. The user presses Start, one randomized
+slot activates at a time, and the user clicks it manually. Record locally for
+each stimulus: round, sequence index, slot, high-resolution appearance time,
+click time, reaction latency in milliseconds, time since the preceding click,
+and wrong-click/miss information. Save raw samples to CSV and show a compact
+summary including sample count, minimum, median, mean, 90th percentile, and
+maximum. Support multiple rounds so the result is a distribution rather than
+one five-click sample. This tool is measurement-only; applying its results to
+Auto Reaction is a later, separate decision.
+
+Auto Reaction received its first live completion proof on 2026-10-15. The
+feature requested Play, clicked the observed slot sequence 0,5,4,2,5, observed
+the window close, and ended the safety pause without an error. Hunter and Boss
+Sweep were OFF for this isolated solver test, so it did not repeat the already
+separately verified queue-restoration path.
+
+That functional result is not a long-term safety result. In the same PID 26232
+session, Hunter and Boss Sweep were re-enabled at 09:48:48. Boss Sweep checked
+all channels without a boss, repeatedly commanded return movement until its
+30-second timeout at 09:49:59, and restored Hunter. The feature observed
+`net.Disconnect` plus `NewLoginWindow` at 09:53:36.473; the native game log
+independently recorded `Remote disconnected from game.lirin.to:11035` at
+09:53:40.354. This was a real remote disconnect, but the combined run cannot
+attribute it uniquely to camera-independent Hunter admission, the 53-55 ms
+uniform reaction clicks, channel sweeping/return movement, or resumed Hunter.
+V27-v29 must not be described as disconnect-safe. V26 with its projection
+guard remains the only long successful Hunter-only run.
 
 ### Required Hunter behavior
 
@@ -32,7 +162,8 @@ repeated 8-15 second batch behavior.
   once per random 30-60 minute interval. This is a preference, not implemented,
   and must not be presented as a proven fix or a way to defeat enforcement.
 - Investigate the actual fault before guessing additional delay values.
-- Preserve Auto Reaction behavior. Do not tune it during this investigation.
+- Preserve the user-requested v30 Auto Reaction delay range of 0.50-0.85
+  seconds unless a live test proves the Reaction Game cannot accept it.
 
 ### Latest controlled live evidence
 
@@ -209,7 +340,8 @@ eight-channel Boss Sweep, returned to the original CH7 anchor, and restored the
 paced Hunter queue. V28 removes the separate `Min` title-bar button and wires X
 to the same non-stopping hide behavior used by Left Ctrl+F8. The native wrapper,
 `chr.IsStone`, observed exclusion filters, distance limits, and refill cadence
-are unchanged.
+are unchanged. V29 adds a 0.5-second visible-boss check in the timer-wait state;
+the timer edge remains supported but is no longer the only repeat trigger.
 
 The observed exclusion sets are deliberately conservative but incomplete:
 state already present before injection and state changed only by native calls
@@ -259,14 +391,18 @@ duration, and millisecond timestamps. Native calls may bypass Python hooks;
 raw TCP capture can distinguish FIN/RST/timeout but may reveal no server reason.
 Avoid a broad intrusive packet hook until its necessity and method are clear.
 
-The next bounded test is a clean v28 UI run in a fresh game process. Start
-Hunter, click X, and confirm scanning and queue activity continue; Left
-Ctrl+F8 must reopen the panel. Do not add automatic camera rotation unless live
-evidence proves it necessary. A fresh process is required because an already
-injected DLL leaves its method pointer in process memory and a later loader
-deliberately refuses to overwrite an unexpected binding.
+Do not repeat the combined v29 run. V30 separately corrected two observed
+behaviors: randomized reaction-click timing and stalled Boss return handling.
+The strongest Hunter regression clue remains that v26 with the projection
+guard ran for about 40 minutes 42 seconds, whereas v27-v31 removed that guard.
+V34 now restores that gate and corrects the camera search to ignore targets
+already in the queue. Test v34 as Hunter-only in a fresh process before
+enabling Boss Sweep or exercising
+Auto Reaction. A fresh process is required because an already injected DLL
+leaves its method pointer in process memory and a later loader deliberately
+refuses to overwrite an unexpected binding.
 
-Current v28 modified tracked files must be checked with `git status`; preserve
+Current v34 modified tracked files must be checked with `git status`; preserve
 them rather than replacing them with HEAD.
 Launcher remains usable at `LirinFeatureLauncher\bin\Release\net8.0-windows`;
 it invokes the repository runner and rebuilt loader. For new loader behavior,
@@ -278,8 +414,8 @@ claims, and hypothesis rankings.
 
 This is the current continuation handover for a new chat. The first task is to
 investigate the repeated game-server disconnects by tracing this feature's code
-and the already unpacked/decompiled client functions. Do not start by injecting
-again or by changing Auto Reaction.
+and the already unpacked/decompiled client functions. Do not inject again until
+the current v34 local changes and the intended isolated live test are reviewed.
 
 ## 1. Read this first
 
@@ -345,7 +481,7 @@ acceptance.
 
 ## 4. Current source and live-version state
 
-The working source is now `FEATURE_VERSION = 28` in `client_feature.py`.
+The working source is now `FEATURE_VERSION = 34` in `client_feature.py`.
 The default radius is 2500.
 
 The latest source changes are local only:
@@ -402,6 +538,32 @@ The latest source changes are local only:
   restoration.
 - v28: removes the separate Min button and changes X to hide without stopping
   automation. Left Ctrl+F8 retains the same non-stopping hide/show behavior.
+- v29: while waiting for the next spawn, checks the current actor snapshot every
+  0.5 seconds and starts a sweep when the marked boss is visible. This fixes the
+  live-observed case where the boss timer stayed at zero after a completed
+  sweep and therefore never re-armed.
+- v30: schedules each newly observed Reaction Game ball once with a random
+  0.50-0.85 second delay. Boss return sends one movement request, tracks
+  meaningful progress, and after a three-second stall restores Hunter if the
+  character is already inside the configured Metin circle; outside the circle
+  it retries only at the stall interval.
+- v31: with Hunter ON, any validated in-radius stone whose case-insensitive
+  name contains `Legendary Metinstone` interrupts and clears the ordinary
+  queue, becomes the only native-wrapper queue target, and restores paced
+  Hunter refill after its VID is absent for 1.5 seconds. Reaction safety and
+  an active Boss Sweep retain priority.
+- v32: replaces the uniform 0.50-0.85 second Reaction delay with an empirical
+  profile from 37 clean manual clicks. Each ball samples one recorded latency,
+  adds +/-25 ms random jitter, and clamps to 0.30-0.99 seconds. Three
+  wrong-click recovery samples were excluded.
+- v33: restores on-screen admission for ordinary and Legendary Metins. With a
+  native queue size of two or less, in-circle candidates but no visible
+  candidate starts a bounded native camera rotation. Projection is checked at
+  10 Hz; visibility stops rotation and triggers an immediate scan. An
+  eight-second cap and two-second retry prevent an endless rotation.
+- v34: camera search ignores VIDs already admitted by Hunter and the active
+  Legendary VID. A visible current queue target therefore no longer prevents
+  rotation toward an off-screen target available for the next queue addition.
 
 V20 was live-tested with Hunter and disconnected after about seven minutes.
 V21 was live-tested with Hunter and disconnected again after about 3 minutes
@@ -587,11 +749,13 @@ The intended combined flow is:
    original channel and Metin anchor.
 5. Hunter resumes stone farming.
 
-## 10. Auto Reaction boundary
+## 10. Auto Reaction boundary (historical; superseded by v30 request)
 
-Do not change, extend, or tune Auto Reaction during the logout investigation.
-Its native-queue and asynchronous-state concerns are already documented in the
-older handover and tests.
+The earlier instruction was not to tune Auto Reaction during the logout
+investigation. The user later explicitly requested v30's 0.50-0.85 second
+random click delay after seeing the live 53-55 ms cadence. Preserve that new
+range. Its native-queue and asynchronous-state concerns remain documented in
+the older handover and tests.
 
 Important live rule: Auto Reaction defaults ON when no saved configuration is
 loaded. The general Stop button does not disable it. During the first live test

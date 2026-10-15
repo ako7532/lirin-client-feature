@@ -79,32 +79,29 @@ sys.modules["net"] = net
 chr_module = types.ModuleType("chr")
 chr_module.GetVirtualNumber = lambda vid: {
     1: 8003, 2: 8004, 3: 100, 4: 8003, 5: 8004, 6: 8003,
-    7: 8004, 8: 8003, 9: 8004, 10: 2493
+    7: 8004, 8: 8003, 9: 8004, 10: 2493, 11: 39922
 }[vid]
 chr_module.GetPixelPosition = lambda vid: {
     1: (300, 400, 0), 2: (1200, 0, 0), 3: (100, 0, 0),
     4: (600, 0, 0), 5: (800, 0, 0), 6: (1000, 0, 0),
     7: (1400, 0, 0), 8: (1500, 0, 0), 9: (1600, 0, 0),
-    10: (2100, 0, 0)
+    10: (2100, 0, 0), 11: (2250, 0, 0)
 }[vid]
 chr_module.GetNameByVID = lambda vid: {
     1: "Battle Metin", 2: "Jealousy Metin", 3: "Wolf",
     4: "Battle Metin", 5: "Jealousy Metin", 6: "Battle Metin",
     7: "Jealousy Metin", 8: "Battle Metin", 9: "Jealousy Metin",
-    10: "Test Boss"
+    10: "Test Boss", 11: "Legendary Metinstone III"
 }[vid]
 actor_stone_overrides = {}
 chr_module.IsStone = lambda vid: actor_stone_overrides.get(
-    vid, chr_module.GetVirtualNumber(vid) in (8003, 8004))
-project_position_overrides = {}
-chr_module.GetProjectPosition = lambda vid, height: project_position_overrides.get(
-    vid, (960, 540))
+    vid, chr_module.GetVirtualNumber(vid) in (8003, 8004, 39922))
 move_requests = []
 chr_module.MoveToDestPosition = lambda vid, x, y: move_requests.append((vid, x, y))
 sys.modules["chr"] = chr_module
 
 nonplayer = types.ModuleType("nonplayer")
-nonplayer.IsMonsterStone = lambda vnum: vnum in (8003, 8004)
+nonplayer.IsMonsterStone = lambda vnum: vnum in (8003, 8004, 39922)
 sys.modules["nonplayer"] = nonplayer
 
 player = types.ModuleType("player")
@@ -136,7 +133,7 @@ def add_metin(vid):
 player.MetinQueueAdd = add_metin
 player.MetinQueueClear = clear_metin_queue
 player.AddMetinQueueAllowedRace = lambda vnum: allowed_queue_races.add(int(vnum))
-player.CanAttackInstance = lambda vid: vid in range(1, 11)
+player.CanAttackInstance = lambda vid: vid in range(1, 12)
 native_immune_vids = set()
 native_untargetable_vids = set()
 def set_native_vid_state(values, vid, enabled):
@@ -259,7 +256,7 @@ with tempfile.TemporaryDirectory() as directory:
         panel.StartBossAttack((100, 10, 100, 100))
         raise AssertionError("Boss attack must require the native queue wrapper")
     except RuntimeError as exc:
-        assert "native manual queue wrapper missing" in str(exc)
+        assert "native full-input queue wrapper missing" in str(exc)
     panel.native_queue_wrapper_active = True
     # Scanner-only Stop must not clear a native queue the feature does not own.
     panel.running = True
@@ -315,26 +312,55 @@ with tempfile.TemporaryDirectory() as directory:
     reaction_window.visible = True
     assert panel.PollReactionGame(10.0)
     assert reaction_window.start_count == 1
+    reaction_globals = panel.PollReactionGame.__globals__
+    feature_random = reaction_globals["random"]
+    original_choice = feature_random.choice
+    original_uniform = feature_random.uniform
+    delay_samples = reaction_globals["REACTION_CLICK_DELAY_SAMPLES"]
+    feature_random.choice = lambda values: min(values)
+    feature_random.uniform = lambda minimum, maximum: minimum
+    assert reaction_globals["next_reaction_click_delay"]() == 0.30
+    feature_random.choice = lambda values: max(values)
+    feature_random.uniform = lambda minimum, maximum: maximum
+    assert reaction_globals["next_reaction_click_delay"]() == 0.99
+    original_delay_function = reaction_globals["next_reaction_click_delay"]
+    scheduled_delays = []
+    def fixed_reaction_delay():
+        scheduled_delays.append(True)
+        return 0.60
+    reaction_globals["next_reaction_click_delay"] = fixed_reaction_delay
     panel.reaction_next_poll = 0.0
     assert panel.PollReactionGame(10.1)
-    assert reaction_window.clicked == [2]
+    assert reaction_window.clicked == []
+    assert scheduled_delays == [True]
     panel.reaction_next_poll = 0.0
     panel.PollReactionGame(10.2)
+    assert reaction_window.clicked == []
+    panel.reaction_next_poll = 0.0
+    panel.PollReactionGame(10.71)
     assert reaction_window.clicked == [2]
     reaction_window.lastBallMoveTime = 2.0
     panel.reaction_next_poll = 0.0
-    panel.PollReactionGame(10.3)
+    panel.PollReactionGame(10.8)
+    assert reaction_window.clicked == [2]
+    assert scheduled_delays == [True, True]
+    panel.reaction_next_poll = 0.0
+    panel.PollReactionGame(11.41)
     assert reaction_window.clicked == [2, 2]
+    reaction_globals["next_reaction_click_delay"] = original_delay_function
+    feature_random.choice = original_choice
+    feature_random.uniform = original_uniform
+    assert len(delay_samples) == 37
     panel.boss_enabled = True
     panel.boss_state_started = 5.0
     panel.boss_deadline = 20.0
     reaction_window.visible = False
     panel.reaction_next_poll = 0.0
-    assert not panel.PollReactionGame(10.4)
+    assert not panel.PollReactionGame(11.5)
     assert panel.reaction_window is reaction_window
-    panel.ResumeAfterReaction(10.4)
+    panel.ResumeAfterReaction(11.5)
     assert panel.reaction_pause_started is None
-    assert round(panel.boss_deadline, 1) == 20.4
+    assert round(panel.boss_deadline, 1) == 21.5
     panel.boss_enabled = False
     assert len(panel.map_ring) == 96
     assert all(dot.visible for dot in panel.map_ring)
@@ -435,13 +461,11 @@ with tempfile.TemporaryDirectory() as directory:
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert not queue
     actor_stone_overrides.pop(7)
-    # V27 deliberately leaves camera direction out of admission; the exact
-    # native actor-click wrapper remains the authoritative eligibility gate.
-    project_position_overrides[7] = (-100, -100)
+    # Hunter admission no longer depends on screen projection or camera motion;
+    # the native wrapper now routes the target through the mouse-state path.
     panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert queue == [7]
-    project_position_overrides.pop(7)
     queue[:] = []
     panel.hunter_queued_vids.clear()
     player.SetMetinQueueVIDImmune(7, 1)
@@ -596,15 +620,29 @@ with tempfile.TemporaryDirectory() as directory:
     boss_update()
     assert move_requests[-1] == (999, 2000, 0)
     first_return_move_count = len(move_requests)
-    panel.boss_return_next_move = 0.0
     boss_update()
-    assert len(move_requests) == first_return_move_count + 1
-    player_position[0] = 2000
+    assert len(move_requests) == first_return_move_count
+    panel.boss_return_last_progress = time.time() - 3.1
     boss_update()
     assert panel.boss_state == "wait_timer", panel.boss_state
     assert panel.boss_enabled and panel.hunter_enabled and queue_state["enabled"]
     assert not target_state["attack"]
     assert target_state["mouse"] == 17
+    assert "return blocked inside Metin circle" in log_path.read_text(encoding="ascii")
+    player_position[0] = 2000
+
+    # A stale timer can remain at zero after a completed sweep. A live marked
+    # boss in the current actor snapshot must start the next sweep without
+    # requiring the user to toggle Boss Sweep OFF and ON.
+    assert not panel.boss_timer_armed
+    boss_timer.remaining = 0
+    Path(directory, "client_feature_vids.txt").write_text(
+        "PID %d\n10\n" % os.getpid(), encoding="ascii"
+    )
+    boss_update()
+    assert panel.boss_state == "find", panel.boss_state
+    assert not panel.hunter_enabled and not queue_state["enabled"]
+    assert "starting sweep without timer edge" in log_path.read_text(encoding="ascii")
     panel.ToggleBossSweep()
     assert not panel.boss_enabled and queue_state["enabled"]
 
@@ -618,6 +656,29 @@ with tempfile.TemporaryDirectory() as directory:
     panel.next_scan = 0
     panel.OnUpdate()
     assert queue == [2, 1], queue
+
+    # Any native stone whose name contains Legendary Metinstone interrupts the
+    # ordinary Hunter queue, remains the only queued target, then restores
+    # paced Hunter refill after its VID has been absent for the grace period.
+    Path(directory, "client_feature_vids.txt").write_text(
+        "PID %d\n1\n2\n11\n" % os.getpid(), encoding="ascii"
+    )
+    panel.Scan(tuple(player_position))
+    assert queue == [11] and queue_state["enabled"]
+    assert panel.priority_event_vid == 11 and panel.hunter_enabled
+    panel.Scan(tuple(player_position))
+    assert queue == [11]
+    Path(directory, "client_feature_vids.txt").write_text(
+        "PID %d\n1\n2\n" % os.getpid(), encoding="ascii"
+    )
+    panel.Scan(tuple(player_position))
+    assert queue == [11] and panel.priority_event_missing_since is not None
+    panel.priority_event_missing_since = time.time() - 1.6
+    panel.Scan(tuple(player_position))
+    assert panel.priority_event_vid == 0 and panel.hunter_enabled
+    assert queue and queue[0] != 11 and queue_state["enabled"]
+    assert "ordinary queue cancelled" in log_path.read_text(encoding="ascii")
+    assert "ordinary Hunter restored" in log_path.read_text(encoding="ascii")
     panel.Stop()
     assert not panel.running
     assert not panel.hunter_enabled and not queue and not queue_state["enabled"]
