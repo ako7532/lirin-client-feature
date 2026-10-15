@@ -1155,6 +1155,14 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
         if self.yinyang_duel_enabled:
+            if not self.running:
+                self.Start()
+                if not self.running:
+                    self.yinyang_duel_enabled = False
+                    self.yinyang_duel_button.SetText("OFF")
+                    self.yinyang_duel_label.SetText(
+                        "Yin Yang Duel: enter the game world first")
+                    return
             self.yinyang_duel_label.SetText("Yin Yang Duel: probing runtime")
             self.AddLine("Yin Yang Duel ON")
             self.DiagnosticYinYangDuel()
@@ -1313,13 +1321,17 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.yinyang_duel_label.SetText(
                     "Yin Yang Duel: daily limit %d/%d" % (used, maximum))
                 return
+            # Play first: if a round is waiting on us, act regardless of the
+            # cooldown timer (which can stay non-zero while a duel is active).
+            # CanPickCard guards against a stale "your turn" from a finished
+            # duel.
+            if self._DuelTryPlay(window):
+                return
             cooldown = self._DuelCooldownRemaining(window)
             if cooldown > 0:
                 self.yinyang_duel_label.SetText(
                     "Yin Yang Duel: cooldown %ds (%d/%d used)" %
                     (int(cooldown), used, maximum))
-                return
-            if self._DuelTryPlay(window):
                 return
             self._DuelEnsureStarted(window, getattr(window, "state", None))
         except Exception as exc:
