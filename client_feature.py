@@ -74,6 +74,7 @@ BOSS_RETURN_STALL_SECONDS = 3.0
 BOSS_RETURN_PROGRESS_DISTANCE = 25
 YINYANG_DUEL_POLL_SECONDS = 1.0
 YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
+YINYANG_DUEL_HISTORY_CSV = os.path.join(DIRECTORY, "yin_yang_duel_history.csv")
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -161,6 +162,21 @@ def choose_duel_card_follow(my_hand, opponent_led_value):
     if not hand:
         return None
     winners = [value for value in hand if value > opponent_led_value]
+    return winners[0] if winners else hand[0]
+
+
+def choose_duel_card_lead(my_hand, opponent_remaining):
+    """Lead blind with full knowledge of the opponent's remaining hand: play
+    the smallest card that beats their median remaining card; otherwise
+    sacrifice our lowest card."""
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    remaining = sorted(opponent_remaining)
+    if not remaining:
+        return hand[0]
+    target = remaining[len(remaining) // 2]
+    winners = [value for value in hand if value > target]
     return winners[0] if winners else hand[0]
 
 
@@ -489,6 +505,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_last_error = None
         self.yinyang_duel_debug = None
         self.yinyang_duel_opponent_played = set()
+        self.yinyang_duel_opponent_last = None
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -1250,6 +1267,54 @@ class MetinScanner(ui.BoardWithTitleBar):
                 continue
         return values
 
+    def _DuelRecordPlay(self, actor, round_num, card_value, leads):
+        try:
+            line = "%s,%s,%d,%d,%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                actor, int(round_num), int(card_value),
+                "1" if leads else "0")
+            data = line.encode("ascii")
+            fd = os.open(YINYANG_DUEL_HISTORY_CSV,
+                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+            try:
+                offset = 0
+                while offset < len(data):
+                    written = os.write(fd, data[offset:])
+                    if written <= 0:
+                        break
+                    offset += written
+            finally:
+                os.close(fd)
+        except Exception:
+            pass
+
+    def _DuelObserveOpponent(self, window):
+        """Record and track the opponent's newly-played cards (leads and
+        responses).  Also remember the most recent one as the led card."""
+        opp_cards = getattr(window, "opponentCards", None) or {}
+        opp_played_now = set()
+        for key, card in opp_cards.items():
+            try:
+                if getattr(card, "played", False):
+                    opp_played_now.add(int(getattr(card, "value", key)))
+            except Exception:
+                continue
+        if not opp_played_now:
+            self.yinyang_duel_opponent_played = set()
+            self.yinyang_duel_opponent_last = None
+            return
+        newly = opp_played_now - self.yinyang_duel_opponent_played
+        self.yinyang_duel_opponent_played = opp_played_now
+        if newly:
+            lead_info = getattr(window, "leadInfo", None) or {}
+            round_num = lead_info.get("round", 0)
+            leads = bool(lead_info.get("leads", False))
+            for value in newly:
+                self._DuelRecordPlay("them", round_num, value, leads)
+            newly_list = sorted(newly)
+            self.yinyang_duel_opponent_last = (newly_list[0]
+                                               if len(newly_list) == 1 else None)
+
     def _DuelTryPlay(self, window):
         """If it is our turn, pick and play a card.  Returns True when played."""
         if getattr(window, "state", None) != 2:
@@ -1261,29 +1326,16 @@ class MetinScanner(ui.BoardWithTitleBar):
         if not hand:
             return False
         leads = bool(lead_info.get("leads", False))
-        opp_cards = getattr(window, "opponentCards", None) or {}
-        opp_played_now = set()
-        for key, card in opp_cards.items():
-            try:
-                if getattr(card, "played", False):
-                    opp_played_now.add(int(getattr(card, "value", key)))
-            except Exception:
-                continue
-        if not opp_played_now:
-            self.yinyang_duel_opponent_played = set()
-        newly_played = opp_played_now - self.yinyang_duel_opponent_played
-        self.yinyang_duel_opponent_played = opp_played_now
-
+        opponent_remaining = self._DuelRemainingValues(
+            getattr(window, "opponentCards", None))
+        opponent_led = None if leads else self.yinyang_duel_opponent_last
         if leads:
-            value = choose_duel_card(hand, None)
-            opponent_led = None
+            value = choose_duel_card_lead(hand, opponent_remaining)
+        elif opponent_led is not None:
+            value = choose_duel_card_follow(hand, opponent_led)
         else:
-            opponent_led = newly_played.pop() if len(newly_played) == 1 else None
-            if opponent_led is not None:
-                value = choose_duel_card_follow(hand, opponent_led)
-            else:
-                color = "black" if lead_info.get("black", False) else "white"
-                value = choose_duel_card(hand, color)
+            color = "black" if lead_info.get("black", False) else "white"
+            value = choose_duel_card(hand, color)
         if value is None:
             return False
 
@@ -1316,6 +1368,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         note = " vs %d" % opponent_led if opponent_led is not None else ""
         self.AddLine("Yin Yang Duel: played %d (%s)%s" %
                      (value, "lead" if leads else ("black" if lead_info.get("black", False) else "white"), note))
+        self._DuelRecordPlay("us", lead_info.get("round", 0), value, leads)
         self.yinyang_duel_label.SetText("Yin Yang Duel: played %d" % value)
         return True
 
@@ -1355,6 +1408,9 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.yinyang_duel_label.SetText(
                     "Yin Yang Duel: daily limit %d/%d" % (used, maximum))
                 return
+            # Observe the opponent's plays every poll (records leads and
+            # responses, and remembers the latest led card).
+            self._DuelObserveOpponent(window)
             # Play first: if a round is waiting on us, act regardless of the
             # cooldown timer (which can stay non-zero while a duel is active).
             # CanPickCard guards against a stale "your turn" from a finished
