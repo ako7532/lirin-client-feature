@@ -2,7 +2,7 @@
 
 See [TEST_RESULTS.md](TEST_RESULTS.md) for the chronological test log and
 verified results.
-For a new-chat project handover, see [HANDOVER_FEATURE.md](HANDOVER_FEATURE.md).
+For a new-chat project handover, see [handovers/HANDOVER_FEATURE.md](handovers/HANDOVER_FEATURE.md).
 
 ## Windows injector UI
 
