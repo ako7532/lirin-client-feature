@@ -477,6 +477,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_window = None
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
+        self.yinyang_duel_debug = None
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -1237,6 +1238,11 @@ class MetinScanner(ui.BoardWithTitleBar):
                 continue
         return hand
 
+    def _DuelDebugLog(self, message):
+        if message != self.yinyang_duel_debug:
+            self.yinyang_duel_debug = message
+            self.AddLine(message)
+
     def _DuelTryPlay(self, window):
         """If it is our turn, pick and play a card.  Returns True when played."""
         lead_info = getattr(window, "leadInfo", None)
@@ -1244,6 +1250,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             return False
         hand = self._DuelRemainingHand(window)
         if not hand:
+            self._DuelDebugLog("Yin Yang Duel: no cards in hand")
             return False
         leads = bool(lead_info.get("leads", False))
         opponent_color = (None if leads else
@@ -1262,14 +1269,16 @@ class MetinScanner(ui.BoardWithTitleBar):
                 except Exception:
                     continue
         if card is None:
+            self._DuelDebugLog("Yin Yang Duel: card %d missing from playerCards" % value)
             return False
         can_pick = getattr(window, "CanPickCard", None)
         if callable(can_pick):
             try:
                 if not can_pick(card):
+                    self._DuelDebugLog("Yin Yang Duel: CanPickCard(%d)=False" % value)
                     return False
-            except Exception:
-                pass
+            except Exception as exc:
+                self._DuelDebugLog("Yin Yang Duel: CanPickCard error %s" % ascii_text(exc))
         emit_synthetic_click()
         try:
             onclick = getattr(window, "OnCardClicked", None)
@@ -1278,8 +1287,14 @@ class MetinScanner(ui.BoardWithTitleBar):
             else:
                 card.OnMouseLeftButtonDown()
         except Exception as exc:
-            self.AddLine("Yin Yang Duel: play error %s" % ascii_text(exc))
-            return False
+            self._DuelDebugLog("Yin Yang Duel: OnCardClicked error %s" % ascii_text(exc))
+            try:
+                card.OnMouseLeftButtonDown()
+            except Exception as exc2:
+                self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc2))
+                return False
+        self.AddLine("Yin Yang Duel: played %d (%s)" %
+                     (value, "lead" if leads else opponent_color))
         self.yinyang_duel_label.SetText(
             "Yin Yang Duel: played %d (%s)" %
             (value, "lead" if leads else opponent_color))
