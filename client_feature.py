@@ -1246,6 +1246,8 @@ class MetinScanner(ui.BoardWithTitleBar):
     def _DuelTryPlay(self, window):
         """If it is our turn, pick and play a card.  Returns True when played."""
         lead_info = getattr(window, "leadInfo", None)
+        self._DuelDebugLog("Yin Yang Duel: try play window=%s lead=%r" %
+                           (id(window), lead_info))
         if not lead_info:
             return False
         hand = self._DuelRemainingHand(window)
@@ -1330,6 +1332,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             if window is None:
                 self.yinyang_duel_label.SetText("Yin Yang Duel: window not found")
                 return
+            self._DuelDebugLog("Yin Yang Duel: poll window=%s state=%s lead=%r" %
+                               (id(window), getattr(window, "state", None),
+                                getattr(window, "leadInfo", None)))
             used = int(getattr(window, "duelsUsedHwid", 0) or 0)
             maximum = int(getattr(window, "duelsMaxHwid", 0) or 0)
             if maximum > 0 and used >= maximum:
