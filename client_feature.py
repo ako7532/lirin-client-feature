@@ -1169,18 +1169,39 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("YinYangDuelWindow not found in runtime objects")
             return
         self.AddLine("YinYangDuelWindow type=%s" % ascii_text(type(window).__name__))
+        for name in ("state", "round", "playerScore", "opponentScore",
+                     "leadInfo", "leadActive", "hasState", "enabled", "reveal",
+                     "duelsUsedHwid", "duelsMaxHwid", "duelsUsed", "duelsMax",
+                     "cooldownEnd", "startPending", "openPending", "levelMin",
+                     "costGold"):
+            try:
+                value = getattr(window, name, None)
+                self.AddLine("  duel state %s = %s" %
+                             (name, ascii_text(repr(value))[:140]))
+            except Exception as exc:
+                self.AddLine("  duel state %s error: %s" % (name, exc))
         try:
-            for name in dir(window):
-                if not name.startswith("__"):
-                    self.AddLine("  duel attr %s" % name)
+            self.AddLine("  duel cooldown remaining = %s" %
+                         ascii_text(repr(window.GetCooldownRemaining())))
         except Exception as exc:
-            self.AddLine("dir(window) failed: %s" % exc)
-        try:
-            for key, value in getattr(window, "__dict__", {}).items():
-                self.AddLine("  duel field %s = %s" %
-                             (key, ascii_text(repr(value))[:80]))
-        except Exception as exc:
-            self.AddLine("__dict__ dump failed: %s" % exc)
+            self.AddLine("  duel cooldown remaining error: %s" % exc)
+        for label, cards in (("player", getattr(window, "playerCards", None)),
+                             ("opponent", getattr(window, "opponentCards", None))):
+            if not cards:
+                self.AddLine("  duel %s cards: (none)" % label)
+                continue
+            try:
+                keys = list(cards.keys())
+                self.AddLine("  duel %s card keys = %s" % (label, ascii_text(repr(keys))))
+                sample = cards[keys[0]]
+                self.AddLine("  duel %s card type=%s" % (label, ascii_text(type(sample).__name__)))
+                self.AddLine("  duel %s card dict=%s" %
+                             (label, ascii_text(repr(getattr(sample, "__dict__", {}))[:240])))
+                for name in dir(sample):
+                    if not name.startswith("__"):
+                        self.AddLine("    card attr %s" % name)
+            except Exception as exc:
+                self.AddLine("  duel %s card dump error: %s" % (label, exc))
 
     def PollYinYangDuel(self, now):
         if not self.yinyang_duel_enabled:
