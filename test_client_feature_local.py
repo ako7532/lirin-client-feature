@@ -124,6 +124,10 @@ player.MetinQueueSetEnabled = set_metin_queue_enabled
 player.MetinQueueGetSize = lambda: len(queue)
 player.MetinQueueGetMaxSize = lambda: queue_state["max_size"]
 def add_metin(vid):
+    if vid == 0:
+        # The native wrapper's bare-click sentinel (emit_synthetic_click): no
+        # queue change, mirrors the real VID-0 click-only path.
+        return True
     if vid in queue:
         return True
     if len(queue) >= queue_state["max_size"]:
@@ -413,47 +417,80 @@ with tempfile.TemporaryDirectory() as directory:
         panel.next_scan = 0
         panel.OnUpdate()
         assert len(queue) == expected_size, queue
-    assert queue == [1, 4, 5, 6, 2], queue
-    assert not panel.hunter_initial_fill
+    assert set(queue) == {1, 2, 4, 5, 6}, queue
     panel.next_scan = 0
     panel.OnUpdate()
-    assert queue == [1, 4, 5, 6, 2], queue
+    assert len(queue) == 5, queue
 
-    # Continuous refill uses increasing 35/70/100 percent chances at 3/2/1.
-    panel.hunter_initial_fill = False
+    # Time-driven refill: after the queue is full, wait a noisy interval before
+    # refilling, with a random (not nearest) target.
+    panel.hunter_refilling = False
     panel.hunter_queued_vids.clear()
-    queue[:] = [90, 91, 92]
-    feature_random = panel.FeedMetinQueue.__globals__["random"]
-    original_random = feature_random.random
-    feature_random.random = lambda: 0.90
+    panel.hunter_next_refill = time.time() + 100.0
+    queue[:] = [90, 91, 92, 93]
     panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert queue == [90, 91, 92]
-    feature_random.random = lambda: 0.10
-    panel.hunter_next_add = 0
+    assert queue == [90, 91, 92, 93], queue
+    assert not panel.hunter_refilling
+    assert "Waiting 4/5" in panel.hunter_label.text
+    assert "refill in" in panel.hunter_label.text
+    panel.hunter_next_refill = time.time() - 1.0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert queue == [90, 91, 92, 7]
-    queue[:] = [90, 91]
-    panel.hunter_queued_vids.clear()
-    feature_random.random = lambda: 0.69
+    assert queue == [90, 91, 92, 93, 7], queue
+    assert not panel.hunter_refilling
+    assert "Full 5/5" in panel.hunter_label.text
+    assert "refill in" in panel.hunter_label.text
+    refill_deadline = panel.hunter_next_refill
+    queue[:] = [90, 91, 92, 93, 7]
     panel.hunter_next_add = 0
-    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert queue == [90, 91, 7]
-    queue[:] = [90]
-    panel.hunter_queued_vids.clear()
-    feature_random.random = lambda: (_ for _ in ()).throw(
-        AssertionError("size-one refill must be guaranteed"))
-    panel.hunter_next_add = 0
-    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert queue == [90, 7]
-    queue[:] = []
-    panel.hunter_queued_vids.clear()
-    panel.hunter_next_add = 0
-    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
-    assert queue == [7]
-    feature_random.random = original_random
+    panel.FeedMetinQueue([(1400, 8, "Battle Metin")])
+    assert queue == [90, 91, 92, 93, 7], queue
+    assert not panel.hunter_refilling
+    assert panel.hunter_next_refill > time.time()
+    assert panel.hunter_next_refill == refill_deadline
+
+    # Full-queue polls must not move the deadline, even after it expires.
+    # Arm immediately on the successful add: the queue may drain before the
+    # next scan ever observes it full.
+    feature_globals = panel.FeedMetinQueue.__globals__
+    original_time_module = feature_globals["time"]
+    simulated_now = [1000.0]
+    feature_globals["time"] = types.SimpleNamespace(
+        time=lambda: simulated_now[0], strftime=time.strftime, localtime=time.localtime)
+    try:
+        panel.hunter_queued_vids.clear()
+        panel.hunter_refilling = True
+        panel.hunter_next_add = 0
+        queue[:] = [90, 91, 92, 93]
+        panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+        deadline = panel.hunter_next_refill
+        assert 1035 <= deadline <= 1070
+        assert not panel.hunter_refilling
+        for tick in (1001.0, deadline - 1, deadline + 1):
+            simulated_now[0] = tick
+            panel.FeedMetinQueue([])
+            assert panel.hunter_next_refill == deadline
+            assert "Full 5/5" in panel.hunter_label.text
+        # A fully drained queue must bypass the long refill wait.
+        simulated_now[0] = deadline - 1
+        queue[:] = []
+        panel.hunter_next_add = 0
+        panel.FeedMetinQueue([(1500, 8, "Battle Metin")])
+        assert queue == [8], queue
+        assert "Refilling 1/5" in panel.hunter_label.text
+        queue[:] = [90, 91, 92, 93]
+        panel.hunter_queued_vids.discard(8)
+        panel.hunter_refilling = True
+        panel.hunter_next_add = 0
+        panel.FeedMetinQueue([(1500, 8, "Battle Metin")])
+        assert queue == [90, 91, 92, 93, 8]
+        assert panel.hunter_next_refill > simulated_now[0]
+    finally:
+        feature_globals["time"] = original_time_module
+    panel.hunter_refilling = False
 
     # Native actor type and per-VID exclusions are enforced before low-level add.
+    panel.hunter_next_refill = time.time() - 1.0
     queue[:] = []
     panel.hunter_queued_vids.clear()
     actor_stone_overrides[7] = False
@@ -655,7 +692,7 @@ with tempfile.TemporaryDirectory() as directory:
     panel.hunter_next_add = 0
     panel.next_scan = 0
     panel.OnUpdate()
-    assert queue == [2, 1], queue
+    assert set(queue) == {1, 2}, queue
 
     # Any native stone whose name contains Legendary Metinstone interrupts the
     # ordinary Hunter queue, remains the only queued target, then restores

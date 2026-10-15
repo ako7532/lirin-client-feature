@@ -35,6 +35,10 @@ static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00A6B650;
 static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x066E218C;
 static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x003D1D40;
 static constexpr ULONG_PTR RVA_SET_MOUSE_STATE = 0x003E5940;
+static constexpr ULONG_PTR RVA_RECORD_INPUT = 0x00471B10;
+static constexpr ULONG_PTR RVA_INPUT_RECORDER = 0x07A6BA20;
+static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x007E13B0;
+static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07A6B480;
 static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
 static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
@@ -46,6 +50,69 @@ using ArgumentError = void* (*)(int);
 using BuildValue = void* (*)(const char*, ...);
 using GetActorByVid = void* (*)(void*, int);
 using SetMouseState = void (*)(void*, int, char);
+using RecordInput = void (*)(void*, char, int, int);
+using GetCursorPosition = void (*)(void*, int*, int*);
+
+// Observe only. Do not generate input records or alter recorder settings.
+static void LogQueueInputState(int vid) {
+    char line[256] = {};
+    __try {
+        BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+        if (!recorder) {
+            sprintf_s(line, "queue input diagnostic: tick=%llu vid=%d recorder=missing",
+                      GetTickCount64(), vid);
+        } else {
+            sprintf_s(line,
+                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u",
+                      GetTickCount64(), vid, static_cast<unsigned>(recorder[8]),
+                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 10)),
+                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        strcpy_s(line, "queue input diagnostic: recorder read unavailable");
+    }
+    AppendStatus(g_feature_status_path, line);
+}
+
+// Fill the client's own cursor position (client coordinates).  This is the
+// same source the input recorder logs for its movement samples, so a synthetic
+// click stays on the recorded movement path even while the window is unfocused
+// (the OS cursor would instead report wherever the physical pointer is).
+static void GetGameCursorPosition(int* out_x, int* out_y) {
+    *out_x = 0;
+    *out_y = 0;
+    void* game_instance = *reinterpret_cast<void**>(
+        g_game_base + RVA_GAME_INSTANCE);
+    if (!game_instance) return;
+    auto get_cursor_position = reinterpret_cast<GetCursorPosition>(
+        g_game_base + RVA_GET_CURSOR_POSITION);
+    __try {
+        get_cursor_position(game_instance, out_x, out_y);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *out_x = 0;
+        *out_y = 0;
+    }
+}
+
+// Emit a bare synthetic left-click (down code 1, up code 2) into the client
+// input recorder.  FUN_140471b10 is a no-op while the recorder is disabled.
+// Used for UI automations (reaction game, channel dialog) that a human would
+// click but that never pass through the Windows mouse handler.
+static void EmitSyntheticClick() {
+    BYTE* recorder = *reinterpret_cast<BYTE**>(
+        g_game_base + RVA_INPUT_RECORDER);
+    if (!recorder) return;
+    int cursor_x = 0;
+    int cursor_y = 0;
+    GetGameCursorPosition(&cursor_x, &cursor_y);
+    auto record_input = reinterpret_cast<RecordInput>(
+        g_game_base + RVA_RECORD_INPUT);
+    __try {
+        record_input(recorder, 1, cursor_x, cursor_y);
+        record_input(recorder, 2, cursor_x, cursor_y);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 
 static void* NativeMetinQueueAdd(void*, void* args) {
     auto parse_integer = reinterpret_cast<ParseTupleInteger>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
@@ -53,6 +120,17 @@ static void* NativeMetinQueueAdd(void*, void* args) {
     auto build_value = reinterpret_cast<BuildValue>(g_game_base + RVA_BUILD_VALUE);
     int vid = 0;
     if (!parse_integer(args, 0, &vid)) return argument_error(0);
+
+    // vid == 0 is a sentinel that asks only for a bare synthetic click, used
+    // by UI automations (reaction game, channel dialog) that do not touch the
+    // metin queue.  Real queue adds always pass a positive VID.
+    if (vid == 0) {
+        EmitSyntheticClick();
+        return build_value(reinterpret_cast<const char*>(
+            g_game_base + RVA_INTEGER_FORMAT), 1);
+    }
+
+    LogQueueInputState(vid);
 
     int added = 0;
     __try {
@@ -76,9 +154,36 @@ static void* NativeMetinQueueAdd(void*, void* args) {
                 void* saved_picked_actor = *picked_actor;
                 auto set_mouse_state = reinterpret_cast<SetMouseState>(
                     g_game_base + RVA_SET_MOUSE_STATE);
+
+                // A real left click first passes through the Windows mouse
+                // handler, which records a down/up pair (codes 1/2) into the
+                // client input recorder before driving the game.  The
+                // synthetic press/release below skips that handler, so emit the
+                // same down/up records here.  While the recorder is enabled the
+                // server audit compares queue changes against these records;
+                // FUN_140471b10 is a no-op while the recorder is disabled.
+                auto record_input = reinterpret_cast<RecordInput>(
+                    g_game_base + RVA_RECORD_INPUT);
+                BYTE* recorder = *reinterpret_cast<BYTE**>(
+                    g_game_base + RVA_INPUT_RECORDER);
+
+                // Read the client's own cursor position (the same source the
+                // recorder uses for its movement samples) rather than the OS
+                // cursor, so the synthetic down/up stays on the recorded path
+                // regardless of window focus.
+                int cursor_x = 0;
+                int cursor_y = 0;
+                GetGameCursorPosition(&cursor_x, &cursor_y);
+
                 *picked_actor = target_actor;
                 __try {
+                    if (recorder) {
+                        record_input(recorder, 1, cursor_x, cursor_y);
+                    }
                     set_mouse_state(player, 1, 0);
+                    if (recorder) {
+                        record_input(recorder, 2, cursor_x, cursor_y);
+                    }
                     set_mouse_state(player, 0, 0);
                 } __finally {
                     *picked_actor = saved_picked_actor;

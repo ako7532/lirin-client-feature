@@ -32,11 +32,15 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 35
+FEATURE_VERSION = 38
 HUNTER_LIMIT = 5
-HUNTER_ADD_DELAY_MIN = 0.65
-HUNTER_ADD_DELAY_MAX = 1.45
-HUNTER_REFILL_CHANCES = {3: 0.35, 2: 0.70, 1: 1.0, 0: 1.0}
+HUNTER_BURST_DELAY_MIN = 0.70
+HUNTER_BURST_DELAY_MAX = 2.50
+# Time-driven refill: after the queue is full, wait this noisy interval before
+# refilling again, matching the observed ~50s human rhythm instead of refilling
+# the instant a slot frees.
+HUNTER_REFILL_MIN = 35.0
+HUNTER_REFILL_MAX = 70.0
 PRIORITY_EVENT_METIN_NAME = "legendary metinstone"
 PRIORITY_EVENT_MISSING_SECONDS = 1.5
 REACTION_POLL_SECONDS = 0.05
@@ -95,6 +99,20 @@ def next_reaction_click_delay():
                             REACTION_CLICK_DELAY_JITTER))
     return max(REACTION_CLICK_DELAY_MIN,
                min(REACTION_CLICK_DELAY_MAX, delay))
+
+
+def emit_synthetic_click():
+    """Record a bare synthetic left-click for UI automations (reaction game,
+    channel dialog) that a human would click but that never pass through the
+    Windows mouse handler.  Calls MetinQueueAdd with the VID 0 sentinel, which
+    the native wrapper turns into a click-only record.  No-op without the
+    wrapper or while the input recorder is disabled."""
+    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
+        return
+    try:
+        player.MetinQueueAdd(0)
+    except Exception:
+        pass
 
 
 def disk_log(message):
@@ -365,6 +383,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_logged_rejections = set()
         self.hunter_initial_fill = True
         self.hunter_batch_add_count = 0
+        self.hunter_refilling = False
+        self.hunter_next_refill = 0.0
         self.hunter_next_add = 0.0
         self.priority_event_vid = 0
         self.priority_event_vnum = 0
@@ -723,6 +743,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_initial_fill = True
         self.hunter_batch_add_count = 0
         self.hunter_next_add = 0.0
+        self.hunter_refilling = False
+        self.hunter_next_refill = 0.0
         self.ResetPriorityEventState()
 
     def ResetPriorityEventState(self):
@@ -999,6 +1021,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             elif not self.reaction_started:
                 play_button = getattr(window, "playButton", None)
                 if play_button is not None and play_button.IsShow():
+                    emit_synthetic_click()
                     window._ReactionGameWindow__OnClickPlay()
                     self.reaction_started = True
                     self.AddLine("Reaction game start requested")
@@ -1028,6 +1051,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 return True
             if now < self.reaction_click_at:
                 return True
+            emit_synthetic_click()
             window._ReactionGameWindow__OnClickSlot(slot)
             self.reaction_last_ball = ball_key
             self.reaction_pending_ball = None
@@ -1354,6 +1378,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         if selected != channel:
             raise ValueError("channel dialog selected %s, expected %d" %
                              (selected, channel))
+        emit_synthetic_click()
         self.boss_switch_dialog.AcceptButton()
 
     def RequestBossChannel(self, channel, returning=False):
@@ -1631,11 +1656,21 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_logged_rejections.clear()
         self.hunter_initial_fill = (size == 0)
         self.hunter_batch_add_count = 0
-        self.hunter_next_add = time.time() + random.uniform(0.2, 0.6)
+        self.hunter_refilling = False
+        self.hunter_next_refill = 0.0
+        now = time.time()
+        self.hunter_next_add = now + random.uniform(0.2, 0.6)
         self.hunter_enabled = True
         self.hunter_button.SetText("ON")
-        self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
+        self.hunter_label.SetText("Starting %d/%d - first add in %.1fs" %
+                                  (size, cap,
+                                   max(0.0, self.hunter_next_add - now)))
         self.AddLine("Metin Hunter ON; queue limit %d" % cap)
+
+    def ScheduleHunterRefill(self, now):
+        self.hunter_refilling = False
+        self.hunter_next_refill = now + random.uniform(HUNTER_REFILL_MIN,
+                                                       HUNTER_REFILL_MAX)
 
     def FeedMetinQueue(self, candidates):
         if not self.hunter_enabled:
@@ -1649,24 +1684,40 @@ class MetinScanner(ui.BoardWithTitleBar):
         cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
         size = int(player.MetinQueueGetSize())
         now = time.time()
-        self.hunter_label.SetText("Queue: %d/%d" % (size, cap))
         if size >= cap:
-            self.hunter_initial_fill = False
+            if self.hunter_refilling or self.hunter_next_refill == 0.0:
+                self.ScheduleHunterRefill(now)
+            refill_wait = self.hunter_next_refill - now
+            if refill_wait > 0.0:
+                self.hunter_label.SetText(
+                    "Full %d/%d - refill in %.1fs" %
+                    (size, cap, refill_wait))
+            else:
+                self.hunter_label.SetText(
+                    "Full %d/%d - refill ready" % (size, cap))
             return
+        # Time-driven refill: wait a noisy interval after the queue was last
+        # full, then burst-fill back to the cap. This mirrors the observed
+        # ~50s human rhythm instead of refilling the instant a slot frees.
+        if size == 0:
+            # Never leave an empty queue waiting for the long refill timer.
+            # Keep the small per-add delay, but begin looking immediately.
+            self.hunter_refilling = True
+            self.hunter_next_refill = 0.0
+        elif not self.hunter_refilling:
+            if now < self.hunter_next_refill:
+                self.hunter_label.SetText(
+                    "Waiting %d/%d - refill in %.1fs" %
+                    (size, cap, self.hunter_next_refill - now))
+                return
+            self.hunter_refilling = True
         if now < self.hunter_next_add:
+            self.hunter_label.SetText(
+                "Refilling %d/%d - next add in %.1fs" %
+                (size, cap, self.hunter_next_add - now))
             return
-        if not self.hunter_initial_fill:
-            chance = HUNTER_REFILL_CHANCES.get(size, 0.0)
-            if chance <= 0.0:
-                return
-            if chance < 1.0 and random.random() >= chance:
-                self.hunter_label.SetText("Queue: %d/%d; refill chance %d%%" %
-                                          (size, cap, int(chance * 100)))
-                return
-        if self.hunter_batch_add_count >= cap and self.hunter_initial_fill:
-            self.hunter_initial_fill = False
-            return
-        for distance, vid, name in sorted(candidates):
+        eligible = []
+        for distance, vid, name in candidates:
             if vid in self.hunter_queued_vids:
                 continue
             try:
@@ -1705,44 +1756,52 @@ class MetinScanner(ui.BoardWithTitleBar):
                 can_attack = getattr(player, "CanAttackInstance", None)
                 if callable(can_attack) and not can_attack(vid):
                     continue
+                eligible.append((distance, vid, name))
             except Exception:
                 continue  # Entity disappeared or changed before queue admission.
-            old_size = size
-            add_started = time.time()
-            result = player.MetinQueueAdd(vid)
-            add_elapsed_ms = (time.time() - add_started) * 1000.0
-            new_size = int(player.MetinQueueGetSize())
-            if new_size > size:
-                self.hunter_queued_vids.add(vid)
-                size = new_size
-                self.hunter_batch_add_count += 1
-                delay = random.uniform(HUNTER_ADD_DELAY_MIN,
-                                       HUNTER_ADD_DELAY_MAX)
-                self.hunter_next_add = now + delay
-                self.hunter_label.SetText("Queue: %d/%d" % (new_size, cap))
-                self.AddLine("Queued %s [VID %d], distance %d, queue %d->%d/%d, call %.2fms; next add >= %.2fs" %
-                             (name or "Metin", vid, distance, old_size, new_size,
-                              cap, add_elapsed_ms, delay))
-                if self.hunter_initial_fill and (self.hunter_batch_add_count >= cap or
-                                                 size >= cap):
-                    self.hunter_initial_fill = False
-                    self.AddLine("Metin Hunter initial queue filled with %d additions" %
-                                 self.hunter_batch_add_count)
-                return
-            if not result:
-                self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
-                             (vid, old_size, new_size, add_elapsed_ms))
-            else:
-                self.AddLine("Queue accepted VID %d without size change, queue %d->%d, call %.2fms; no retry" %
-                             (vid, old_size, new_size, add_elapsed_ms))
-                self.hunter_queued_vids.add(vid)
-            self.hunter_next_add = now + random.uniform(HUNTER_ADD_DELAY_MIN,
-                                                        HUNTER_ADD_DELAY_MAX)
+        if not eligible:
+            self.hunter_label.SetText(
+                "Searching %d/%d - no eligible Metin" % (size, cap))
+            if size > 0:
+                self.ScheduleHunterRefill(now)
             return
-        if self.hunter_initial_fill and self.hunter_batch_add_count:
-            self.hunter_initial_fill = False
-            self.AddLine("Metin Hunter initial queue armed with %d additions" %
-                         self.hunter_batch_add_count)
+        distance, vid, name = random.choice(eligible)
+        old_size = size
+        add_started = time.time()
+        result = player.MetinQueueAdd(vid)
+        add_elapsed_ms = (time.time() - add_started) * 1000.0
+        new_size = int(player.MetinQueueGetSize())
+        if new_size > size:
+            self.hunter_queued_vids.add(vid)
+            if new_size >= cap:
+                self.ScheduleHunterRefill(now)
+            delay = random.uniform(HUNTER_BURST_DELAY_MIN, HUNTER_BURST_DELAY_MAX)
+            self.hunter_next_add = now + delay
+            if new_size >= cap:
+                self.hunter_label.SetText(
+                    "Full %d/%d - refill in %.1fs" %
+                    (new_size, cap,
+                     max(0.0, self.hunter_next_refill - now)))
+            else:
+                self.hunter_label.SetText(
+                    "Refilling %d/%d - next add in %.1fs" %
+                    (new_size, cap, delay))
+            self.AddLine("Queued %s [VID %d], distance %d, queue %d->%d/%d, call %.2fms; next add >= %.2fs" %
+                         (name or "Metin", vid, distance, old_size, new_size,
+                          cap, add_elapsed_ms, delay))
+            return
+        if not result:
+            self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
+                         (vid, old_size, new_size, add_elapsed_ms))
+        else:
+            self.AddLine("Queue accepted VID %d without size change, queue %d->%d, call %.2fms; no retry" %
+                         (vid, old_size, new_size, add_elapsed_ms))
+            self.hunter_queued_vids.add(vid)
+        delay = random.uniform(HUNTER_BURST_DELAY_MIN,
+                               HUNTER_BURST_DELAY_MAX)
+        self.hunter_next_add = now + delay
+        self.hunter_label.SetText(
+            "Retrying %d/%d - next try in %.1fs" % (new_size, cap, delay))
 
     def StartPriorityEventMetin(self, candidate):
         distance, vid, name, expected_vnum = candidate
@@ -1958,7 +2017,9 @@ class MetinScanner(ui.BoardWithTitleBar):
                     self.AddLine("Scan error: %s" % problem)
                     self.last_scan_error = problem
                 self.ClearMap()
-            self.next_scan = now + 1.0
+            # Jitter the scan cadence so Hunter adds don't land on a whole-second
+            # grid; the effective click gaps then carry sub-second variation.
+            self.next_scan = now + random.uniform(0.85, 1.15)
 
 
 try:
