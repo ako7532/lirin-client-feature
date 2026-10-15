@@ -1276,8 +1276,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         can_pick = getattr(window, "CanPickCard", None)
         if callable(can_pick):
             try:
-                if not can_pick(card):
-                    self._DuelDebugLog("Yin Yang Duel: CanPickCard(%d)=False" % value)
+                allowed = can_pick()
+                if not allowed:
+                    self._DuelDebugLog("Yin Yang Duel: CanPickCard()=False")
                     return False
             except Exception as exc:
                 self._DuelDebugLog("Yin Yang Duel: CanPickCard error %s" % ascii_text(exc))
@@ -1285,7 +1286,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         try:
             onclick = getattr(window, "OnCardClicked", None)
             if callable(onclick):
-                onclick(card)
+                result = onclick(card)
+                self._DuelDebugLog("Yin Yang Duel: OnCardClicked(%d) -> %r" %
+                                   (value, result))
             else:
                 card.OnMouseLeftButtonDown()
         except Exception as exc:
