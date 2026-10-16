@@ -41,6 +41,7 @@ static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x007E13B0;
 static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07A6B480;
 static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x007E3E70;
 static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x007E3FD0;
+static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07A734C0;
 static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
 static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
@@ -112,11 +113,17 @@ static void LogQueueInputState(int vid) {
             sprintf_s(line, "queue input diagnostic: tick=%llu vid=%d recorder=missing",
                       GetTickCount64(), vid);
         } else {
+            unsigned bg = 0;
+            __try {
+                bg = static_cast<unsigned>(
+                    *reinterpret_cast<BYTE*>(g_game_base + RVA_APP_GLOBAL + 0x20));
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
             sprintf_s(line,
-                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u",
+                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u bg=%u",
                       GetTickCount64(), vid, static_cast<unsigned>(recorder[8]),
                       static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 10)),
-                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)));
+                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)), bg);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         strcpy_s(line, "queue input diagnostic: recorder read unavailable");
