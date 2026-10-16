@@ -1758,7 +1758,10 @@ class MetinScanner(ui.BoardWithTitleBar):
                                                  time.localtime()))
             event.setdefault("feature_version", FEATURE_VERSION)
             line = json.dumps(event, sort_keys=True)
-            data = line.encode("ascii") + b"\n"
+            if sys.version_info[0] == 2:
+                data = line + "\n"
+            else:
+                data = line.encode("ascii") + b"\n"
             fd = os.open(YINYANG_DUEL_HISTORY_JSONL,
                          os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
             try:
@@ -1959,13 +1962,17 @@ class MetinScanner(ui.BoardWithTitleBar):
             tracker.last_round = round_num
             if self._DuelTryPlay(window):
                 return
-            cooldown = self._DuelCooldownRemaining(window)
-            if cooldown > 0:
-                self.yinyang_duel_label.SetText(
-                    "Yin Yang Duel: cooldown %ds (%d/%d used)" %
-                    (int(cooldown), used, maximum))
-                return
-            self._DuelEnsureStarted(window, state)
+            # Only treat the cooldown as a gate when the duel is idle.  During
+            # an active duel (state 2/3/4) GetCooldownRemaining reports the
+            # countdown to the next duel, which must not be shown as a stall.
+            if state == 0:
+                cooldown = self._DuelCooldownRemaining(window)
+                if cooldown > 0:
+                    self.yinyang_duel_label.SetText(
+                        "Yin Yang Duel: cooldown %ds (%d/%d used)" %
+                        (int(cooldown), used, maximum))
+                    return
+                self._DuelEnsureStarted(window, state)
         except Exception as exc:
             problem = ascii_text(exc)
             if problem != self.yinyang_duel_last_error:
