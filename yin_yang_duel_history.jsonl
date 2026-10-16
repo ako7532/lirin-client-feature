@@ -1,0 +1,2 @@
+{"actor": "them", "card": 7, "event": "play", "feature_version": 40, "leads": 1, "round": 1, "schema": 1, "ts": "2026-10-16 08:51:52"}
+{"event": "finish", "feature_version": 40, "match_id": 1, "opponent_score": 0, "our_score": 0, "outcome": "tie", "schema": 1, "ts": "2026-10-16 09:00:25"}

@@ -2,6 +2,7 @@
 
 import __main__
 import gc
+import json
 import math
 import os
 import random
@@ -32,7 +33,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 38
+FEATURE_VERSION = 43
 HUNTER_LIMIT = 5
 HUNTER_BURST_DELAY_MIN = 0.70
 HUNTER_BURST_DELAY_MAX = 2.50
@@ -72,6 +73,10 @@ BOSS_CHANNEL_TIMEOUT_SECONDS = 35.0
 BOSS_RETURN_DISTANCE = 120
 BOSS_RETURN_STALL_SECONDS = 3.0
 BOSS_RETURN_PROGRESS_DISTANCE = 25
+YINYANG_DUEL_POLL_SECONDS = 1.0
+YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
+YINYANG_DUEL_HISTORY_JSONL = os.path.join(DIRECTORY, "yin_yang_duel_history.jsonl")
+YINYANG_DUEL_HISTORY_SCHEMA = 1
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -82,6 +87,9 @@ BOSS_CHANGE_CHANNEL = "change_channel"
 BOSS_WAIT_CHANNEL = "wait_channel"
 BOSS_SETTLE_CHANNEL = "settle_channel"
 BOSS_RETURN_POSITION = "return_position"
+BOSS_SWEEP_BUSY_STATES = (BOSS_WAIT_SPAWN, BOSS_FIND, BOSS_ATTACK,
+                          BOSS_CHANGE_CHANNEL, BOSS_WAIT_CHANNEL,
+                          BOSS_SETTLE_CHANNEL, BOSS_RETURN_POSITION)
 
 PHASE_LOADING = 4
 PHASE_GAME = 5
@@ -115,6 +123,570 @@ def emit_synthetic_click():
         player.MetinQueueAdd(0)
     except Exception:
         pass
+
+
+# --- Yin Yang Duel strategy (cards 0..8; even=black, odd=white) ---
+# Both players hold the same 9-card hand (0..8).  Each round the higher card
+# wins; ties score nothing.  You only ever see the colour of the opponent's
+# card, so the opponent's exact remaining values are unknowable.
+
+YINYANG_DUEL_BLACK = (0, 2, 4, 6, 8)
+YINYANG_DUEL_WHITE = (1, 3, 5, 7)
+
+
+def duel_card_color(value):
+    return "black" if (int(value) % 2) == 0 else "white"
+
+
+def duel_we_lead(lead_info):
+    """Whether WE lead (play blind) this round, from the window's `leadInfo`.
+
+    Live observation (round 1): when `leadInfo.leads` is True the opponent
+    already has exactly one card marked `played`, so `leads=True` actually
+    means the OPPONENT led and we are following.  (The `black` flag is their
+    led card's colour.)
+    """
+    return not bool((lead_info or {}).get("leads", False))
+
+
+def choose_duel_card(my_hand, opponent_color):
+    """Minimal-winner heuristic for one Yin Yang Duel round.
+
+    my_hand: remaining card values we still hold.
+    opponent_color: 'black'/'white' when the opponent led and we can see their
+    card colour, or None when we lead blind.
+
+    - Follower: play the smallest card that beats the opponent's median card of
+      that colour (win cheaply); if that is impossible, sacrifice our lowest.
+    - Leader: play the median of our hand as a balanced blind move.
+    """
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    if opponent_color is None:
+        return hand[len(hand) // 2]
+    possible = YINYANG_DUEL_BLACK if opponent_color == "black" else YINYANG_DUEL_WHITE
+    target = sorted(possible)[len(possible) // 2]
+    winners = [value for value in hand if value > target]
+    return winners[0] if winners else hand[0]
+
+
+def choose_duel_card_follow(my_hand, opponent_led_value):
+    """Follower with exact knowledge of the opponent's led card: beat it by the
+    smallest margin, or sacrifice our lowest card if we cannot win."""
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    winners = [value for value in hand if value > opponent_led_value]
+    return winners[0] if winners else hand[0]
+
+
+def choose_duel_card_lead(my_hand, opponent_remaining):
+    """Lead blind with full knowledge of the opponent's remaining hand: play
+    the smallest card that beats their median remaining card; otherwise
+    sacrifice our lowest card."""
+    hand = sorted(int(value) for value in my_hand)
+    if not hand:
+        return None
+    remaining = sorted(opponent_remaining)
+    if not remaining:
+        return hand[0]
+    target = remaining[len(remaining) // 2]
+    winners = [value for value in hand if value > target]
+    return winners[0] if winners else hand[0]
+
+
+# --- Yin Yang Duel solver (round-safe, pure card-game logic) ---
+# The controller reads the client and clicks; the solver is a pure function of
+# an immutable snapshot and only reasons about the 9-card match.
+
+DUEL_FULL_MASK = 0x1FF
+DUEL_WORST_WEIGHT = 0.25
+DUEL_SOLVER_BUDGET_SECONDS = 0.020
+DUEL_WARM_BUDGET_SECONDS = 0.050
+
+
+def duel_mask_cards(mask):
+    return [value for value in range(9) if mask & (1 << value)]
+
+
+def duel_mask_count(mask):
+    count = 0
+    while mask:
+        count += mask & 1
+        mask >>= 1
+    return count
+
+
+def duel_mask_remove(mask, value):
+    return mask & ~(1 << value)
+
+
+def duel_mask_color(mask, color):
+    result = 0
+    for value in duel_mask_cards(mask):
+        if duel_card_color(value) == color:
+            result |= 1 << value
+    return result
+
+
+def round_score_delta(our_card, opponent_card):
+    if our_card > opponent_card:
+        return 1
+    if our_card < opponent_card:
+        return -1
+    return 0
+
+
+def terminal_duel_value(score_delta):
+    # (prob_win, -prob_loss, expected_score_delta, worst_case_utility)
+    if score_delta > 0:
+        return (1.0, 0.0, float(score_delta), 1.0)
+    if score_delta < 0:
+        return (0.0, -1.0, float(score_delta), -1.0)
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def _duel_add_scaled(base, scale, value):
+    return (base[0] + scale * value[0],
+            base[1] + scale * value[1],
+            base[2] + scale * value[2],
+            base[3] + scale * value[3])
+
+
+def _duel_blend(expected, worst):
+    weight = 1.0 - DUEL_WORST_WEIGHT
+    return (weight * expected[0] + DUEL_WORST_WEIGHT * worst[0],
+            weight * expected[1] + DUEL_WORST_WEIGHT * worst[1],
+            weight * expected[2] + DUEL_WORST_WEIGHT * worst[2],
+            weight * expected[3] + DUEL_WORST_WEIGHT * worst[3])
+
+
+class _DuelDeadline(Exception):
+    pass
+
+
+class DuelSnapshot(object):
+    __slots__ = ("match_id", "round_num", "state", "we_lead", "visible_color",
+                 "exact_opponent_led_value", "exact_value_confident",
+                 "our_remaining_mask", "opponent_remaining_mask",
+                 "our_score", "opponent_score")
+
+    def __init__(self, **kwargs):
+        for key in self.__slots__:
+            setattr(self, key, kwargs.get(key))
+
+    @property
+    def score_delta(self):
+        return self.our_score - self.opponent_score
+
+    @property
+    def rounds_left(self):
+        return duel_mask_count(self.our_remaining_mask)
+
+    def decision_key(self):
+        return (self.match_id, self.round_num, self.our_remaining_mask,
+                self.opponent_remaining_mask, self.we_lead,
+                self.exact_opponent_led_value, self.visible_color,
+                self.our_score, self.opponent_score)
+
+
+class DuelBaselineModels(object):
+    """Deterministic baseline opponent models (versioned)."""
+
+    def __init__(self, model_version="v1"):
+        self.model_version = model_version
+
+    def opponent_response(self, opponent_mask, our_color, score_delta, rounds_left):
+        cards = duel_mask_cards(opponent_mask)
+        if not cards:
+            return []
+        prob = 1.0 / len(cards)
+        return [(b, prob) for b in cards]
+
+    def opponent_lead(self, opponent_mask, score_delta, rounds_left):
+        cards = duel_mask_cards(opponent_mask)
+        if not cards:
+            return []
+        prob = 1.0 / len(cards)
+        return [(b, prob) for b in cards]
+
+    def next_leader(self, we_lead_now):
+        return "them" if we_lead_now else "us"
+
+
+class DuelTrainedModels(object):
+    """Opponent models loaded from an offline-trained frequency table."""
+
+    def __init__(self, data, model_version="trained-v1"):
+        self.model_version = model_version
+        self.response = data.get("opponent_response", {})
+        self.lead = data.get("opponent_lead", {})
+
+    @staticmethod
+    def _round_bucket(rounds_left):
+        if rounds_left >= 7:
+            return "early"
+        if rounds_left >= 4:
+            return "mid"
+        return "late"
+
+    def _distribution(self, table, cards):
+        legal = duel_mask_cards(cards)
+        if not legal:
+            return []
+        total = 0
+        counts = {}
+        for card in legal:
+            count = int(table.get(str(card), 0)) + 1  # Laplace smoothing
+            counts[card] = count
+            total += count
+        return [(card, counts[card] / float(total)) for card in legal]
+
+    def opponent_response(self, opponent_mask, our_color, score_delta, rounds_left):
+        key = "%s|%d|%s" % (our_color, duel_mask_count(opponent_mask),
+                            self._round_bucket(rounds_left))
+        table = self.response.get(key, {})
+        if not table:
+            cards = duel_mask_cards(opponent_mask)
+            if not cards:
+                return []
+            prob = 1.0 / len(cards)
+            return [(b, prob) for b in cards]
+        return self._distribution(table, opponent_mask)
+
+    def opponent_lead(self, opponent_mask, score_delta, rounds_left):
+        key = "%d|%s" % (duel_mask_count(opponent_mask),
+                         self._round_bucket(rounds_left))
+        table = self.lead.get(key, {})
+        if not table:
+            cards = duel_mask_cards(opponent_mask)
+            if not cards:
+                return []
+            prob = 1.0 / len(cards)
+            return [(b, prob) for b in cards]
+        return self._distribution(table, opponent_mask)
+
+    def next_leader(self, we_lead_now):
+        return "them" if we_lead_now else "us"
+
+
+def load_trained_duel_models():
+    path = os.path.join(DIRECTORY, "yin_yang_duel_model.json")
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as source:
+            data = source.read()
+        if sys.version_info[0] != 2:
+            data = data.decode("utf-8")
+        return DuelTrainedModels(json.loads(data))
+    except Exception:
+        return None
+
+
+class DuelSolver(object):
+    def __init__(self, models=None):
+        self.models = models or DuelBaselineModels()
+        self.memo = {}
+
+    def choose_move(self, snapshot, deadline):
+        try:
+            if snapshot.we_lead:
+                value, card = self._choose_lead(snapshot, deadline)
+                mode = "lead"
+            elif (snapshot.exact_value_confident and
+                  snapshot.exact_opponent_led_value is not None):
+                value, card = self._choose_exact_follow(snapshot, deadline)
+                mode = "exact_follow"
+            else:
+                value, card = self._choose_color_follow(snapshot, deadline)
+                mode = "color_follow"
+        except _DuelDeadline:
+            return self._fallback(snapshot)
+        if card is None or value is None:
+            return self._fallback(snapshot)
+        return {
+            "card_value": card,
+            "mode": mode,
+            "win_probability": value[0],
+            "loss_probability": -value[1],
+            "expected_score_delta": value[2],
+            "worst_case_utility": value[3],
+            "model_version": self.models.model_version,
+            "complete_search": True,
+        }
+
+    def warm(self, our_mask, opp_mask, score_delta, deadline):
+        """Warm the memo by exploring the current match state (both leader
+        cases) during non-pick states.  Does not return a decision."""
+        rounds = duel_mask_count(our_mask)
+        for leader in ("us", "them"):
+            try:
+                self._value((our_mask, opp_mask, score_delta, rounds, leader),
+                            deadline)
+            except _DuelDeadline:
+                pass
+
+    # --- recursion over the match ---
+
+    def _value(self, state, deadline):
+        our_mask, opp_mask, score_delta, rounds_left, leader = state
+        if time.time() > deadline:
+            raise _DuelDeadline()
+        if rounds_left == 0:
+            return terminal_duel_value(score_delta)
+        key = (our_mask, opp_mask, score_delta, rounds_left, leader)
+        cached = self.memo.get(key)
+        if cached is not None:
+            return cached
+        if leader == "us":
+            result = self._value_our_lead(state, deadline)
+        else:
+            result = self._value_their_lead(state, deadline)
+        self.memo[key] = result
+        return result
+
+    def _value_our_lead(self, state, deadline):
+        our_mask = state[0]
+        best = None
+        for a in duel_mask_cards(our_mask):
+            value = self._value_our_lead_card(state, a, deadline)
+            if best is None or value > best:
+                best = value
+        return best
+
+    def _value_our_lead_card(self, state, a, deadline):
+        our_mask, opp_mask, score_delta, rounds_left, _leader = state
+        resp = self.models.opponent_response(opp_mask, duel_card_color(a),
+                                             score_delta, rounds_left)
+        expected = (0.0, 0.0, 0.0, 0.0)
+        worst = None
+        for b, prob in resp:
+            value = self._advance(state, a, b, deadline)
+            expected = _duel_add_scaled(expected, prob, value)
+            if worst is None or value < worst:
+                worst = value
+        return _duel_blend(expected, worst)
+
+    def _value_their_lead(self, state, deadline):
+        our_mask, opp_mask, score_delta, rounds_left, _leader = state
+        lead_dist = self.models.opponent_lead(opp_mask, score_delta, rounds_left)
+        expected = (0.0, 0.0, 0.0, 0.0)
+        worst = None
+        for b, prob in lead_dist:
+            value = self._value_their_lead_card(state, b, deadline)
+            expected = _duel_add_scaled(expected, prob, value)
+            if worst is None or value < worst:
+                worst = value
+        return _duel_blend(expected, worst)
+
+    def _value_their_lead_card(self, state, b, deadline):
+        our_mask = state[0]
+        best = None
+        for a in duel_mask_cards(our_mask):
+            value = self._advance(state, a, b, deadline)
+            if best is None or value > best:
+                best = value
+        return best
+
+    def _advance(self, state, a, b, deadline):
+        our_mask, opp_mask, score_delta, rounds_left, leader = state
+        next_our = duel_mask_remove(our_mask, a)
+        next_opp = duel_mask_remove(opp_mask, b)
+        next_score = score_delta + round_score_delta(a, b)
+        next_rounds = rounds_left - 1
+        next_leader = self.models.next_leader(leader == "us")
+        return self._value((next_our, next_opp, next_score, next_rounds, next_leader),
+                           deadline)
+
+    # --- decision entry points ---
+
+    def _choose_lead(self, snapshot, deadline):
+        best_value, best_card = None, None
+        for a in duel_mask_cards(snapshot.our_remaining_mask):
+            state = (snapshot.our_remaining_mask, snapshot.opponent_remaining_mask,
+                     snapshot.score_delta, snapshot.rounds_left, "us")
+            value = self._value_our_lead_card(state, a, deadline)
+            if best_value is None or value > best_value or (
+                    value == best_value and a < best_card):
+                best_value, best_card = value, a
+        return best_value, best_card
+
+    def _choose_exact_follow(self, snapshot, deadline):
+        b = snapshot.exact_opponent_led_value
+        state = (snapshot.our_remaining_mask, snapshot.opponent_remaining_mask,
+                 snapshot.score_delta, snapshot.rounds_left, "them")
+        best_value, best_card = None, None
+        for a in duel_mask_cards(snapshot.our_remaining_mask):
+            value = self._advance(state, a, b, deadline)
+            if best_value is None or value > best_value or (
+                    value == best_value and a < best_card):
+                best_value, best_card = value, a
+        return best_value, best_card
+
+    def _choose_color_follow(self, snapshot, deadline):
+        color = snapshot.visible_color
+        possible = duel_mask_cards(duel_mask_color(snapshot.opponent_remaining_mask, color))
+        if not possible:
+            raise _DuelDeadline()
+        state = (snapshot.our_remaining_mask, snapshot.opponent_remaining_mask,
+                 snapshot.score_delta, snapshot.rounds_left, "them")
+        best_value, best_card = None, None
+        for a in duel_mask_cards(snapshot.our_remaining_mask):
+            expected = (0.0, 0.0, 0.0, 0.0)
+            worst = None
+            for b in possible:
+                value = self._advance(state, a, b, deadline)
+                expected = _duel_add_scaled(expected, 1.0 / len(possible), value)
+                if worst is None or value < worst:
+                    worst = value
+            blended = _duel_blend(expected, worst)
+            if best_value is None or blended > best_value or (
+                    blended == best_value and a < best_card):
+                best_value, best_card = blended, a
+        return best_value, best_card
+
+    # --- deterministic fallback ---
+
+    def _fallback(self, snapshot):
+        hand = duel_mask_cards(snapshot.our_remaining_mask)
+        if not hand:
+            return None
+        if snapshot.we_lead:
+            card = choose_duel_card_lead(hand, duel_mask_cards(snapshot.opponent_remaining_mask))
+            mode = "fallback_lead"
+        elif (snapshot.exact_value_confident and
+              snapshot.exact_opponent_led_value is not None):
+            card = choose_duel_card_follow(hand, snapshot.exact_opponent_led_value)
+            mode = "fallback_exact"
+        else:
+            card = choose_duel_card(hand, snapshot.visible_color)
+            mode = "fallback_color"
+        return {
+            "card_value": card,
+            "mode": mode,
+            "win_probability": None,
+            "loss_probability": None,
+            "expected_score_delta": None,
+            "worst_case_utility": None,
+            "model_version": self.models.model_version,
+            "complete_search": False,
+        }
+
+
+class DuelRoundTracker(object):
+    """Tracks mutable match state and converts client UI into a DuelSnapshot."""
+
+    def __init__(self):
+        self.match_id = 0
+        self.window_identity = None
+        self.last_state = None
+        self.last_round = None
+        self.opponent_played_mask = 0
+        self.opponent_last = None
+        self.opponent_round = None
+        self.pending = None
+
+    def on_window(self, window):
+        if id(window) != self.window_identity:
+            self.match_id += 1
+            self.window_identity = id(window)
+            self.last_state = None
+            self.last_round = None
+            self.opponent_played_mask = 0
+            self.opponent_last = None
+            self.opponent_round = None
+            self.pending = None
+
+    @staticmethod
+    def read_mask(cards_dict, played):
+        mask = 0
+        valid = True
+        for key, card in (cards_dict or {}).items():
+            try:
+                is_played = bool(getattr(card, "played", False))
+                if is_played != played:
+                    continue
+                value = int(getattr(card, "value", key))
+                if 0 <= value <= 8 and not (mask & (1 << value)):
+                    mask |= 1 << value
+                else:
+                    valid = False
+            except Exception:
+                valid = False
+        return mask, valid
+
+    def observe_opponent(self, window):
+        """Track the opponent's newly-played cards.  Returns (newly_values, exact)
+        where exact is the led value when exactly one card appeared in an
+        opponent-led, colour-matching state."""
+        lead_info = getattr(window, "leadInfo", None) or {}
+        we_lead = duel_we_lead(lead_info)
+        round_num = lead_info.get("round", 0)
+        if round_num != self.opponent_round:
+            # A new round invalidates the previously-detected led card: a stale
+            # value must never be reused as the exact led card of this round.
+            self.opponent_round = round_num
+            self.opponent_last = None
+        played_mask, valid = self.read_mask(getattr(window, "opponentCards", None),
+                                            played=True)
+        if not valid:
+            return [], None
+        newly = played_mask & ~self.opponent_played_mask
+        self.opponent_played_mask = played_mask
+        newly_values = duel_mask_cards(newly)
+        exact = None
+        if len(newly_values) == 1 and not we_lead:
+            value = newly_values[0]
+            black = bool(lead_info.get("black", False))
+            if (duel_card_color(value) == "black") == black:
+                self.opponent_last = value
+                exact = value
+        return newly_values, exact
+
+    def build_snapshot(self, window):
+        lead_info = getattr(window, "leadInfo", None) or {}
+        we_lead = duel_we_lead(lead_info)
+        our_remaining, our_valid = self.read_mask(getattr(window, "playerCards", None),
+                                                  played=False)
+        opp_remaining, opp_valid = self.read_mask(getattr(window, "opponentCards", None),
+                                                  played=False)
+        if not (our_valid and opp_valid):
+            return None
+        our_count = duel_mask_count(our_remaining)
+        opp_count = duel_mask_count(opp_remaining)
+        if we_lead:
+            if our_count != opp_count:
+                return None
+        else:
+            # The opponent already led, so they hold one fewer unplayed card.
+            if our_count != opp_count + 1:
+                return None
+        exact = None if we_lead else self.opponent_last
+        return DuelSnapshot(
+            match_id=self.match_id,
+            round_num=lead_info.get("round", 0),
+            state=getattr(window, "state", None),
+            we_lead=we_lead,
+            visible_color=(None if we_lead else
+                           ("black" if lead_info.get("black", False) else "white")),
+            exact_opponent_led_value=exact,
+            exact_value_confident=(exact is not None),
+            our_remaining_mask=our_remaining,
+            opponent_remaining_mask=opp_remaining,
+            our_score=int(getattr(window, "playerScore", 0) or 0),
+            opponent_score=int(getattr(window, "opponentScore", 0) or 0),
+        )
+
+    def has_pending(self, key):
+        return self.pending == key
+
+    def mark_pending(self, key):
+        self.pending = key
+
+    def clear_pending(self):
+        self.pending = None
 
 
 def disk_log(message):
@@ -373,7 +945,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
         self.AddFlag("movable")
         self.AddFlag("float")
-        self.SetSize(820, 485)
+        self.SetSize(820, 520)
         self.SetPosition(40, 80)
         self.SetTitleName("Metin Radius Scanner")
         self.SetCloseEvent(self.MinimizePanel)
@@ -435,6 +1007,17 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_saved_hunter_enabled = False
         self.reaction_saved_queue_enabled = False
         self.reaction_saved_boss_attack = False
+        self.yinyang_duel_enabled = False
+        self.yinyang_duel_window = None
+        self.yinyang_duel_next_poll = 0.0
+        self.yinyang_duel_last_error = None
+        self.yinyang_duel_debug = None
+        self.yinyang_duel_stall = None
+        self.yinyang_duel_solver = DuelSolver(
+            load_trained_duel_models() or DuelBaselineModels())
+        self.yinyang_duel_tracker = DuelRoundTracker()
+        self.yinyang_duel_last_scores = None
+        self.yinyang_duel_last_state = None
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -545,6 +1128,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_title = make_text(self, 15, 432, "Auto Reaction")
         self.reaction_button = make_button(self, 110, "ON", self.ToggleReaction, 427)
         self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
+        self.yinyang_duel_title = make_text(self, 15, 466, "Yin Yang Duel")
+        self.yinyang_duel_button = make_button(self, 110, "OFF", self.ToggleYinYangDuel, 461)
+        self.yinyang_duel_label = make_text(self, 205, 466, "Plays the Yin Yang Duel minigame")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
         self.queue_admission_guard = get_metin_queue_admission_guard()
@@ -1103,6 +1689,374 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.reaction_saved_queue_enabled = False
             self.reaction_saved_boss_attack = False
         self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
+
+    def ToggleYinYangDuel(self):
+        self.yinyang_duel_enabled = not self.yinyang_duel_enabled
+        self.yinyang_duel_button.SetText("ON" if self.yinyang_duel_enabled else "OFF")
+        self.yinyang_duel_next_poll = 0.0
+        self.yinyang_duel_last_error = None
+        self.yinyang_duel_debug = None
+        self.yinyang_duel_stall = None
+        if self.yinyang_duel_enabled:
+            if not self.running:
+                self.Start()
+                if not self.running:
+                    self.yinyang_duel_enabled = False
+                    self.yinyang_duel_button.SetText("OFF")
+                    self.yinyang_duel_label.SetText(
+                        "Yin Yang Duel: enter the game world first")
+                    return
+            self.yinyang_duel_label.SetText("Yin Yang Duel: probing runtime")
+            self.AddLine("Yin Yang Duel ON")
+            self.DiagnosticYinYangDuel()
+        else:
+            self.yinyang_duel_label.SetText("Yin Yang Duel off")
+            self.AddLine("Yin Yang Duel OFF")
+
+    def DiagnosticYinYangDuel(self):
+        """Dump the YinYangDuelWindow runtime API so the minigame can be driven."""
+        window = self.FindRuntimeObject("YinYangDuelWindow", ())
+        if window is None:
+            self.AddLine("YinYangDuelWindow not found in runtime objects")
+            return
+        self.AddLine("YinYangDuelWindow type=%s" % ascii_text(type(window).__name__))
+        for name in ("state", "round", "playerScore", "opponentScore",
+                     "leadInfo", "leadActive", "hasState", "enabled", "reveal",
+                     "duelsUsedHwid", "duelsMaxHwid", "duelsUsed", "duelsMax",
+                     "cooldownEnd", "startPending", "openPending", "levelMin",
+                     "costGold"):
+            try:
+                value = getattr(window, name, None)
+                self.AddLine("  duel state %s = %s" %
+                             (name, ascii_text(repr(value))[:140]))
+            except Exception as exc:
+                self.AddLine("  duel state %s error: %s" % (name, exc))
+        try:
+            self.AddLine("  duel cooldown remaining = %s" %
+                         ascii_text(repr(window.GetCooldownRemaining())))
+        except Exception as exc:
+            self.AddLine("  duel cooldown remaining error: %s" % exc)
+        for label, cards in (("player", getattr(window, "playerCards", None)),
+                             ("opponent", getattr(window, "opponentCards", None))):
+            if not cards:
+                self.AddLine("  duel %s cards: (none)" % label)
+                continue
+            try:
+                keys = list(cards.keys())
+                self.AddLine("  duel %s card keys = %s" % (label, ascii_text(repr(keys))))
+                sample = cards[keys[0]]
+                self.AddLine("  duel %s card type=%s" % (label, ascii_text(type(sample).__name__)))
+                self.AddLine("  duel %s card dict=%s" %
+                             (label, ascii_text(repr(getattr(sample, "__dict__", {}))[:240])))
+                for name in dir(sample):
+                    if not name.startswith("__"):
+                        self.AddLine("    card attr %s" % name)
+            except Exception as exc:
+                self.AddLine("  duel %s card dump error: %s" % (label, exc))
+
+    def _DuelCooldownRemaining(self, window):
+        get_cd = getattr(window, "GetCooldownRemaining", None)
+        if callable(get_cd):
+            try:
+                value = get_cd()
+                if isinstance(value, (tuple, list)):
+                    value = value[0] if value else 0
+                return float(value)
+            except Exception:
+                pass
+        return 0.0
+
+    def _DuelDebugLog(self, message):
+        if message != self.yinyang_duel_debug:
+            self.yinyang_duel_debug = message
+            self.AddLine(message)
+
+    def _DuelStallLog(self, reason, detail=""):
+        """Throttled log of *why* a card was not played, to diagnose stalls."""
+        message = "Yin Yang Duel: no play (%s)%s" % (reason, detail)
+        if message != self.yinyang_duel_stall:
+            self.yinyang_duel_stall = message
+            self.AddLine(message)
+
+    def _DuelRecordEvent(self, event):
+        """Append one versioned JSON-lines event to the duel history."""
+        try:
+            event = dict(event)
+            event.setdefault("schema", YINYANG_DUEL_HISTORY_SCHEMA)
+            event.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S",
+                                                 time.localtime()))
+            event.setdefault("feature_version", FEATURE_VERSION)
+            line = json.dumps(event, sort_keys=True)
+            if sys.version_info[0] == 2:
+                data = line + "\n"
+            else:
+                data = line.encode("ascii") + b"\n"
+            fd = os.open(YINYANG_DUEL_HISTORY_JSONL,
+                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+            try:
+                offset = 0
+                while offset < len(data):
+                    written = os.write(fd, data[offset:])
+                    if written <= 0:
+                        break
+                    offset += written
+            finally:
+                os.close(fd)
+        except Exception as exc:
+            self._DuelDebugLog("Yin Yang Duel: history write error %s" %
+                               ascii_text(exc))
+
+    def _DuelRecordPlay(self, actor, round_num, card_value, leads):
+        self._DuelRecordEvent({
+            "event": "play",
+            "actor": actor,
+            "round": int(round_num),
+            "card": int(card_value),
+            "leads": 1 if leads else 0,
+        })
+
+    def _DuelTryPlay(self, window):
+        """If it is our turn, solve and play a card.  Returns True when played."""
+        if getattr(window, "state", None) != 2:
+            return False
+        tracker = self.yinyang_duel_tracker
+        snapshot = tracker.build_snapshot(window)
+        if snapshot is None:
+            our_rm, our_ok = tracker.read_mask(getattr(window, "playerCards", None),
+                                               played=False)
+            opp_rm, opp_ok = tracker.read_mask(getattr(window, "opponentCards", None),
+                                               played=False)
+            lead_info = getattr(window, "leadInfo", None) or {}
+            self._DuelStallLog(
+                "snapshot rejected",
+                ": we_lead=%s round=%s our=%d(%s) opp=%d(%s)" % (
+                    duel_we_lead(lead_info),
+                    lead_info.get("round", 0),
+                    duel_mask_count(our_rm), our_ok,
+                    duel_mask_count(opp_rm), opp_ok))
+            return False
+        key = snapshot.decision_key()
+        if tracker.has_pending(key):
+            self._DuelStallLog(
+                "pending click not cleared",
+                ": round=%s we_lead=%s" % (snapshot.round_num, snapshot.we_lead))
+            return False
+        can_pick = getattr(window, "CanPickCard", None)
+        if callable(can_pick):
+            try:
+                if not can_pick():
+                    self._DuelStallLog(
+                        "CanPickCard returned false",
+                        ": round=%s we_lead=%s" % (snapshot.round_num, snapshot.we_lead))
+                    return False
+            except Exception:
+                pass
+        deadline = time.time() + DUEL_SOLVER_BUDGET_SECONDS
+        solve_started = time.time()
+        decision = self.yinyang_duel_solver.choose_move(snapshot, deadline)
+        solver_elapsed_ms = (time.time() - solve_started) * 1000.0
+        if decision is None or decision.get("card_value") is None:
+            self._DuelStallLog(
+                "solver produced no decision",
+                ": round=%s we_lead=%s our=%d opp=%d" % (
+                    snapshot.round_num, snapshot.we_lead,
+                    duel_mask_count(snapshot.our_remaining_mask),
+                    duel_mask_count(snapshot.opponent_remaining_mask)))
+            return False
+        value = int(decision["card_value"])
+        cards = getattr(window, "playerCards", None) or {}
+        card = cards.get(value)
+        if card is None:
+            for candidate in cards.values():
+                try:
+                    if int(getattr(candidate, "value", -1)) == value:
+                        card = candidate
+                        break
+                except Exception:
+                    continue
+        if card is None or getattr(card, "played", False):
+            self._DuelStallLog(
+                "chosen card unavailable",
+                ": card=%d played=%s" % (
+                    value,
+                    bool(getattr(card, "played", False)) if card is not None else None))
+            return False
+        tracker.mark_pending(key)
+        emit_synthetic_click()
+        try:
+            card.OnMouseLeftButtonDown()
+        except Exception as exc:
+            tracker.clear_pending()
+            self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc))
+            return False
+        note = (" vs %d" % snapshot.exact_opponent_led_value
+                if snapshot.exact_opponent_led_value is not None else "")
+        self.AddLine("Yin Yang Duel: played %d (%s)%s" %
+                     (value, decision.get("mode"), note))
+        self._DuelRecordEvent({
+            "event": "decision",
+            "match_id": snapshot.match_id,
+            "round": snapshot.round_num,
+            "state": snapshot.state,
+            "we_lead": 1 if snapshot.we_lead else 0,
+            "visible_color": snapshot.visible_color,
+            "exact_opponent_led_value": snapshot.exact_opponent_led_value,
+            "exact_value_confident": 1 if snapshot.exact_value_confident else 0,
+            "our_score_before": snapshot.our_score,
+            "opponent_score_before": snapshot.opponent_score,
+            "our_remaining_mask": snapshot.our_remaining_mask,
+            "opponent_remaining_mask": snapshot.opponent_remaining_mask,
+            "chosen_card": value,
+            "decision_mode": decision.get("mode"),
+            "win_probability": decision.get("win_probability"),
+            "loss_probability": decision.get("loss_probability"),
+            "expected_final_score_delta": decision.get("expected_score_delta"),
+            "worst_case_utility": decision.get("worst_case_utility"),
+            "complete_search": 1 if decision.get("complete_search") else 0,
+            "solver_elapsed_ms": round(solver_elapsed_ms, 3),
+            "model_version": decision.get("model_version"),
+        })
+        self.yinyang_duel_label.SetText("Yin Yang Duel: played %d" % value)
+        return True
+
+    def _DuelEnsureVisible(self, window):
+        """Open the duel window if it is hidden; returns True when opened."""
+        try:
+            if not window.IsShow():
+                window.Open()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _DuelEnsureStarted(self, window, state):
+        if self._DuelEnsureVisible(window):
+            self.yinyang_duel_label.SetText("Yin Yang Duel: opening window")
+            return
+        if state == 0:
+            start = getattr(window, "_YinYangDuelWindow__OnStartClicked", None)
+            if callable(start):
+                start()
+                self.yinyang_duel_label.SetText("Yin Yang Duel: starting")
+                return
+        self.yinyang_duel_label.SetText("Yin Yang Duel: idle (state %s)" % state)
+
+    def PollYinYangDuel(self, now):
+        if not self.yinyang_duel_enabled:
+            return
+        if self.boss_enabled and self.boss_state in BOSS_SWEEP_BUSY_STATES:
+            self.yinyang_duel_label.SetText("Yin Yang Duel: waiting for Boss Sweep")
+            return
+        if now < self.yinyang_duel_next_poll:
+            return
+        self.yinyang_duel_next_poll = now + YINYANG_DUEL_POLL_SECONDS
+        try:
+            window = self.FindRuntimeObject("YinYangDuelWindow", ())
+            if window is None:
+                self.yinyang_duel_label.SetText("Yin Yang Duel: window not found")
+                return
+            tracker = self.yinyang_duel_tracker
+            tracker.on_window(window)
+            used = int(getattr(window, "duelsUsedHwid", 0) or 0)
+            maximum = int(getattr(window, "duelsMaxHwid", 0) or 0)
+            if maximum > 0 and used >= maximum:
+                self.yinyang_duel_enabled = False
+                self.yinyang_duel_button.SetText("OFF")
+                self.yinyang_duel_label.SetText(
+                    "Yin Yang Duel: daily limit %d/%d" % (used, maximum))
+                return
+            state = getattr(window, "state", None)
+            lead_info = getattr(window, "leadInfo", None) or {}
+            round_num = lead_info.get("round", 0)
+            we_lead = duel_we_lead(lead_info)
+            # Keep the duel window visible while a duel is active, so the
+            # automation isn't playing cards on a hidden window.
+            if state in (2, 3, 4):
+                self._DuelEnsureVisible(window)
+            # Warm the solver cache during non-pick active states so the next
+            # pick decision is fast and closer to exact.
+            if state in (3, 4):
+                warm_our, _ = tracker.read_mask(
+                    getattr(window, "playerCards", None), played=False)
+                warm_opp, _ = tracker.read_mask(
+                    getattr(window, "opponentCards", None), played=False)
+                self.yinyang_duel_solver.warm(
+                    warm_our, warm_opp,
+                    int(getattr(window, "playerScore", 0) or 0) -
+                    int(getattr(window, "opponentScore", 0) or 0),
+                    time.time() + DUEL_WARM_BUDGET_SECONDS)
+            # Observe and record the opponent's plays (leads and responses).
+            newly, _exact = tracker.observe_opponent(window)
+            for value in newly:
+                self._DuelRecordPlay("them", round_num, value, we_lead)
+            # Correlate resolved rounds and the match finish from score/state
+            # transitions.
+            our_score = int(getattr(window, "playerScore", 0) or 0)
+            opp_score = int(getattr(window, "opponentScore", 0) or 0)
+            prev_state = self.yinyang_duel_last_state
+            if state == 2 and prev_state in (0, None):
+                # A new match started; reset score tracking.
+                self.yinyang_duel_last_scores = (our_score, opp_score)
+            else:
+                last_scores = self.yinyang_duel_last_scores
+                if last_scores is not None and last_scores != (our_score, opp_score):
+                    our_delta = our_score - last_scores[0]
+                    opp_delta = opp_score - last_scores[1]
+                    outcome = ("win" if our_delta > 0 else
+                               ("lose" if opp_delta > 0 else "tie"))
+                    self._DuelRecordEvent({
+                        "event": "result",
+                        "match_id": tracker.match_id,
+                        "round": round_num,
+                        "round_outcome": outcome,
+                        "our_score": our_score,
+                        "opponent_score": opp_score,
+                    })
+                    self.yinyang_duel_last_scores = (our_score, opp_score)
+                if prev_state in (2, 3, 4) and state == 0:
+                    final_outcome = ("win" if our_score > opp_score else
+                                     ("lose" if our_score < opp_score else "tie"))
+                    self._DuelRecordEvent({
+                        "event": "finish",
+                        "match_id": tracker.match_id,
+                        "our_score": our_score,
+                        "opponent_score": opp_score,
+                        "outcome": final_outcome,
+                    })
+            self.yinyang_duel_last_state = state
+            # Clear the pending click once state leaves the pickable round.
+            if state != 2 or round_num != tracker.last_round:
+                tracker.clear_pending()
+            tracker.last_round = round_num
+            # Debug: report state and mask counts (throttled) to diagnose stalls.
+            _our_rm, _our_ok = tracker.read_mask(getattr(window, "playerCards", None),
+                                                 played=False)
+            _opp_rm, _opp_ok = tracker.read_mask(getattr(window, "opponentCards", None),
+                                                 played=False)
+            self._DuelDebugLog(
+                "Yin Yang Duel: state=%s round=%s we_lead=%s our=%d(%s) opp=%d(%s)" %
+                (state, round_num, we_lead, duel_mask_count(_our_rm), _our_ok,
+                 duel_mask_count(_opp_rm), _opp_ok))
+            if self._DuelTryPlay(window):
+                return
+            # Only treat the cooldown as a gate when the duel is idle.  During
+            # an active duel (state 2/3/4) GetCooldownRemaining reports the
+            # countdown to the next duel, which must not be shown as a stall.
+            if state == 0:
+                cooldown = self._DuelCooldownRemaining(window)
+                if cooldown > 0:
+                    self.yinyang_duel_label.SetText(
+                        "Yin Yang Duel: cooldown %ds (%d/%d used)" %
+                        (int(cooldown), used, maximum))
+                    return
+                self._DuelEnsureStarted(window, state)
+            else:
+                self.yinyang_duel_label.SetText("Yin Yang Duel: duel in progress")
+        except Exception as exc:
+            problem = ascii_text(exc)
+            if problem != self.yinyang_duel_last_error:
+                self.AddLine("Yin Yang Duel error: %s" % problem)
+                self.yinyang_duel_last_error = problem
 
     def ReadBossTimer(self):
         if self.boss_timer is None:
@@ -2034,6 +2988,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.AddLine("Radius update error: %s" % problem)
                 self.last_radius_error = problem
         self.UpdateBossSweep(now, player_position)
+        self.PollYinYangDuel(now)
         if now >= self.next_scan:
             try:
                 if player_position is None:

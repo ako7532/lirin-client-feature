@@ -835,4 +835,189 @@ with tempfile.TemporaryDirectory() as directory:
     assert not loaded_panel.running and not loaded_panel.hunter_enabled
     assert not loaded_panel.boss_enabled
     loaded_panel.Dispose()
+
+    # Yin Yang Duel strategy (cards 0..8; even=black, odd=white).
+    duel_globals = panel.PollYinYangDuel.__globals__
+    choose_duel_card = duel_globals["choose_duel_card"]
+    choose_duel_card_follow = duel_globals["choose_duel_card_follow"]
+    choose_duel_card_lead = duel_globals["choose_duel_card_lead"]
+    duel_card_color = duel_globals["duel_card_color"]
+    assert duel_card_color(0) == "black" and duel_card_color(1) == "white"
+    assert choose_duel_card([0, 1, 2, 3, 4, 5, 6, 7, 8], "black") == 5
+    assert choose_duel_card([0, 1, 2, 3, 4, 5, 6, 7, 8], "white") == 6
+    assert choose_duel_card([0, 1], "black") == 0
+    assert choose_duel_card([0, 1, 2, 3, 4, 5, 6, 7, 8], None) == 4
+    assert choose_duel_card([], "black") is None
+    assert choose_duel_card_follow([0, 1, 2, 3, 4, 5, 6, 7, 8], 6) == 7
+    assert choose_duel_card_follow([0, 1, 2, 3], 8) == 0
+    assert choose_duel_card_follow([], 3) is None
+    assert choose_duel_card_lead([0, 1, 2, 3, 4, 5, 6, 7, 8], {1, 3, 5, 7}) == 6
+    assert choose_duel_card_lead([0, 1, 2], {7, 8}) == 0
+    assert choose_duel_card_lead([], {}) is None
+
+    # Yin Yang Duel solver (pure card-game logic).
+    DuelSolver = duel_globals["DuelSolver"]
+    DuelSnapshot = duel_globals["DuelSnapshot"]
+    duel_mask_cards = duel_globals["duel_mask_cards"]
+    duel_mask_count = duel_globals["duel_mask_count"]
+    duel_mask_remove = duel_globals["duel_mask_remove"]
+    duel_mask_color = duel_globals["duel_mask_color"]
+    round_score_delta = duel_globals["round_score_delta"]
+    terminal_duel_value = duel_globals["terminal_duel_value"]
+
+    assert duel_mask_cards(0x1FF) == [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    assert duel_mask_count(0x1FF) == 9
+    assert duel_mask_remove(0x1FF, 4) == 0x1FF & ~(1 << 4)
+    assert duel_mask_cards(duel_mask_color(0x1FF, "black")) == [0, 2, 4, 6, 8]
+    assert round_score_delta(6, 3) == 1
+    assert round_score_delta(3, 6) == -1
+    assert round_score_delta(5, 5) == 0
+    assert terminal_duel_value(2) == (1.0, 0.0, 2.0, 1.0)
+    assert terminal_duel_value(-1) == (0.0, -1.0, -1.0, -1.0)
+    assert terminal_duel_value(0) == (0.0, 0.0, 0.0, 0.0)
+
+    solver = DuelSolver()
+    # One-card exact follow: only card 7, opponent led 6 -> must play 7.
+    one_card = DuelSnapshot(match_id=1, round_num=9, state=2, we_lead=False,
+                            visible_color="black", exact_opponent_led_value=6,
+                            exact_value_confident=True,
+                            our_remaining_mask=1 << 7,
+                            opponent_remaining_mask=1 << 6,
+                            our_score=4, opponent_score=4)
+    d = solver.choose_move(one_card, time.time() + 2.0)
+    assert d is not None and d["card_value"] == 7, d
+    # One-card exact follow where we cannot beat: only card 2 vs led 6.
+    lose_card = DuelSnapshot(match_id=1, round_num=9, state=2, we_lead=False,
+                             visible_color="black", exact_opponent_led_value=6,
+                             exact_value_confident=True,
+                             our_remaining_mask=1 << 2,
+                             opponent_remaining_mask=1 << 6,
+                             our_score=4, opponent_score=4)
+    d2 = solver.choose_move(lose_card, time.time() + 2.0)
+    assert d2 is not None and d2["card_value"] == 2, d2
+    # 2-card exact follow: {5,7} vs led 6, opponent remaining {8}.  Playing 7
+    # ties the match; playing 5 loses it, so the solver must choose 7.
+    follow2 = DuelSnapshot(match_id=1, round_num=8, state=2, we_lead=False,
+                           visible_color="black", exact_opponent_led_value=6,
+                           exact_value_confident=True,
+                           our_remaining_mask=(1 << 5) | (1 << 7),
+                           opponent_remaining_mask=1 << 8,
+                           our_score=0, opponent_score=0)
+    d4 = solver.choose_move(follow2, time.time() + 2.0)
+    assert d4 is not None and d4["card_value"] == 7, d4
+    # Full-hand lead decision must return a valid in-hand card (and not crash).
+    full = DuelSnapshot(match_id=1, round_num=1, state=2, we_lead=True,
+                        visible_color=None, exact_opponent_led_value=None,
+                        exact_value_confident=False,
+                        our_remaining_mask=0x1FF, opponent_remaining_mask=0x1FF,
+                        our_score=0, opponent_score=0)
+    d3 = solver.choose_move(full, time.time() + 3.0)
+    assert d3 is not None and d3["card_value"] in duel_mask_cards(0x1FF), d3
+
+    # Brute-force reference (no memoization) for small exact-follow hands.
+    def brute_value(om, pm, sd, leader):
+        oc = duel_mask_cards(om)
+        pc = duel_mask_cards(pm)
+        if not oc:
+            return terminal_duel_value(sd)
+        if leader == "us":
+            best = None
+            for a in oc:
+                exp = [0.0, 0.0, 0.0, 0.0]
+                worst = None
+                for b in pc:
+                    v = brute_value(duel_mask_remove(om, a), duel_mask_remove(pm, b),
+                                    sd + round_score_delta(a, b), "them")
+                    for i in range(4):
+                        exp[i] += v[i] / len(pc)
+                    if worst is None or v < worst:
+                        worst = v
+                val = tuple(0.75 * exp[i] + 0.25 * worst[i] for i in range(4))
+                if best is None or val > best:
+                    best = val
+            return best
+        exp = [0.0, 0.0, 0.0, 0.0]
+        worst = None
+        for b in pc:
+            best_a = None
+            for a in oc:
+                v = brute_value(duel_mask_remove(om, a), duel_mask_remove(pm, b),
+                                sd + round_score_delta(a, b), "us")
+                if best_a is None or v > best_a:
+                    best_a = v
+            for i in range(4):
+                exp[i] += best_a[i] / len(pc)
+            if worst is None or best_a < worst:
+                worst = best_a
+        return tuple(0.75 * exp[i] + 0.25 * worst[i] for i in range(4))
+
+    def brute_exact(our_mask, opp_mask, score_delta, b):
+        best_val, best_card = None, None
+        for a in duel_mask_cards(our_mask):
+            v = brute_value(duel_mask_remove(our_mask, a),
+                            duel_mask_remove(opp_mask, b),
+                            score_delta + round_score_delta(a, b), "us")
+            if best_val is None or v > best_val or (v == best_val and a < best_card):
+                best_val, best_card = v, a
+        return best_card
+
+    rng = duel_globals["random"].Random(7)
+    for _ in range(25):
+        size = rng.randint(1, 4)
+        our_vals = rng.sample(range(9), size)
+        opp_vals = rng.sample(range(9), size)
+        led = rng.choice(opp_vals)
+        our_mask = sum(1 << v for v in our_vals)
+        opp_mask = sum(1 << v for v in opp_vals)
+        snap = DuelSnapshot(match_id=1, round_num=9 - size, state=2, we_lead=False,
+                            visible_color=duel_card_color(led),
+                            exact_opponent_led_value=led, exact_value_confident=True,
+                            our_remaining_mask=our_mask,
+                            opponent_remaining_mask=opp_mask & ~(1 << led),
+                            our_score=0, opponent_score=0)
+        got = solver.choose_move(snap, time.time() + 2.0)
+        expect = brute_exact(our_mask, opp_mask, 0, led)
+        assert got is not None and got["card_value"] == expect, (our_vals, opp_vals, led, got, expect)
+
+    # DuelRoundTracker: a stale exact-led value must be cleared when the round
+    # advances, so a later follow round never reuses a previous round's card.
+    DuelRoundTracker = duel_globals["DuelRoundTracker"]
+
+    class DuelCard:
+        def __init__(self, value, played=False):
+            self.value = value
+            self.played = played
+
+    class DuelWindow:
+        def __init__(self):
+            self.state = 2
+            self.playerScore = 0
+            self.opponentScore = 0
+            self.leadInfo = {"leads": True, "black": True, "round": 1}
+            self.playerCards = {v: DuelCard(v) for v in range(9)}
+            self.opponentCards = {v: DuelCard(v) for v in range(9)}
+
+    tracker = DuelRoundTracker()
+    window = DuelWindow()
+    tracker.on_window(window)
+    # Round 1: `leads=True` means the opponent led (we follow).  Their led card
+    # 4 is black, so it is detected as the exact led value.
+    window.opponentCards[4].played = True
+    newly, exact = tracker.observe_opponent(window)
+    assert newly == [4] and exact == 4, (newly, exact)
+    snap = tracker.build_snapshot(window)
+    assert snap is not None and snap.exact_opponent_led_value == 4
+    assert snap.we_lead is False
+    # We answered in round 1 (our card 2 played); round advances to 2 and the
+    # opponent leads again, but the reported colour mismatches (card 6 is
+    # black, flag says white) so detection fails.  The stale round-1 value must
+    # not leak into the snapshot.
+    window.playerCards[2].played = True
+    window.leadInfo = {"leads": True, "black": False, "round": 2}
+    window.opponentCards[6].played = True
+    newly, exact = tracker.observe_opponent(window)
+    assert exact is None, exact
+    snap = tracker.build_snapshot(window)
+    assert snap is not None, "count validation rejected a valid follow state"
+    assert snap.exact_opponent_led_value is None, snap.exact_opponent_led_value
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")
