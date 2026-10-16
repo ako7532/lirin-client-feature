@@ -1960,6 +1960,15 @@ class MetinScanner(ui.BoardWithTitleBar):
             if state != 2 or round_num != tracker.last_round:
                 tracker.clear_pending()
             tracker.last_round = round_num
+            # Debug: report state and mask counts (throttled) to diagnose stalls.
+            _our_rm, _our_ok = tracker.read_mask(getattr(window, "playerCards", None),
+                                                 played=False)
+            _opp_rm, _opp_ok = tracker.read_mask(getattr(window, "opponentCards", None),
+                                                 played=False)
+            self._DuelDebugLog(
+                "Yin Yang Duel: state=%s round=%s we_lead=%s our=%d(%s) opp=%d(%s)" %
+                (state, round_num, we_lead, duel_mask_count(_our_rm), _our_ok,
+                 duel_mask_count(_opp_rm), _opp_ok))
             if self._DuelTryPlay(window):
                 return
             # Only treat the cooldown as a gate when the duel is idle.  During
