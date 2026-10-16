@@ -189,6 +189,7 @@ def choose_duel_card_lead(my_hand, opponent_remaining):
 DUEL_FULL_MASK = 0x1FF
 DUEL_WORST_WEIGHT = 0.25
 DUEL_SOLVER_BUDGET_SECONDS = 0.020
+DUEL_WARM_BUDGET_SECONDS = 0.050
 
 
 def duel_mask_cards(mask):
@@ -300,6 +301,76 @@ class DuelBaselineModels(object):
         return "them" if we_lead_now else "us"
 
 
+class DuelTrainedModels(object):
+    """Opponent models loaded from an offline-trained frequency table."""
+
+    def __init__(self, data, model_version="trained-v1"):
+        self.model_version = model_version
+        self.response = data.get("opponent_response", {})
+        self.lead = data.get("opponent_lead", {})
+
+    @staticmethod
+    def _round_bucket(rounds_left):
+        if rounds_left >= 7:
+            return "early"
+        if rounds_left >= 4:
+            return "mid"
+        return "late"
+
+    def _distribution(self, table, cards):
+        legal = duel_mask_cards(cards)
+        if not legal:
+            return []
+        total = 0
+        counts = {}
+        for card in legal:
+            count = int(table.get(str(card), 0)) + 1  # Laplace smoothing
+            counts[card] = count
+            total += count
+        return [(card, counts[card] / float(total)) for card in legal]
+
+    def opponent_response(self, opponent_mask, our_color, score_delta, rounds_left):
+        key = "%s|%d|%s" % (our_color, duel_mask_count(opponent_mask),
+                            self._round_bucket(rounds_left))
+        table = self.response.get(key, {})
+        if not table:
+            cards = duel_mask_cards(opponent_mask)
+            if not cards:
+                return []
+            prob = 1.0 / len(cards)
+            return [(b, prob) for b in cards]
+        return self._distribution(table, opponent_mask)
+
+    def opponent_lead(self, opponent_mask, score_delta, rounds_left):
+        key = "%d|%s" % (duel_mask_count(opponent_mask),
+                         self._round_bucket(rounds_left))
+        table = self.lead.get(key, {})
+        if not table:
+            cards = duel_mask_cards(opponent_mask)
+            if not cards:
+                return []
+            prob = 1.0 / len(cards)
+            return [(b, prob) for b in cards]
+        return self._distribution(table, opponent_mask)
+
+    def next_leader(self, we_lead_now):
+        return "them" if we_lead_now else "us"
+
+
+def load_trained_duel_models():
+    path = os.path.join(DIRECTORY, "yin_yang_duel_model.json")
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as source:
+            data = source.read()
+        if sys.version_info[0] != 2:
+            data = data.decode("utf-8")
+        return DuelTrainedModels(json.loads(data))
+    except Exception:
+        return None
+
+
 class DuelSolver(object):
     def __init__(self, models=None):
         self.models = models or DuelBaselineModels()
@@ -331,6 +402,17 @@ class DuelSolver(object):
             "model_version": self.models.model_version,
             "complete_search": True,
         }
+
+    def warm(self, our_mask, opp_mask, score_delta, deadline):
+        """Warm the memo by exploring the current match state (both leader
+        cases) during non-pick states.  Does not return a decision."""
+        rounds = duel_mask_count(our_mask)
+        for leader in ("us", "them"):
+            try:
+                self._value((our_mask, opp_mask, score_delta, rounds, leader),
+                            deadline)
+            except _DuelDeadline:
+                pass
 
     # --- recursion over the match ---
 
@@ -908,7 +990,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
         self.yinyang_duel_debug = None
-        self.yinyang_duel_solver = DuelSolver()
+        self.yinyang_duel_solver = DuelSolver(
+            load_trained_duel_models() or DuelBaselineModels())
         self.yinyang_duel_tracker = DuelRoundTracker()
         self.yinyang_duel_last_scores = None
         self.yinyang_duel_last_state = None
@@ -1816,6 +1899,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             lead_info = getattr(window, "leadInfo", None) or {}
             round_num = lead_info.get("round", 0)
             we_lead = bool(lead_info.get("leads", False))
+            # Warm the solver cache during non-pick active states so the next
+            # pick decision is fast and closer to exact.
+            if state in (3, 4):
+                warm_our, _ = tracker.read_mask(
+                    getattr(window, "playerCards", None), played=False)
+                warm_opp, _ = tracker.read_mask(
+                    getattr(window, "opponentCards", None), played=False)
+                self.yinyang_duel_solver.warm(
+                    warm_our, warm_opp,
+                    int(getattr(window, "playerScore", 0) or 0) -
+                    int(getattr(window, "opponentScore", 0) or 0),
+                    time.time() + DUEL_WARM_BUDGET_SECONDS)
             # Observe and record the opponent's plays (leads and responses).
             newly, _exact = tracker.observe_opponent(window)
             for value in newly:
