@@ -171,6 +171,30 @@ static bool EmitSyntheticClick() {
     return emitted;
 }
 
+// Reproduce the WndProc mouse-down/up sequence at explicit client-pixel
+// coordinates: record down (code 1) -> game down dispatch -> record up
+// (code 2) -> game up dispatch.  No picker override; the client's own
+// hit-testing picks whatever is under those coordinates.  Returns false only
+// when the game instance is missing or the dispatch faulted.
+static bool DispatchClickAt(int x, int y) {
+    void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
+    if (!game_instance) return false;
+    auto record_input = reinterpret_cast<RecordInput>(g_game_base + RVA_RECORD_INPUT);
+    BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+    auto game_down = reinterpret_cast<GameDownDispatch>(g_game_base + RVA_GAME_DOWN_DISPATCH);
+    auto game_up = reinterpret_cast<GameUpDispatch>(g_game_base + RVA_GAME_UP_DISPATCH);
+    __try {
+        if (recorder) record_input(recorder, 1, x, y);
+        game_down(game_instance, x, y);
+        if (recorder) record_input(recorder, 2, x, y);
+        game_up(game_instance, x, y);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AppendStatus(g_feature_status_path, "native queue wrapper click dispatch fault");
+        return false;
+    }
+    return true;
+}
+
 // Performs the actual click dispatch for a positive VID, assuming the
 // re-entrancy guard is held.  Returns an ADD_* code.  The acknowledgement is
 // derived from the requested VID's membership in the authoritative queue, not
@@ -226,26 +250,10 @@ static int NativeMetinQueueAddInner(int vid, int click_x, int click_y) {
     BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
 
     if (click_x >= 0 && click_y >= 0) {
-        // Full physical-path dispatch: reproduce the WndProc's mouse-down/up
-        // sequence with the target's projected client-pixel coordinates.  This
-        // lets the client pick the target naturally (UI hit-test -> world pick
-        // -> player press -> queue add) with no picker override.
-        void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
-        if (!game_instance) {
-            AppendStatus(g_feature_status_path, "native queue wrapper skipped: game instance missing");
-            return ADD_NOT_ADDED;
-        }
-        auto game_down = reinterpret_cast<GameDownDispatch>(
-            g_game_base + RVA_GAME_DOWN_DISPATCH);
-        auto game_up = reinterpret_cast<GameUpDispatch>(
-            g_game_base + RVA_GAME_UP_DISPATCH);
-        __try {
-            if (recorder) record_input(recorder, 1, click_x, click_y);
-            game_down(game_instance, click_x, click_y);
-            if (recorder) record_input(recorder, 2, click_x, click_y);
-            game_up(game_instance, click_x, click_y);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            AppendStatus(g_feature_status_path, "native queue wrapper full dispatch fault");
+        // Full physical-path dispatch at the target's projected client-pixel
+        // coordinates (UI hit-test -> world pick -> player press -> queue add)
+        // with no picker override.
+        if (!DispatchClickAt(click_x, click_y)) {
             return ADD_NOT_ADDED;
         }
     } else {
@@ -309,14 +317,16 @@ static void* NativeMetinQueueAdd(void*, void* args) {
     int vid = 0;
     if (!parse_integer(args, 0, &vid)) return argument_error(0);
 
-    // vid == 0 is a sentinel that asks only for a bare synthetic click, used by
-    // UI automations (reaction game, channel dialog) that do not touch the
-    // metin queue.  Real queue adds always pass a positive VID.
-    if (vid == 0) {
-        return build_value(int_format, EmitSyntheticClick() ? 1 : 0);
-    }
-
     if (vid < 0) return build_value(int_format, ADD_NOT_ADDED);
+
+    // Optional explicit click coordinates (client pixels).  When provided, the
+    // wrapper reproduces the full WndProc mouse-down/up dispatch at these
+    // coordinates.  vid == 0 with coordinates is a UI-control click; a positive
+    // VID with coordinates is a world-target click.
+    int click_x = -1;
+    int click_y = -1;
+    parse_integer(args, 1, &click_x);
+    parse_integer(args, 2, &click_y);
 
     // Reject recursive re-entry before any mutation.  The owner is released on
     // every exit below.
@@ -326,17 +336,20 @@ static void* NativeMetinQueueAdd(void*, void* args) {
         return build_value(int_format, ADD_NOT_ADDED);
     }
 
-    // Optional explicit target coordinates (client pixels).  When provided,
-    // the wrapper reproduces the full WndProc mouse-down/up dispatch at these
-    // coordinates; otherwise it falls back to the picker-override path.
-    int click_x = -1;
-    int click_y = -1;
-    parse_integer(args, 1, &click_x);
-    parse_integer(args, 2, &click_y);
-
     int result = ADD_NOT_ADDED;
     __try {
-        result = NativeMetinQueueAddInner(vid, click_x, click_y);
+        if (vid == 0) {
+            // vid == 0 sentinel: a bare synthetic click, or (with coordinates)
+            // a full-dispatch click on a UI control.  The latter is the
+            // replacement for the deprecated bare-record UI path.
+            if (click_x >= 0 && click_y >= 0) {
+                result = DispatchClickAt(click_x, click_y) ? 1 : 0;
+            } else {
+                result = EmitSyntheticClick() ? 1 : 0;
+            }
+        } else {
+            result = NativeMetinQueueAddInner(vid, click_x, click_y);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         AppendStatus(g_feature_status_path, "native input queue wrapper access fault");
         result = ADD_NOT_ADDED;
