@@ -150,6 +150,154 @@ def emit_synthetic_click():
         pass
 
 
+# Vertical offset (game units) added to a target's world position when
+# projecting it to client pixels for the full-dispatch click.  The entity's
+# world position is its base, so this lifts the click point into its visible
+# body and off the ground plane.  Tunable after a live test.
+PROJECT_CLICK_HEIGHT = 100
+
+
+def _queue_add(vid):
+    """Add a VID through the native queue wrapper.  When the client exposes the
+    forward projection (player.GetProjectPosition) and the target projects on
+    screen, pass the projected client-pixel coordinates so the wrapper can
+    reproduce the full WndProc mouse-down/up dispatch instead of forcing the
+    picker.  Otherwise fall back to the single-argument binding."""
+    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
+        return player.MetinQueueAdd(vid)
+    project = getattr(player, "GetProjectPosition", None)
+    if callable(project):
+        try:
+            projected = project(vid, PROJECT_CLICK_HEIGHT)
+            x = int(projected[0])
+            y = int(projected[1])
+            if x >= 0 and y >= 0:
+                return player.MetinQueueAdd(vid, x, y)
+        except Exception:
+            pass
+    return player.MetinQueueAdd(vid)
+
+
+class NativeActionCoordinator(object):
+    """Tracks in-flight native actions through an explicit state machine.
+
+    Normal flow: requested -> validated -> dispatched -> awaiting -> completed.
+    Any non-terminal state may also become cancelled (phase change or explicit
+    cancel), rejected (validation failure), or unknown (deadline or ambiguous
+    outcome).  Each action records the phase generation it was requested under
+    and a wall-clock deadline."""
+
+    REQUESTED = "requested"
+    VALIDATED = "validated"
+    DISPATCHED = "dispatched"
+    AWAITING = "awaiting"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+    _TERMINAL = (COMPLETED, CANCELLED, REJECTED, UNKNOWN)
+    _PENDING = (REQUESTED, VALIDATED, DISPATCHED, AWAITING)
+
+    def __init__(self, phase_getter, clock=time.time):
+        self._phase_getter = phase_getter
+        self._clock = clock
+        self._next_id = 1
+        self._actions = {}
+
+    def request(self, action_type, target, timeout):
+        """Open a request.  Returns a fresh action id."""
+        action_id = self._next_id
+        self._next_id += 1
+        self._actions[action_id] = {
+            "type": action_type,
+            "target": target,
+            "state": self.REQUESTED,
+            "phase": self._phase_getter(),
+            "deadline": self._clock() + timeout,
+            "detail": None,
+        }
+        return action_id
+
+    def state(self, action_id):
+        action = self._actions.get(action_id)
+        return action["state"] if action is not None else None
+
+    def _transition(self, action_id, state, detail=None):
+        action = self._actions[action_id]
+        action["state"] = state
+        action["detail"] = detail
+        return action
+
+    def validate(self, action_id, ok):
+        """REQUESTED -> VALIDATED, or REJECTED when validation fails."""
+        action = self._actions[action_id]
+        if action["state"] == self.REQUESTED:
+            if ok:
+                self._transition(action_id, self.VALIDATED)
+            else:
+                self._transition(action_id, self.REJECTED, "invalid")
+        return action["state"]
+
+    def dispatch(self, action_id):
+        """VALIDATED -> DISPATCHED -> AWAITING."""
+        action = self._actions[action_id]
+        if action["state"] == self.VALIDATED:
+            self._transition(action_id, self.DISPATCHED)
+            self._transition(action_id, self.AWAITING)
+        return action["state"]
+
+    def acknowledge(self, action_id, outcome):
+        """AWAITING -> COMPLETED/UNKNOWN/REJECTED by the reported outcome."""
+        action = self._actions[action_id]
+        if action["state"] in (self.DISPATCHED, self.AWAITING):
+            terminal = {
+                self.COMPLETED: self.COMPLETED,
+                self.UNKNOWN: self.UNKNOWN,
+                self.REJECTED: self.REJECTED,
+            }.get(outcome, self.UNKNOWN)
+            self._transition(action_id, terminal, outcome)
+        return action["state"]
+
+    def cancel(self, action_id, reason="cancelled"):
+        action = self._actions[action_id]
+        if action["state"] not in self._TERMINAL:
+            self._transition(action_id, self.CANCELLED, reason)
+        return action["state"]
+
+    def on_phase_change(self):
+        """Cancel every pending action whose phase generation is now stale."""
+        current = self._phase_getter()
+        for action_id, action in list(self._actions.items()):
+            if action["state"] in self._PENDING and action["phase"] != current:
+                self._transition(action_id, self.CANCELLED, "phase change")
+
+    def poll(self):
+        """Move pending actions past their deadline to UNKNOWN."""
+        now = self._clock()
+        for action_id, action in list(self._actions.items()):
+            if action["state"] in self._PENDING and now >= action["deadline"]:
+                self._transition(action_id, self.UNKNOWN, "deadline")
+
+    def has_pending(self):
+        return any(a["state"] in self._PENDING for a in self._actions.values())
+
+    def finish(self, action_id):
+        """Drop a terminal action so the tracker does not grow unbounded."""
+        action = self._actions.get(action_id)
+        if action is not None and action["state"] in self._TERMINAL:
+            self._actions.pop(action_id, None)
+
+
+# Map the native wrapper's integer result to a coordinator outcome.
+_ADD_RESULT_OUTCOME = {
+    1: NativeActionCoordinator.COMPLETED,
+    2: NativeActionCoordinator.COMPLETED,
+    3: NativeActionCoordinator.UNKNOWN,
+    0: NativeActionCoordinator.REJECTED,
+}
+
+
 # --- Yin Yang Duel strategy (cards 0..8; even=black, odd=white) ---
 # Both players hold the same 9-card hand (0..8).  Each round the higher card
 # wins; ties score nothing.  You only ever see the colour of the opponent's
@@ -1592,6 +1740,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.gameplay_available = True
         self.gameplay_next_check = 0.0
         self.gameplay_stopped = False
+        self.action_coordinator = NativeActionCoordinator(
+            lambda: self.gameplay_phase)
         self.config_autoload = False
         self.radius = DEFAULT_RADIUS
         self.next_scan = 0.0
@@ -1939,6 +2089,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def OnGameplayPhaseWindowRegistered(self, phase, window):
         self.gameplay_phase = int(phase)
+        self.action_coordinator.on_phase_change()
         self.gameplay_available = (self.gameplay_phase == PHASE_GAME)
         self.gameplay_next_check = 0.0
         window_name = ascii_text(getattr(type(window), "__name__", "unknown"))
@@ -3235,7 +3386,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         player.MetinQueueClear()
         player.AddMetinQueueAllowedRace(self.boss_vnum)
         player.MetinQueueSetEnabled(1)
-        player.MetinQueueAdd(vid)
+        self._dispatch_native_add(vid, 2.0)
         queue_size = int(player.MetinQueueGetSize())
         if queue_size < 1:
             player.MetinQueueSetEnabled(0)
@@ -3598,6 +3749,24 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.hunter_next_refill = now + random.uniform(HUNTER_REFILL_MIN,
                                                        HUNTER_REFILL_MAX)
 
+    def _dispatch_native_add(self, vid, timeout):
+        """Run a synchronous native queue add through the action coordinator's
+        state machine, returning the raw wrapper result (0/1/2/3).  The
+        coordinator records the phase generation and deadline so the surrounding
+        loop can detect a phase change or a hang."""
+        action_id = self.action_coordinator.request("queue_add", vid, timeout)
+        if not self.action_coordinator.validate(action_id, vid > 0):
+            return 0
+        self.action_coordinator.dispatch(action_id)
+        try:
+            result = _queue_add(vid)
+        except Exception:
+            result = 0
+        outcome = _ADD_RESULT_OUTCOME.get(result, NativeActionCoordinator.UNKNOWN)
+        self.action_coordinator.acknowledge(action_id, outcome)
+        self.action_coordinator.finish(action_id)
+        return result
+
     def FeedMetinQueue(self, candidates):
         if not self.hunter_enabled:
             return
@@ -3694,10 +3863,19 @@ class MetinScanner(ui.BoardWithTitleBar):
         distance, vid, name = random.choice(eligible)
         old_size = size
         add_started = time.time()
-        result = player.MetinQueueAdd(vid)
+        result = self._dispatch_native_add(vid, 2.0)
         add_elapsed_ms = (time.time() - add_started) * 1000.0
         new_size = int(player.MetinQueueGetSize())
-        if new_size > size:
+        if result == 2:
+            # Already present in the authoritative queue; the wrapper did not
+            # dispatch a click (a click could remove it).  Treat as queued.
+            self.hunter_queued_vids.add(vid)
+            self.AddLine("VID %d already queued (no click), queue %d/%d, call %.2fms" %
+                         (vid, new_size, cap, add_elapsed_ms))
+            if new_size >= cap:
+                self.ScheduleHunterRefill(now)
+            return
+        if result == 1 or new_size > size:
             self.hunter_queued_vids.add(vid)
             if new_size >= cap:
                 self.ScheduleHunterRefill(now)
@@ -3716,13 +3894,21 @@ class MetinScanner(ui.BoardWithTitleBar):
                          (name or "Metin", vid, distance, old_size, new_size,
                           cap, add_elapsed_ms, delay))
             return
-        if not result:
-            self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
-                         (vid, old_size, new_size, add_elapsed_ms))
-        else:
-            self.AddLine("Queue accepted VID %d without size change, queue %d->%d, call %.2fms; no retry" %
-                         (vid, old_size, new_size, add_elapsed_ms))
+        if result == 3:
+            # Outcome unknown: the dispatch ran but the requested VID is not in
+            # the queue.  Never retry the same action immediately (it may have
+            # executed); let the next scan re-evaluate.
             self.hunter_queued_vids.add(vid)
+            self.AddLine("Queue outcome unknown for VID %d, queue %d->%d/%d, call %.2fms; no immediate retry" %
+                         (vid, old_size, new_size, cap, add_elapsed_ms))
+            delay = random.uniform(HUNTER_BURST_DELAY_MIN,
+                                   HUNTER_BURST_DELAY_MAX)
+            self.hunter_next_add = now + delay
+            self.hunter_label.SetText(
+                "Outcome unknown %d/%d - recheck in %.1fs" % (new_size, cap, delay))
+            return
+        self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
+                     (vid, old_size, new_size, add_elapsed_ms))
         delay = random.uniform(HUNTER_BURST_DELAY_MIN,
                                HUNTER_BURST_DELAY_MAX)
         self.hunter_next_add = now + delay
@@ -3766,7 +3952,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.hunter_next_add = 0.0
             player.AddMetinQueueAllowedRace(vnum)
             player.MetinQueueSetEnabled(1)
-            player.MetinQueueAdd(vid)
+            self._dispatch_native_add(vid, 2.0)
             if int(player.MetinQueueGetSize()) < 1:
                 raise RuntimeError("one-target queue rejected VID %d" % vid)
             self.priority_event_vid = int(vid)
@@ -3906,6 +4092,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def OnUpdate(self):
         now = time.time()
+        self.action_coordinator.poll()
         if not self.IsGameplayAvailable(now):
             return
         if self.PollReactionGame(now):

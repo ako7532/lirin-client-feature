@@ -39,11 +39,60 @@ static constexpr ULONG_PTR RVA_RECORD_INPUT = 0x00471B10;
 static constexpr ULONG_PTR RVA_INPUT_RECORDER = 0x07A6BA20;
 static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x007E13B0;
 static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07A6B480;
+static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x007E3E70;
+static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x007E3FD0;
+static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07A734C0;
 static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
 static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
 static BYTE* g_game_base = nullptr;
 static bool g_native_queue_wrapper_installed = false;
+static volatile LONG g_wrapper_owner = 0;
+
+// Return codes reported to Python through the wrapped MetinQueueAdd binding.
+// 0 = not added (invalid input, missing state, or the client rejected it);
+// 1 = requested VID newly present in the authoritative queue;
+// 2 = requested VID already present (no click dispatched);
+// 3 = outcome unknown (dispatch ran but queue membership did not change).
+static constexpr int ADD_NOT_ADDED = 0;
+static constexpr int ADD_ADDED = 1;
+static constexpr int ADD_ALREADY_PRESENT = 2;
+static constexpr int ADD_UNKNOWN = 3;
+
+static constexpr ptrdiff_t PLAYER_QUEUE_BEGIN_OFFSET = 0x4588;
+static constexpr ptrdiff_t PLAYER_QUEUE_END_OFFSET = 0x4590;
+
+// The authoritative Metin queue is a std::vector<int> at player+0x4588..0x4590.
+static bool QueueVectorValid(BYTE* player) {
+    __try {
+        DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
+        DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
+        // An empty std::vector has begin == end (both null when capacity is 0);
+        // that is valid, not a fault.  Only reject an inconsistent pair, a
+        // reversed range, or a misaligned element count.
+        if ((begin == nullptr) != (end == nullptr)) return false;
+        if (begin && end && end < begin) return false;
+        size_t bytes = reinterpret_cast<size_t>(end) - reinterpret_cast<size_t>(begin);
+        if (bytes % sizeof(DWORD) != 0) return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+static bool QueueContainsVid(BYTE* player, int vid) {
+    __try {
+        DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
+        DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
+        if (!begin || !end || end < begin) return false;
+        for (DWORD* it = begin; it < end; ++it) {
+            if (static_cast<int>(*it) == vid) return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
 
 using ParseTupleInteger = char (*)(void*, int, int*);
 using ArgumentError = void* (*)(int);
@@ -52,6 +101,8 @@ using GetActorByVid = void* (*)(void*, int);
 using SetMouseState = void (*)(void*, int, char);
 using RecordInput = void (*)(void*, char, int, int);
 using GetCursorPosition = void (*)(void*, int*, int*);
+using GameDownDispatch = bool (*)(void*, int, int);
+using GameUpDispatch = bool (*)(void*, int, int);
 
 // Observe only. Do not generate input records or alter recorder settings.
 static void LogQueueInputState(int vid) {
@@ -62,11 +113,17 @@ static void LogQueueInputState(int vid) {
             sprintf_s(line, "queue input diagnostic: tick=%llu vid=%d recorder=missing",
                       GetTickCount64(), vid);
         } else {
+            unsigned bg = 0;
+            __try {
+                bg = static_cast<unsigned>(
+                    *reinterpret_cast<BYTE*>(g_game_base + RVA_APP_GLOBAL + 0x20));
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
             sprintf_s(line,
-                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u",
+                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u bg=%u",
                       GetTickCount64(), vid, static_cast<unsigned>(recorder[8]),
                       static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 10)),
-                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)));
+                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)), bg);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         strcpy_s(line, "queue input diagnostic: recorder read unavailable");
@@ -98,123 +155,240 @@ static void GetGameCursorPosition(int* out_x, int* out_y) {
 // input recorder.  FUN_140471b10 is a no-op while the recorder is disabled.
 // Used for UI automations (reaction game, channel dialog) that a human would
 // click but that never pass through the Windows mouse handler.
-static void EmitSyntheticClick() {
-    BYTE* recorder = *reinterpret_cast<BYTE**>(
-        g_game_base + RVA_INPUT_RECORDER);
-    if (!recorder) return;
-    int cursor_x = 0;
-    int cursor_y = 0;
-    GetGameCursorPosition(&cursor_x, &cursor_y);
+//
+// Returns true only when both the down and up records were actually emitted
+// into an enabled recorder.  The whole path (recorder dereference, cursor
+// getter, and record calls) is fault-guarded.  This is a deprecated
+// compatibility path; it must not introduce a second recorder event alongside
+// real dispatch.
+static bool EmitSyntheticClick() {
+    bool emitted = false;
+    __try {
+        BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+        if (recorder && recorder[8] != 0) {
+            int cursor_x = 0;
+            int cursor_y = 0;
+            GetGameCursorPosition(&cursor_x, &cursor_y);
+            auto record_input = reinterpret_cast<RecordInput>(
+                g_game_base + RVA_RECORD_INPUT);
+            record_input(recorder, 1, cursor_x, cursor_y);
+            record_input(recorder, 2, cursor_x, cursor_y);
+            emitted = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        emitted = false;
+    }
+    return emitted;
+}
+
+// Reproduce the WndProc mouse-down/up sequence at explicit client-pixel
+// coordinates: record down (code 1) -> game down dispatch -> record up
+// (code 2) -> game up dispatch.  No picker override; the client's own
+// hit-testing picks whatever is under those coordinates.  Returns false only
+// when the game instance is missing or the dispatch faulted.
+static bool DispatchClickAt(int x, int y) {
+    void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
+    if (!game_instance) return false;
+    auto record_input = reinterpret_cast<RecordInput>(g_game_base + RVA_RECORD_INPUT);
+    BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+    auto game_down = reinterpret_cast<GameDownDispatch>(g_game_base + RVA_GAME_DOWN_DISPATCH);
+    auto game_up = reinterpret_cast<GameUpDispatch>(g_game_base + RVA_GAME_UP_DISPATCH);
+    __try {
+        if (recorder) record_input(recorder, 1, x, y);
+        game_down(game_instance, x, y);
+        if (recorder) record_input(recorder, 2, x, y);
+        game_up(game_instance, x, y);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        AppendStatus(g_feature_status_path, "native queue wrapper click dispatch fault");
+        return false;
+    }
+    return true;
+}
+
+// Performs the actual click dispatch for a positive VID, assuming the
+// re-entrancy guard is held.  Returns an ADD_* code.  The acknowledgement is
+// derived from the requested VID's membership in the authoritative queue, not
+// from a raw size delta (a click can remove-then-add, keeping the size equal).
+static int NativeMetinQueueAddInner(int vid, int click_x, int click_y) {
+    LogQueueInputState(vid);
+
+    BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+    BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
+    if (!player || !manager) {
+        AppendStatus(g_feature_status_path, "native queue wrapper skipped: singleton missing");
+        return ADD_NOT_ADDED;
+    }
+    if (!QueueVectorValid(player)) {
+        AppendStatus(g_feature_status_path, "native queue wrapper skipped: queue vector invalid");
+        return ADD_NOT_ADDED;
+    }
+
+    // Check membership before any click.  The native click path can remove an
+    // already-queued actor under its duplicate gate, so a click on an
+    // already-present VID must not be dispatched.
+    if (QueueContainsVid(player, vid)) {
+        AppendStatus(g_feature_status_path, "native queue wrapper: VID already present; no click");
+        return ADD_ALREADY_PRESENT;
+    }
+
+    if (player[PLAYER_MOUSE_DOWN_OFFSET] != 0) {
+        AppendStatus(g_feature_status_path, "native queue wrapper skipped: mouse already down");
+        return ADD_NOT_ADDED;
+    }
+
+    auto get_actor = reinterpret_cast<GetActorByVid>(g_game_base + RVA_GET_ACTOR_BY_VID);
+    void* target_actor = get_actor(player, vid);
+    if (!target_actor) {
+        AppendStatus(g_feature_status_path, "native queue wrapper skipped: actor unresolved");
+        return ADD_NOT_ADDED;
+    }
+
+    // Re-validate the singletons immediately before mutating shared state; a
+    // phase change may have replaced them between the checks above.
+    if (*reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON) != player ||
+        *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) != manager) {
+        AppendStatus(g_feature_status_path, "native queue wrapper skipped: singleton changed");
+        return ADD_NOT_ADDED;
+    }
+
+    // A real left click first passes through the Windows mouse handler, which
+    // records a down/up pair (codes 1/2) into the client input recorder before
+    // driving the game.  FUN_140471b10 is a no-op while the recorder is
+    // disabled.
     auto record_input = reinterpret_cast<RecordInput>(
         g_game_base + RVA_RECORD_INPUT);
-    __try {
-        record_input(recorder, 1, cursor_x, cursor_y);
-        record_input(recorder, 2, cursor_x, cursor_y);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+
+    if (click_x >= 0 && click_y >= 0) {
+        // Full physical-path dispatch at the target's projected client-pixel
+        // coordinates (UI hit-test -> world pick -> player press -> queue add)
+        // with no picker override.
+        if (!DispatchClickAt(click_x, click_y)) {
+            return ADD_NOT_ADDED;
+        }
+    } else {
+        // Fallback (no explicit coordinates): picker override plus player
+        // press/release, recording at the client's stored cursor position.
+        void** picked_actor = reinterpret_cast<void**>(
+            manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
+        void* saved_picked_actor = *picked_actor;
+        auto set_mouse_state = reinterpret_cast<SetMouseState>(
+            g_game_base + RVA_SET_MOUSE_STATE);
+
+        // Read the client's own cursor position (the same source the recorder
+        // uses for its movement samples) rather than the OS cursor, so the
+        // synthetic down/up stays on the recorded path regardless of focus.
+        int cursor_x = 0;
+        int cursor_y = 0;
+        GetGameCursorPosition(&cursor_x, &cursor_y);
+
+        bool pressed = false;
+        __try {
+            *picked_actor = target_actor;
+            if (recorder) record_input(recorder, 1, cursor_x, cursor_y);
+            set_mouse_state(player, 1, 0);
+            pressed = true;
+            if (recorder) record_input(recorder, 2, cursor_x, cursor_y);
+            set_mouse_state(player, 0, 0);
+            pressed = false;
+        } __finally {
+            // Exception-safe cleanup: if press succeeded but release did not,
+            // still attempt release once.  Never touch physical OS input.
+            if (pressed) {
+                __try {
+                    set_mouse_state(player, 0, 0);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                }
+            }
+            // Restore the picker only if the character manager is still the
+            // same object we overrode (do not write through a stale pointer
+            // after a phase change).
+            __try {
+                if (*reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) == manager) {
+                    *picked_actor = saved_picked_actor;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+        }
     }
+
+    // Acknowledge by requested-VID membership change.  If the VID is not
+    // present after dispatch the outcome is unknown: do not report success and
+    // never immediately retry (the click may already have executed).
+    return QueueContainsVid(player, vid) ? ADD_ADDED : ADD_UNKNOWN;
 }
 
 static void* NativeMetinQueueAdd(void*, void* args) {
     auto parse_integer = reinterpret_cast<ParseTupleInteger>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
     auto argument_error = reinterpret_cast<ArgumentError>(g_game_base + RVA_ARGUMENT_ERROR);
     auto build_value = reinterpret_cast<BuildValue>(g_game_base + RVA_BUILD_VALUE);
+    const char* int_format = reinterpret_cast<const char*>(g_game_base + RVA_INTEGER_FORMAT);
+
     int vid = 0;
     if (!parse_integer(args, 0, &vid)) return argument_error(0);
 
-    // vid == 0 is a sentinel that asks only for a bare synthetic click, used
-    // by UI automations (reaction game, channel dialog) that do not touch the
-    // metin queue.  Real queue adds always pass a positive VID.
-    if (vid == 0) {
-        EmitSyntheticClick();
-        return build_value(reinterpret_cast<const char*>(
-            g_game_base + RVA_INTEGER_FORMAT), 1);
+    if (vid < 0) return build_value(int_format, ADD_NOT_ADDED);
+
+    // Optional explicit click coordinates (client pixels).  When provided, the
+    // wrapper reproduces the full WndProc mouse-down/up dispatch at these
+    // coordinates.  vid == 0 with coordinates is a UI-control click; a positive
+    // VID with coordinates is a world-target click.
+    int click_x = -1;
+    int click_y = -1;
+    parse_integer(args, 1, &click_x);
+    parse_integer(args, 2, &click_y);
+
+    // Reject recursive re-entry before any mutation.  The owner is released on
+    // every exit below.
+    LONG owner = static_cast<LONG>(GetCurrentThreadId());
+    if (InterlockedCompareExchange(&g_wrapper_owner, owner, 0) != 0) {
+        AppendStatus(g_feature_status_path, "native queue wrapper re-entrant call rejected");
+        return build_value(int_format, ADD_NOT_ADDED);
     }
 
-    LogQueueInputState(vid);
-
-    int added = 0;
+    int result = ADD_NOT_ADDED;
     __try {
-        BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
-        BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
-        if (player && manager && player[PLAYER_MOUSE_DOWN_OFFSET] == 0) {
-            auto get_actor = reinterpret_cast<GetActorByVid>(g_game_base + RVA_GET_ACTOR_BY_VID);
-            void* target_actor = get_actor(player, vid);
-            if (target_actor) {
-                auto begin = *reinterpret_cast<DWORD**>(player + 0x4588);
-                auto end = *reinterpret_cast<DWORD**>(player + 0x4590);
-                size_t before = 0;
-                if (begin && end && end >= begin) before = static_cast<size_t>(end - begin);
-
-                // Route the requested actor through the same CPythonPlayer
-                // mouse press/release path used by a normal smart left click.
-                // The picker override is scoped to this synchronous call and
-                // restored before Python regains control.
-                void** picked_actor = reinterpret_cast<void**>(
-                    manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
-                void* saved_picked_actor = *picked_actor;
-                auto set_mouse_state = reinterpret_cast<SetMouseState>(
-                    g_game_base + RVA_SET_MOUSE_STATE);
-
-                // A real left click first passes through the Windows mouse
-                // handler, which records a down/up pair (codes 1/2) into the
-                // client input recorder before driving the game.  The
-                // synthetic press/release below skips that handler, so emit the
-                // same down/up records here.  While the recorder is enabled the
-                // server audit compares queue changes against these records;
-                // FUN_140471b10 is a no-op while the recorder is disabled.
-                auto record_input = reinterpret_cast<RecordInput>(
-                    g_game_base + RVA_RECORD_INPUT);
-                BYTE* recorder = *reinterpret_cast<BYTE**>(
-                    g_game_base + RVA_INPUT_RECORDER);
-
-                // Read the client's own cursor position (the same source the
-                // recorder uses for its movement samples) rather than the OS
-                // cursor, so the synthetic down/up stays on the recorded path
-                // regardless of window focus.
-                int cursor_x = 0;
-                int cursor_y = 0;
-                GetGameCursorPosition(&cursor_x, &cursor_y);
-
-                *picked_actor = target_actor;
-                __try {
-                    if (recorder) {
-                        record_input(recorder, 1, cursor_x, cursor_y);
-                    }
-                    set_mouse_state(player, 1, 0);
-                    if (recorder) {
-                        record_input(recorder, 2, cursor_x, cursor_y);
-                    }
-                    set_mouse_state(player, 0, 0);
-                } __finally {
-                    *picked_actor = saved_picked_actor;
-                }
-
-                begin = *reinterpret_cast<DWORD**>(player + 0x4588);
-                end = *reinterpret_cast<DWORD**>(player + 0x4590);
-                size_t after = 0;
-                if (begin && end && end >= begin) after = static_cast<size_t>(end - begin);
-                added = after > before;
+        if (vid == 0) {
+            // vid == 0 sentinel: a bare synthetic click, or (with coordinates)
+            // a full-dispatch click on a UI control.  The latter is the
+            // replacement for the deprecated bare-record UI path.
+            if (click_x >= 0 && click_y >= 0) {
+                result = DispatchClickAt(click_x, click_y) ? 1 : 0;
+            } else {
+                result = EmitSyntheticClick() ? 1 : 0;
             }
+        } else {
+            result = NativeMetinQueueAddInner(vid, click_x, click_y);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         AppendStatus(g_feature_status_path, "native input queue wrapper access fault");
-        added = 0;
+        result = ADD_NOT_ADDED;
     }
-    return build_value(reinterpret_cast<const char*>(g_game_base + RVA_INTEGER_FORMAT), added);
+    InterlockedExchange(&g_wrapper_owner, 0);
+    return build_value(int_format, result);
 }
 
 static bool InstallNativeMetinQueueWrapper(BYTE* base) {
+    // Only patch when the patch site is readable and the current entry is still
+    // the stock binding we expect.  The guard read below faults on an
+    // out-of-image or protected address instead of writing through it.
     void** method = reinterpret_cast<void**>(base + RVA_METIN_QUEUE_ADD_METHOD);
     void* expected = base + RVA_METIN_QUEUE_ADD_BINDING;
-    if (*method != expected) {
+    __try {
+        if (*method != expected) {
+            AppendStatus(g_feature_status_path,
+                         "native queue wrapper skipped: binding already changed");
+            return false;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         AppendStatus(g_feature_status_path,
-                     "native queue wrapper skipped: binding already changed");
+                     "native queue wrapper skipped: method table unreadable");
         return false;
     }
     DWORD old_protection = 0;
     if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) {
         AppendStatus(g_feature_status_path,
-                     "native queue wrapper skipped: method table is protected");
+                     "native queue wrapper skipped: method table protect failed");
         return false;
     }
     *method = reinterpret_cast<void*>(&NativeMetinQueueAdd);
@@ -228,7 +402,12 @@ static bool InstallNativeMetinQueueWrapper(BYTE* base) {
 static void RestoreNativeMetinQueueWrapper() {
     if (!g_native_queue_wrapper_installed || !g_game_base) return;
     void** method = reinterpret_cast<void**>(g_game_base + RVA_METIN_QUEUE_ADD_METHOD);
-    if (*method != reinterpret_cast<void*>(&NativeMetinQueueAdd)) return;
+    __try {
+        // Restore only the entry we own; never overwrite a foreign change.
+        if (*method != reinterpret_cast<void*>(&NativeMetinQueueAdd)) return;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
     DWORD old_protection = 0;
     if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) return;
     *method = g_game_base + RVA_METIN_QUEUE_ADD_BINDING;
