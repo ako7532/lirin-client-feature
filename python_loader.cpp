@@ -66,8 +66,11 @@ static bool QueueVectorValid(BYTE* player) {
     __try {
         DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
         DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
-        if (!begin || !end) return false;
-        if (end < begin) return false;
+        // An empty std::vector has begin == end (both null when capacity is 0);
+        // that is valid, not a fault.  Only reject an inconsistent pair, a
+        // reversed range, or a misaligned element count.
+        if ((begin == nullptr) != (end == nullptr)) return false;
+        if (begin && end && end < begin) return false;
         size_t bytes = reinterpret_cast<size_t>(end) - reinterpret_cast<size_t>(begin);
         if (bytes % sizeof(DWORD) != 0) return false;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
