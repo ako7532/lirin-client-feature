@@ -41,3 +41,10 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Launcher updater local artifacts
+/publish/
+/release-output/
+/.launcher-operation.lock
+/.update-*/
+/.update-journal.json*

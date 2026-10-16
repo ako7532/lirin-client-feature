@@ -3,7 +3,7 @@ using System.Security.Principal;
 
 namespace LirinFeatureLauncher;
 
-public sealed class MainForm : Form
+public sealed partial class MainForm : Form
 {
     private readonly ProcessDiscovery _processDiscovery = new();
     private readonly ProcessExecutor _processExecutor = new();
@@ -35,6 +35,7 @@ public sealed class MainForm : Form
             ShowFailure(exception.Message);
         }
 
+        InitializeUpdater();
         Shown += async (_, _) => await RefreshClientsAsync();
         FormClosing += (_, _) => _injectionCancellation?.Cancel();
     }
@@ -341,7 +342,7 @@ public sealed class MainForm : Form
 
     private async Task InjectSelectedAsync()
     {
-        if (_busy)
+        if (_busy || _updating)
         {
             return;
         }
@@ -387,6 +388,8 @@ public sealed class MainForm : Form
             }
         }
 
+        using var operation = TryInjectionLock();
+        if (operation is null) return;
         SetBusy(true);
         SetStatus(LauncherState.Injecting, $"Injecting - revalidating PID {selectedPid.Value}.");
         AppendOutput($"Revalidating PID {selectedPid.Value} immediately before injection...");
@@ -457,7 +460,7 @@ public sealed class MainForm : Form
 
     private void UpdateInjectEnabled()
     {
-        _injectButton.Enabled = !_busy && !_refreshing && GetSelectedPid() is not null;
+        _injectButton.Enabled = !_busy && !_refreshing && !_updating && GetSelectedPid() is not null;
     }
 
     private void ShowFailure(string message)
