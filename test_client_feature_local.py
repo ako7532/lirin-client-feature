@@ -1397,6 +1397,28 @@ with tempfile.TemporaryDirectory() as directory:
     assert mt6.resolve_pending_flip(snap3, 3.0) is True
     assert not mt6.has_pending_flip()
 
+    # Tracker: an unverified numeric state is resolved from reliable signals.
+    mt_num = MemoryBoardTracker()
+    w_num = ts_window([(0, 7, False), (1, 7, False), (2, 8, False), (3, 8, False)])
+    w_num.state = 0
+    w_num.GetCooldownRemaining = lambda: 0.0
+    snap_num, _ = mt_num.observe(w_num, 1.0)
+    assert snap_num.state == "idle", snap_num.state
+    # A dispatched start (pending_start) makes a numeric state resolve to playing.
+    mt_num.mark_pending_start()
+    snap_num2, _ = mt_num.observe(w_num, 2.0)
+    assert snap_num2.state == "playing", snap_num2.state
+    # A completed board resolves to finishing even while a start is pending.
+    w_num.pairsFound = 2
+    snap_num3, _ = mt_num.observe(w_num, 3.0)
+    assert snap_num3.state == "finishing", snap_num3.state
+    # A nonzero cooldown resolves to idle.
+    mt_num.clear_pending_start()
+    w_num.pairsFound = 0
+    w_num.GetCooldownRemaining = lambda: 30.0
+    snap_num4, _ = mt_num.observe(w_num, 4.0)
+    assert snap_num4.state == "idle", snap_num4.state
+
     # Controller lifecycle (observation only; no dispatch without the adapter).
     controller_window = FakeMemoryWindow(
         [MCard(0, 7, False), MCard(1, 0, False), MCard(2, 8, False), MCard(3, 0, False)])

@@ -1262,7 +1262,8 @@ class MemoryBoardTracker(object):
         pairs, ok, reason = enumerate_memory_cards(cards)
         if not ok:
             return None, reason
-        state = classify_memory_state(getattr(window, "state", None))
+        raw_state = getattr(window, "state", None)
+        state = classify_memory_state(raw_state)
         phase = getattr(window, "phase", None)
         cell_count = len(pairs)
         pair_count = int(getattr(window, "faceCount", 0) or 0)
@@ -1270,6 +1271,9 @@ class MemoryBoardTracker(object):
             pair_count = cell_count // 2
         pairs_found = int(getattr(window, "pairsFound", 0) or 0)
         awaiting_flip = bool(getattr(window, "awaitingFlip", False))
+        if state == TWIN_SOULS_STATE_UNKNOWN:
+            state = self._resolve_unknown_state(window, raw_state,
+                                                pair_count, pairs_found)
 
         open_cells = self._normalize_open_cells(window, pairs)
         open_set = set(open_cells)
@@ -1322,6 +1326,29 @@ class MemoryBoardTracker(object):
             plays_max_hwid=int(getattr(window, "playsMaxHwid", 0) or 0),
             generation_signature=generation_signature,
         ), None
+
+    def _resolve_unknown_state(self, window, raw_state, pair_count, pairs_found):
+        """Map an unverified numeric `state` to a semantic state.
+
+        The client's integer idle/playing/finish constants are not pinned, so we
+        infer the phase from signals that are observable and reliable: a
+        completed board (all pairs found) is finishing, a nonzero cooldown is
+        idle, an in-flight start (`openPending`) is still idle, and a nonzero
+        state (or one of our own pending requests) is playing. Falls back to
+        idle, which is the safe default for an unstarted board.
+        """
+        if pair_count > 0 and pairs_found >= pair_count:
+            return TWIN_SOULS_STATE_FINISHING
+        cooldown = self._call_float(window, "GetCooldownRemaining")
+        if cooldown is not None and cooldown > 0:
+            return TWIN_SOULS_STATE_IDLE
+        if bool(getattr(window, "openPending", False)):
+            return TWIN_SOULS_STATE_IDLE
+        if isinstance(raw_state, INTEGER_TYPES) and raw_state != 0:
+            return TWIN_SOULS_STATE_PLAYING
+        if self.pending_start or self.pending_flip:
+            return TWIN_SOULS_STATE_PLAYING
+        return TWIN_SOULS_STATE_IDLE
 
     def _detect_reset(self, snapshot):
         if self.generation_signature is None:
@@ -1426,6 +1453,9 @@ class MemoryBoardTracker(object):
 
     def clear_pending_start(self):
         self.pending_start = False
+
+    def clear_pending_flip(self):
+        self.pending_flip = None
 
 
 class MemoryActionAdapter(object):
@@ -1803,6 +1833,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.twin_souls_tracker = MemoryBoardTracker()
         self.twin_souls_solver = MemorySolver()
         self.twin_souls_adapter = MemoryActionAdapter()
+        self.twin_souls_trace_key = None
         self.yinyang_duel_result_closed = True
         self.yinyang_duel_result_close_at = 0.0
         self.player_next_poll = 0.0
@@ -2953,6 +2984,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def _TwinSoulsRelease(self):
         self.twin_souls_window = None
+        self.twin_souls_trace_key = None
         tracker = self.twin_souls_tracker
         tracker.pending_flip = None
         tracker.pending_start = False
@@ -3116,6 +3148,23 @@ class MetinScanner(ui.BoardWithTitleBar):
             self._TwinSoulsDebugLog("Twin Souls: history write error %s" %
                                     ascii_text(exc))
 
+    def _TwinSoulsTraceState(self, window, snapshot):
+        raw_state = getattr(window, "state", None)
+        cooldown = self._TwinSoulsCooldownRemaining(window)
+        open_pending = bool(getattr(window, "openPending", False))
+        key = (raw_state, snapshot.state, cooldown, open_pending,
+               snapshot.pairs_found, snapshot.pair_count,
+               snapshot.awaiting_flip, snapshot.busy)
+        if key == self.twin_souls_trace_key:
+            return
+        self.twin_souls_trace_key = key
+        self.AddLine(
+            "Twin Souls trace: raw_state=%r state=%s cooldown=%s openPending=%s "
+            "pairs=%d/%d awaiting=%s busy=%s" %
+            (raw_state, snapshot.state, cooldown, open_pending,
+             snapshot.pairs_found, snapshot.pair_count,
+             snapshot.awaiting_flip, snapshot.busy))
+
     def _DuelWindow(self):
         """Return the duel window, or None when disabled or not yet discovered."""
         if not self.yinyang_duel_enabled:
@@ -3241,6 +3290,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         return None
 
     def _TwinSoulsHandleFinishing(self, snapshot):
+        self.twin_souls_tracker.clear_pending_start()
+        self.twin_souls_tracker.clear_pending_flip()
         if (snapshot.board_id == self.twin_souls_last_board and
                 self.twin_souls_last_board != self.twin_souls_last_finished_board):
             self.twin_souls_last_finished_board = snapshot.board_id
@@ -3255,6 +3306,8 @@ class MetinScanner(ui.BoardWithTitleBar):
     def _TwinSoulsHandleIdle(self, window, snapshot):
         cooldown = self._TwinSoulsCooldownRemaining(window)
         if cooldown > 0:
+            self.twin_souls_tracker.clear_pending_start()
+            self.twin_souls_tracker.clear_pending_flip()
             self._TwinSoulsStatus("cooldown %ds (%d/%d daily, %d/%d HWID)" %
                                   (int(cooldown), snapshot.plays_used,
                                    snapshot.plays_max, snapshot.plays_used_hwid,
@@ -3297,6 +3350,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self._TwinSoulsStatus("waiting for state: %s" % (error or "unreadable"))
                 return
             self.twin_souls_last_state = snapshot.state
+            self._TwinSoulsTraceState(window, snapshot)
             reached = self._TwinSoulsLimitReached(snapshot)
             if reached:
                 self._TwinSoulsDisableForLimit(reached)
