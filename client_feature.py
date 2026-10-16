@@ -1431,15 +1431,35 @@ class MemoryBoardTracker(object):
 class MemoryActionAdapter(object):
     """Dispatch boundary for Twin Souls UI actions.
 
-    The background-input feasibility gate (INPUT_RECORDER_IMPLEMENTATION_PLAN)
-    has not been verified, so this adapter reports UNAVAILABLE and performs no
-    dispatch. When a verified route exists, wire dispatch_start/dispatch_flip to
-    reach the client handlers exactly once; the controller must never call the
-    handlers itself.
+    Twin Souls is a UI minigame, like Yin Yang Duel and the reaction game, so its
+    start and flips go through the same proven route: record a synthetic click,
+    then invoke the client's own UI handler directly (no world projection, no
+    cursor move, no audited world-click path).
     """
 
-    def is_verified(self):
-        return False
+    def dispatch_start(self, window):
+        start = getattr(window, "_YinYangMemoryWindow__OnStartClicked", None)
+        if not callable(start):
+            return False
+        emit_synthetic_click()
+        try:
+            start()
+            return True
+        except Exception:
+            return False
+
+    def dispatch_flip(self, card):
+        if card is None:
+            return False
+        click = getattr(card, "OnMouseLeftButtonDown", None)
+        if not callable(click):
+            return False
+        emit_synthetic_click()
+        try:
+            click()
+            return True
+        except Exception:
+            return False
 
 
 def disk_log(message):
@@ -3019,6 +3039,11 @@ class MetinScanner(ui.BoardWithTitleBar):
                             self.AddLine("    card attr %s" % name)
             except Exception as exc:
                 self.AddLine("  memory card dump error: %s" % exc)
+        members = [n for n in dir(window)
+                   if any(t in n.lower()
+                          for t in ("start", "click", "open", "begin", "play",
+                                    "result"))]
+        self.AddLine("  memory window action members = %s" % ascii_text(repr(members)))
 
     def _TwinSoulsCooldownRemaining(self, window):
         get_cd = getattr(window, "GetCooldownRemaining", None)
@@ -3190,21 +3215,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             return
         self._TwinSoulsRecordEvent(
             self._TwinSoulsDecisionEvent(snapshot, knowledge, decision))
-        if not self.twin_souls_adapter.is_verified():
-            self._TwinSoulsStatus(
-                "%s; next cell %d (%s) - background input unverified" %
-                (self._TwinSoulsSummary(snapshot), decision["cell_index"],
-                 decision["mode"]))
-            return
-        # Adapter verified: dispatch a card action exactly once.
         card = self._TwinSoulsResolveCell(window, snapshot,
                                           decision["cell_index"])
         if card is None:
             self._TwinSoulsStatus("chosen cell unavailable; revalidating")
             return
+        if not self.twin_souls_adapter.dispatch_flip(card):
+            self._TwinSoulsStatus(
+                "%s; next cell %d (%s) - flip unavailable" %
+                (self._TwinSoulsSummary(snapshot), decision["cell_index"],
+                 decision["mode"]))
+            return
         tracker.mark_pending_flip(decision["cell_index"], snapshot)
-        # NOTE: dispatch through the verified adapter here; never call
-        # card.OnMouseLeftButtonDown() directly.
 
     def _TwinSoulsResolveCell(self, window, snapshot, cell):
         if window is None:
@@ -3241,16 +3263,15 @@ class MetinScanner(ui.BoardWithTitleBar):
         if snapshot.plays_max <= 0 and snapshot.plays_max_hwid <= 0:
             self._TwinSoulsStatus("waiting for limits/state")
             return
-        if not self.twin_souls_adapter.is_verified():
-            self._TwinSoulsStatus("idle; waiting for verified background input")
-            return
         if (self.twin_souls_tracker.has_pending_start() or
                 bool(getattr(window, "openPending", False))):
             self._TwinSoulsStatus("start pending")
             return
-        # Adapter verified and all gates passed: dispatch one start here; never
-        # call _YinYangMemoryWindow__OnStartClicked() directly.
+        if not self.twin_souls_adapter.dispatch_start(window):
+            self._TwinSoulsStatus("idle; start unavailable")
+            return
         self.twin_souls_tracker.mark_pending_start()
+        self._TwinSoulsStatus("start dispatched")
 
     def PollTwinSouls(self, now):
         if not self.twin_souls_enabled:
