@@ -17,6 +17,7 @@ import net
 import nonplayer
 import player
 import ui
+import wndMgr
 
 try:
     INTEGER_TYPES = (int, long)
@@ -33,7 +34,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 45
+FEATURE_VERSION = 46
 HUNTER_LIMIT = 5
 HUNTER_BURST_DELAY_MIN = 0.70
 HUNTER_BURST_DELAY_MAX = 2.50
@@ -1570,6 +1571,14 @@ def make_text(parent, x, y, message):
     return label
 
 
+def limit_text(label, width):
+    try:
+        label.SetLimitWidth(width)
+    except Exception:
+        pass
+    return label
+
+
 def make_button(parent, x, text, callback, y=43):
     button = ui.Button()
     button.SetParent(parent)
@@ -1581,6 +1590,25 @@ def make_button(parent, x, text, callback, y=43):
     button.SetEvent(callback)
     button.Show()
     return button
+
+
+def make_bar(parent, x, y, width, height, color):
+    bar = ui.Bar()
+    bar.SetParent(parent)
+    bar.SetPosition(x, y)
+    bar.SetSize(width, height)
+    bar.SetColor(color)
+    bar.Show()
+    return bar
+
+
+def make_page(parent, x, y, width, height):
+    page = ui.Window()
+    page.SetParent(parent)
+    page.SetPosition(x, y)
+    page.SetSize(width, height)
+    page.Show()
+    return page
 
 
 def make_radar_dot(parent, x, y, size, color, fallback):
@@ -1748,9 +1776,14 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
         self.AddFlag("movable")
         self.AddFlag("float")
-        self.SetSize(820, 555)
-        self.SetPosition(40, 80)
-        self.SetTitleName("Metin Radius Scanner")
+        self.SetSize(620, 555)
+        try:
+            panel_x = max(0, min(40, int(wndMgr.GetScreenWidth()) - 620))
+            panel_y = max(0, min(80, int(wndMgr.GetScreenHeight()) - 555))
+        except Exception:
+            panel_x, panel_y = 40, 80
+        self.SetPosition(panel_x, panel_y)
+        self.SetTitleName("Lirin Feature Panel")
         self.SetCloseEvent(self.MinimizePanel)
         self.running = False
         self.anchor_position = None
@@ -1850,10 +1883,20 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.last_radius_error = None
         self.last_scan_error = None
         self.lines = []
+        try:
+            panel_color = ui.GenerateColor(0.13, 0.16, 0.20, 0.96)
+            separator_color = ui.GenerateColor(0.21, 0.25, 0.30, 1.0)
+            accent_color = ui.GenerateColor(0.51, 0.71, 0.87, 1.0)
+        except Exception:
+            panel_color = 0xF5222A34
+            separator_color = 0xFF35404D
+            accent_color = 0xFF82B6DE
+
+        self.toolbar_separator = make_bar(self, 10, 73, 600, 1, separator_color)
         self.radius_label = make_text(self, 15, 47, "Radius:")
         self.radius_slot = ui.SlotBar()
         self.radius_slot.SetParent(self)
-        self.radius_slot.SetPosition(75, 42)
+        self.radius_slot.SetPosition(70, 42)
         self.radius_slot.SetSize(90, 22)
         self.radius_slot.Show()
         self.radius_edit = ui.EditLine()
@@ -1864,23 +1907,84 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.radius_edit.SetNumberMode()
         self.radius_edit.SetText(str(DEFAULT_RADIUS))
         self.radius_edit.Show()
-        self.start_button = make_button(self, 205, "Start", self.Start)
-        self.stop_button = make_button(self, 315, "Stop", self.Stop)
-        self.anchor_button = make_button(self, 425, "Anchor", self.ToggleAnchor)
-        self.config_save_button = make_button(self, 535, "Save", self.SaveConfig)
-        self.config_load_button = make_button(self, 625, "Load", self.LoadConfig)
-        self.config_auto_button = make_button(self, 715, "Auto OFF", self.ToggleConfigAutoload)
-        self.hunter_title = make_text(self, 15, 327, "Metin Hunter")
-        self.hunter_button = make_button(self, 110, "OFF", self.ToggleMetinHunter, 322)
-        self.hunter_label = make_text(self, 205, 327, "Queue: idle")
-        self.anchor_label = make_text(self, 15, 291, "Circle: following character")
-        self.state_label = make_text(self, 15, 81, "Stopped. Set radius, then click Start.")
+        self.start_button = make_button(self, 178, "Start", self.Start)
+        button_width, button_height = self.GetWidgetSize(self.start_button, 88, 21)
+        self.native_button_size = (button_width, button_height)
+        self.stop_button = make_button(
+            self, 178 + button_width + 8, "Stop farming", self.Stop)
+        state_x = 178 + (button_width + 8) * 2
+        self.state_label = limit_text(
+            make_text(self, state_x, 47, "Stopped. Set radius, then click Start."),
+            max(40, 605 - state_x))
+
+        self.farming_tab_button = make_button(
+            self, 15, "Farming", self.ShowFarmingTab, 79)
+        self.minigames_tab_button = make_button(
+            self, 15 + button_width + 8, "Minigames", self.ShowMinigamesTab, 79)
+        self.activity_tab_button = make_button(
+            self, 15 + (button_width + 8) * 2, "Activity", self.ShowActivityTab, 79)
+        self.tab_indicator = make_bar(self, 15, 102, button_width, 2, accent_color)
+        self.tabs_separator = make_bar(self, 10, 105, 600, 1, separator_color)
+
+        self.farming_page = make_page(self, 0, 106, 620, 410)
+        self.minigames_page = make_page(self, 0, 106, 620, 410)
+        self.activity_page = make_page(self, 0, 106, 620, 410)
+        self.tab_pages = {
+            "farming": self.farming_page,
+            "minigames": self.minigames_page,
+            "activity": self.activity_page,
+        }
+        self.tab_buttons = {
+            "farming": self.farming_tab_button,
+            "minigames": self.minigames_tab_button,
+            "activity": self.activity_tab_button,
+        }
+        self.tab_positions = {
+            "farming": 15,
+            "minigames": 15 + button_width + 8,
+            "activity": 15 + (button_width + 8) * 2,
+        }
+        self.active_tab = None
+
+        self.farming_hunter_card = make_bar(
+            self.farming_page, 12, 10, 300, 120, panel_color)
+        self.farming_boss_card = make_bar(
+            self.farming_page, 12, 142, 300, 242, panel_color)
+        self.farming_radar_card = make_bar(
+            self.farming_page, 324, 10, 282, 374, panel_color)
+        self.hunter_section_title = make_text(
+            self.farming_page, 22, 20, "METIN FARMING")
+        self.hunter_title = make_text(self.farming_page, 22, 47, "Metin Hunter")
+        self.hunter_button = make_button(
+            self.farming_page, 302 - button_width, "OFF",
+            self.ToggleMetinHunter, 42)
+        self.hunter_label = limit_text(
+            make_text(self.farming_page, 22, 75, "Queue: idle"), 280)
+        self.boss_section_title = make_text(
+            self.farming_page, 22, 154, "BOSS SWEEP")
+        self.boss_title = make_text(self.farming_page, 22, 181, "Boss Sweep")
+        self.boss_label = limit_text(
+            make_text(self.farming_page, 22, 204,
+                      "Select a boss, then mark its spot"), 280)
+        self.boss_mark_button = make_button(
+            self.farming_page, 22, "Mark Boss", self.MarkBoss, 232)
+        self.boss_button = make_button(
+            self.farming_page, 22 + button_width + 8, "OFF",
+            self.ToggleBossSweep, 232)
+
+        self.radar_label = limit_text(
+            make_text(self.farming_page, 335, 20,
+                      "Local map: radius %d units" % self.radius), 260)
+        self.activity_card = make_bar(
+            self.activity_page, 12, 10, 594, 374, panel_color)
+        self.activity_title = make_text(
+            self.activity_page, 22, 22, "RECENT ACTIVITY - LAST 8 EVENTS")
         self.log_labels = []
         for index in range(8):
-            self.log_labels.append(make_text(self, 15, 110 + index * 21, ""))
-        self.radar_center = (650, 221)
+            label = make_text(self.activity_page, 24, 57 + index * 38, "")
+            self.log_labels.append(limit_text(label, 568))
+        self.radar_center = (465, 173)
         self.radar_pixels = 112
-        self.radar_label = make_text(self, 525, 66, "Local map: radius %d units" % self.radius)
         try:
             background_color = ui.GenerateColor(0.08, 0.14, 0.18, 0.92)
             grid_color = ui.GenerateColor(0.25, 0.34, 0.39, 0.7)
@@ -1893,41 +1997,42 @@ class MetinScanner(ui.BoardWithTitleBar):
             ring_color, player_color = 0xFF55AAFF, 0xFFFFFF33
             metin_color, other_color = 0xFFFF4433, 0xFFBBDDDD
         self.map_background = ui.Bar()
-        self.map_background.SetParent(self)
-        self.map_background.SetPosition(520, 91)
+        self.map_background.SetParent(self.farming_page)
+        self.map_background.SetPosition(335, 43)
         self.map_background.SetSize(260, 260)
         self.map_background.SetColor(background_color)
         self.map_background.Show()
         self.map_grid = []
-        for x in (565, 607, 650, 693, 735):
+        for x in (380, 422, 465, 508, 550):
             bar = ui.Bar()
-            bar.SetParent(self)
-            bar.SetPosition(x, 91)
+            bar.SetParent(self.farming_page)
+            bar.SetPosition(x, 43)
             bar.SetSize(1, 260)
             bar.SetColor(grid_color)
             bar.Show()
             self.map_grid.append(bar)
-        for y in (136, 178, 221, 264, 306):
+        for y in (88, 130, 173, 216, 258):
             bar = ui.Bar()
-            bar.SetParent(self)
-            bar.SetPosition(520, y)
+            bar.SetParent(self.farming_page)
+            bar.SetPosition(335, y)
             bar.SetSize(260, 1)
             bar.SetColor(grid_color)
             bar.Show()
             self.map_grid.append(bar)
         self.map_compass = [
-            make_text(self, 646, 96, "N"),
-            make_text(self, 646, 333, "S"),
-            make_text(self, 761, 216, "E"),
-            make_text(self, 527, 216, "W"),
+            make_text(self.farming_page, 461, 48, "N"),
+            make_text(self.farming_page, 461, 285, "S"),
+            make_text(self.farming_page, 576, 168, "E"),
+            make_text(self.farming_page, 342, 168, "W"),
         ]
         self.map_ring = []
         for index in range(96):
             angle = 2.0 * math.pi * index / 96.0
             x = int(self.radar_center[0] + self.radar_pixels * math.cos(angle))
             y = int(self.radar_center[1] + self.radar_pixels * math.sin(angle))
-            self.map_ring.append(make_radar_dot(self, x, y, 3, ring_color, "."))
-        self.map_player = make_radar_dot(self, self.radar_center[0] - 2,
+            self.map_ring.append(make_radar_dot(
+                self.farming_page, x, y, 3, ring_color, "."))
+        self.map_player = make_radar_dot(self.farming_page, self.radar_center[0] - 2,
                                          self.radar_center[1] - 2, 6, player_color, "P")
         self.map_metins = []
         self.map_others = []
@@ -1935,25 +2040,62 @@ class MetinScanner(ui.BoardWithTitleBar):
                 (self.map_metins, 32, metin_color, "M"),
                 (self.map_others, 64, other_color, ".")):
             for index in range(count):
-                dot = make_radar_dot(self, self.radar_center[0],
+                dot = make_radar_dot(self.farming_page, self.radar_center[0],
                                      self.radar_center[1], 5, color, symbol)
                 dot.Hide()
                 pool.append(dot)
-        self.map_count_label = make_text(self, 525, 360,
-                                         "Yellow: you  Red: metin  White: other")
-        self.boss_title = make_text(self, 15, 399, "Boss Sweep")
-        self.boss_mark_button = make_button(self, 110, "Mark Boss", self.MarkBoss, 394)
-        self.boss_button = make_button(self, 220, "OFF", self.ToggleBossSweep, 394)
-        self.boss_label = make_text(self, 315, 399, "Select a boss, then mark its spot")
-        self.reaction_title = make_text(self, 15, 432, "Auto Reaction")
-        self.reaction_button = make_button(self, 110, "ON", self.ToggleReaction, 427)
-        self.reaction_label = make_text(self, 205, 432, "Watches the yin-yang reaction game")
-        self.yinyang_duel_title = make_text(self, 15, 466, "Yin Yang Duel")
-        self.yinyang_duel_button = make_button(self, 110, "OFF", self.ToggleYinYangDuel, 461)
-        self.yinyang_duel_label = make_text(self, 205, 466, "Plays the Yin Yang Duel minigame")
-        self.twin_souls_title = make_text(self, 15, 499, "Twin Souls")
-        self.twin_souls_button = make_button(self, 110, "OFF", self.ToggleTwinSouls, 494)
-        self.twin_souls_label = make_text(self, 205, 499, "Plays the Twin Souls memory minigame")
+        self.map_count_label = limit_text(
+            make_text(self.farming_page, 335, 310,
+                      "Yellow: you  Red: metin  White: other"), 260)
+        self.anchor_button = make_button(
+            self.farming_page, 335, "Anchor", self.ToggleAnchor, 341)
+        self.anchor_label = limit_text(
+            make_text(self.farming_page, 335 + button_width + 10, 346,
+                      "Circle: following character"), 160)
+
+        self.minigames_card = make_bar(
+            self.minigames_page, 12, 10, 594, 374, panel_color)
+        self.minigames_title = make_text(
+            self.minigames_page, 22, 22, "MINIGAMES")
+        self.minigame_separator_one = make_bar(
+            self.minigames_page, 22, 126, 574, 1, separator_color)
+        self.minigame_separator_two = make_bar(
+            self.minigames_page, 22, 240, 574, 1, separator_color)
+        self.reaction_title = make_text(
+            self.minigames_page, 24, 61, "Auto Reaction")
+        self.reaction_button = make_button(
+            self.minigames_page, 596 - button_width, "ON",
+            self.ToggleReaction, 56)
+        self.reaction_label = limit_text(
+            make_text(self.minigames_page, 24, 84,
+                      "Watches the yin-yang reaction game"), 450)
+        self.yinyang_duel_title = make_text(
+            self.minigames_page, 24, 175, "Yin Yang Duel")
+        self.yinyang_duel_button = make_button(
+            self.minigames_page, 596 - button_width, "OFF",
+            self.ToggleYinYangDuel, 170)
+        self.yinyang_duel_label = limit_text(
+            make_text(self.minigames_page, 24, 198,
+                      "Plays the Yin Yang Duel minigame"), 450)
+        self.twin_souls_title = make_text(
+            self.minigames_page, 24, 289, "Twin Souls")
+        self.twin_souls_button = make_button(
+            self.minigames_page, 596 - button_width, "OFF",
+            self.ToggleTwinSouls, 284)
+        self.twin_souls_label = limit_text(
+            make_text(self.minigames_page, 24, 312,
+                      "Plays the Twin Souls memory minigame"), 450)
+
+        self.footer_separator = make_bar(self, 10, 518, 600, 1, separator_color)
+        self.config_save_button = make_button(self, 12, "Save", self.SaveConfig, 526)
+        self.config_load_button = make_button(
+            self, 12 + button_width + 8, "Load", self.LoadConfig, 526)
+        self.config_auto_button = make_button(
+            self, 12 + (button_width + 8) * 2, "Auto OFF",
+            self.ToggleConfigAutoload, 526)
+        self.footer_hint = make_text(self, 310, 531, "Ctrl+F8: hide / show")
+        self.RecordLayoutMetrics()
+        self.SwitchTab("farming")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
         self.queue_admission_guard = get_metin_queue_admission_guard()
@@ -1973,6 +2115,58 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.Show()
         self.watcher = ScannerWatcher(self)
 
+    def GetWidgetSize(self, widget, fallback_width, fallback_height):
+        try:
+            width = int(widget.GetWidth())
+            height = int(widget.GetHeight())
+            if width > 0 and height > 0:
+                return width, height
+        except Exception:
+            pass
+        return fallback_width, fallback_height
+
+    def MeasureText(self, text):
+        probe = ui.TextLine()
+        probe.SetParent(self)
+        probe.SetText(text)
+        probe.Show()
+        try:
+            width, height = probe.GetTextSize()
+            return int(width), int(height)
+        except Exception:
+            return 0, 0
+        finally:
+            probe.Hide()
+
+    def RecordLayoutMetrics(self):
+        stop_text_size = self.MeasureText("Stop farming")
+        status_text_size = self.MeasureText("Stopped. Set radius, then click Start.")
+        disk_log("Compact UI metrics: middle button=%dx%d; default font "
+                 "Stop farming=%dx%d; status sample=%dx%d" %
+                 (self.native_button_size[0], self.native_button_size[1],
+                  stop_text_size[0], stop_text_size[1],
+                  status_text_size[0], status_text_size[1]))
+
+    def SwitchTab(self, name):
+        if name not in self.tab_pages:
+            return
+        for tab_name, page in self.tab_pages.items():
+            if tab_name == name:
+                page.Show()
+            else:
+                page.Hide()
+        self.tab_indicator.SetPosition(self.tab_positions[name], 102)
+        self.active_tab = name
+
+    def ShowFarmingTab(self):
+        self.SwitchTab("farming")
+
+    def ShowMinigamesTab(self):
+        self.SwitchTab("minigames")
+
+    def ShowActivityTab(self):
+        self.SwitchTab("activity")
+
     def AddLine(self, message):
         clean = ascii_text(message)
         disk_log(clean)
@@ -1980,7 +2174,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.lines = self.lines[-8:]
         for index, label in enumerate(self.log_labels):
             row = self.lines[index] if index < len(self.lines) else ""
-            label.SetText(row[:60])
+            label.SetText(row[:72])
 
     def ClearMap(self):
         for dot in self.map_metins + self.map_others:

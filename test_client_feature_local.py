@@ -16,6 +16,8 @@ class Widget:
     def __init__(self):
         self.text = ""
         self.visible = False
+        self.parent = None
+        self.size = None
 
     def __getattr__(self, name):
         if name.startswith("Set") or name == "AddFlag":
@@ -25,8 +27,23 @@ class Widget:
     def SetText(self, value):
         self.text = value
 
+    def SetParent(self, parent):
+        self.parent = parent
+
     def SetPosition(self, x, y):
         self.position = (x, y)
+
+    def SetSize(self, width, height):
+        self.size = (width, height)
+
+    def GetWidth(self):
+        return self.size[0] if self.size is not None else 0
+
+    def GetHeight(self):
+        return self.size[1] if self.size is not None else 0
+
+    def GetTextSize(self):
+        return (len(self.text) * 6, 12)
 
     def SetEvent(self, callback):
         self.event = callback
@@ -59,6 +76,12 @@ app.DIK_F8 = 66
 pressed_keys = set()
 app.IsPressed = lambda key: key in pressed_keys
 sys.modules["app"] = app
+
+wndMgr = types.ModuleType("wndMgr")
+screen_size = [2560, 1369]
+wndMgr.GetScreenWidth = lambda: screen_size[0]
+wndMgr.GetScreenHeight = lambda: screen_size[1]
+sys.modules["wndMgr"] = wndMgr
 
 background = types.ModuleType("background")
 background.GetCurrentMapName = lambda: "metin2_map_test"
@@ -262,6 +285,25 @@ with tempfile.TemporaryDirectory() as directory:
     exec(compile(source, str(source_path), "exec"), {"__name__": "__main__"})
     panel = sys.modules["__main__"]._lirin_metin_scanner
     assert panel.radius == 2500 and panel.radius_edit.GetText() == "2500"
+    assert panel.size == (620, 555)
+    assert panel.position == (40, 80)
+    assert panel.native_button_size == (88, 21)
+    assert panel.stop_button.text == "Stop farming"
+    assert panel.active_tab == "farming"
+    assert panel.farming_page.visible
+    assert not panel.minigames_page.visible and not panel.activity_page.visible
+    assert panel.state_label.parent is panel
+    assert panel.config_save_button.parent is panel
+    assert panel.hunter_button.parent is panel.farming_page
+    assert panel.reaction_button.parent is panel.minigames_page
+    assert all(label.parent is panel.activity_page for label in panel.log_labels)
+    panel.ShowMinigamesTab()
+    assert panel.active_tab == "minigames" and panel.minigames_page.visible
+    assert not panel.farming_page.visible and not panel.activity_page.visible
+    panel.ShowActivityTab()
+    assert panel.active_tab == "activity" and panel.activity_page.visible
+    assert not panel.farming_page.visible and not panel.minigames_page.visible
+    panel.ShowFarmingTab()
     assert [label.text for label in panel.map_compass] == ["N", "S", "E", "W"]
     panel.native_queue_wrapper_active = False
     panel.ToggleMetinHunter()
@@ -277,8 +319,14 @@ with tempfile.TemporaryDirectory() as directory:
     queue_state["enabled"] = True
     queue[:] = [1]
     target_state["vid"] = 1
+    panel.yinyang_duel_enabled = True
+    panel.twin_souls_enabled = True
     panel.Stop()
     assert queue == [1] and queue_state["enabled"] and target_state["vid"] == 1
+    assert panel.reaction_enabled
+    assert panel.yinyang_duel_enabled and panel.twin_souls_enabled
+    panel.yinyang_duel_enabled = False
+    panel.twin_souls_enabled = False
     queue[:] = []
     queue_state["enabled"] = False
     target_state["vid"] = 0
@@ -408,7 +456,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert "Battle Metin" in first_log and "vnum 8003" in first_log, first_log
     assert "Jealousy Metin" not in first_log
     assert panel.map_metins[0].visible
-    assert panel.map_metins[0].position == (616, 176), panel.map_metins[0].position
+    assert panel.map_metins[0].position == (431, 128), panel.map_metins[0].position
     assert not panel.map_metins[1].visible
     assert panel.map_others[0].visible
     panel.radius_edit.SetText("2000")
@@ -597,6 +645,18 @@ with tempfile.TemporaryDirectory() as directory:
     panel.watcher.OnUpdate()
     assert queue == [2], queue
     assert panel.map_player.visible
+
+    # A hidden tab remains a presentation choice only; the watcher continues
+    # polling the live scanner and automation state behind the Activity page.
+    panel.ShowActivityTab()
+    running_before_tab_update = panel.running
+    hunter_before_tab_update = panel.hunter_enabled
+    panel.next_scan = 0
+    panel.watcher.OnUpdate()
+    assert panel.active_tab == "activity" and panel.activity_page.visible
+    assert panel.running == running_before_tab_update
+    assert panel.hunter_enabled == hunter_before_tab_update
+    panel.ShowFarmingTab()
 
     running_before_minimize = panel.running
     hunter_before_minimize = panel.hunter_enabled
