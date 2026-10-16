@@ -1,59 +1,63 @@
 name: Release
-
 on:
   push:
     branches: [main]
-
+  workflow_dispatch:
 permissions:
   contents: write
-
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
 jobs:
   release:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PUBLIC_CLIENT_ID: ${{ vars.UPDATER_GITHUB_CLIENT_ID }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-
-      - name: Run local feature tests
-        shell: pwsh
-        run: python .\test_client_feature_local.py
-
-      - name: Build feature loader DLL
-        shell: pwsh
-        run: .\build.ps1 -FeatureOnly
-
-      - name: Publish launcher
-        shell: pwsh
-        run: dotnet publish .\LirinFeatureLauncher\LirinFeatureLauncher.csproj -c Release -o .\publish\launcher
-
-      - name: Stage release files
+      - name: Validate configuration and identity
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force .\staging | Out-Null
-          Copy-Item .\publish\launcher\* .\staging\
-          Copy-Item .\client_feature_loader.dll .\staging\
-          Copy-Item .\client_feature.py .\staging\
-          Copy-Item .\inject.py .\staging\
-          Copy-Item .\run_client_feature.ps1 .\staging\
-
-      - name: Zip release
+          if (!$env:PUBLIC_CLIENT_ID) { throw 'Set UPDATER_GITHUB_CLIENT_ID repository variable to the public GitHub App client ID.' }
+          if ([int]$env:GITHUB_RUN_ATTEMPT -ge 1000) { throw 'Run attempt exceeds sequence allocation.' }
+          $sequence = [long]$env:GITHUB_RUN_NUMBER * 1000 + [int]$env:GITHUB_RUN_ATTEMPT
+          "BUILD_SEQUENCE=$sequence" >> $env:GITHUB_ENV
+          "RELEASE_TAG=stable-$sequence-$env:GITHUB_SHA" >> $env:GITHUB_ENV
+      - name: Run feature and launcher checks
         shell: pwsh
-        run: Compress-Archive -Path .\staging\* -DestinationPath .\release.zip
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: autobuild-${{ github.sha }}
-          name: Autobuild ${{ github.sha }}
-          body: |
-            Automated build from commit `${{ github.sha }}`.
-
-            **${{ github.event.head_commit.message }}**
-          files: release.zip
-          draft: false
-          prerelease: false
+        run: |
+          python .\test_client_feature_local.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project .\LirinFeatureLauncher.Tests -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project .\LirinUpdater.Tests -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build feature loader
+        shell: pwsh
+        run: .\build.ps1 -FeatureOnly
+      - name: Publish framework-dependent executables and package
+        shell: pwsh
+        run: |
+          dotnet publish .\LirinFeatureLauncher -c Release --self-contained false -o .\publish\launcher
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet publish .\LirinUpdater.Helper -c Release --self-contained false -o .\publish\helper
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python .\scripts\package_release.py --root . --launcher .\publish\launcher --helper .\publish\helper --output .\release-output --sequence $env:BUILD_SEQUENCE --commit $env:GITHUB_SHA --client-id $env:PUBLIC_CLIENT_ID
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet run --project .\LirinUpdater.Tests -c Release -- --validate-package .\release-output
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload draft, then publish complete release
+        shell: pwsh
+        run: |
+          $notes = "Stable build $env:BUILD_SEQUENCE from commit $env:GITHUB_SHA. Requires .NET 8 Desktop Runtime x64. See docs/LAUNCHER_UPDATER.md for setup."
+          Set-Content -LiteralPath release-notes.txt -Value $notes -Encoding utf8
+          gh release create $env:RELEASE_TAG --target $env:GITHUB_SHA --draft --title "Stable build $env:BUILD_SEQUENCE" --notes-file release-notes.txt .\release-output\release.zip .\release-output\update-manifest.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit $env:RELEASE_TAG --draft=false --latest=false
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

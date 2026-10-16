@@ -381,3 +381,7 @@ The v6 run also succeeded after entering a character: the snapshot contained
 419 modules, including `game`, and the runner reported the process still
 responsive immediately afterward. See `TEST_RESULTS.md` for the comparison
 with the login-screen snapshot.
+
+## Private launcher updater
+
+See [setup, packaging, recovery, and validation](docs/LAUNCHER_UPDATER.md). The updater uses each user's GitHub authorization and requires a packaged installation under Program Files. Live two-account verification is still pending.

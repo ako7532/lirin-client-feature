@@ -10,4 +10,5 @@
     <AssemblyName>LirinFeatureLauncher</AssemblyName>
     <RootNamespace>LirinFeatureLauncher</RootNamespace>
   </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../LirinUpdater.Core/LirinUpdater.Core.csproj" /></ItemGroup>
 </Project>
