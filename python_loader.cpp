@@ -25,33 +25,33 @@ static wchar_t g_feature_status_path[MAX_PATH] = {};
 static char g_feature_dll_name[MAX_PATH] = {};
 static const char* g_snapshot_error = "snapshot not attempted";
 static ULONGLONG g_last_snapshot_error = 0;
-static constexpr ULONG_PTR RVA_CHARACTER_MANAGER = 0x07A6B450;
-static constexpr ULONG_PTR RVA_PLAYER_SINGLETON = 0x07A6B6B0;
-static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_METHOD = 0x072ECA18;
-static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_BINDING = 0x003F6360;
-static constexpr ULONG_PTR RVA_PARSE_TUPLE_INTEGER = 0x00897B40;
-static constexpr ULONG_PTR RVA_ARGUMENT_ERROR = 0x00897E40;
-static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00A6B650;
-static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x066E218C;
-static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x003D1D40;
-static constexpr ULONG_PTR RVA_SET_MOUSE_STATE = 0x003E5940;
-static constexpr ULONG_PTR RVA_RECORD_INPUT = 0x00471B10;
-static constexpr ULONG_PTR RVA_INPUT_RECORDER = 0x07A6BA20;
-static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x007E13B0;
-static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07A6B480;
-static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x007E3E70;
-static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x007E3FD0;
-static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07A734C0;
+static constexpr ULONG_PTR RVA_CHARACTER_MANAGER = 0x07CCAB10;
+static constexpr ULONG_PTR RVA_PLAYER_SINGLETON = 0x07CCAF00;
+static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_METHOD = 0x07525778;
+static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_BINDING = 0x004011C0;
+static constexpr ULONG_PTR RVA_PARSE_TUPLE_INTEGER = 0x008C7020;
+static constexpr ULONG_PTR RVA_ARGUMENT_ERROR = 0x008C7320;
+static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00AA5EA0;
+static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x068FB3CC;
+static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x003EE6D0;
+static constexpr ULONG_PTR RVA_SET_MOUSE_STATE = 0x003E5940; // STALE (dead code since v35; no longer referenced)
+static constexpr ULONG_PTR RVA_RECORD_INPUT = 0x00497840;
+static constexpr ULONG_PTR RVA_INPUT_RECORDER = 0x07CCB198;
+static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x00824180;
+static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07CCAB50;
+static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x00826C30;
+static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x00826D90;
+static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07CD3168;
 // World->screen projection (the forward projection used by the pick path).
 // FUN_1404a2ec0 reads an actor's world position; FUN_14061ca10 sets up the
 // projection matrix (camera 2) that FUN_14061e430 consumes; DAT_147a6b678 is
 // the camera/graphics context, and DAT_1466e6050 is the position-Y obfuscation
 // key applied before projection.
-static constexpr ULONG_PTR RVA_GET_ACTOR_POSITION = 0x004A2EC0;
-static constexpr ULONG_PTR RVA_PROJECTION_SETUP = 0x0061CA10;
-static constexpr ULONG_PTR RVA_PROJECT = 0x0061E430;
-static constexpr ULONG_PTR RVA_CAMERA = 0x07A6B678;
-static constexpr ULONG_PTR RVA_POS_Y_OBF = 0x066E6050;
+static constexpr ULONG_PTR RVA_GET_ACTOR_POSITION = 0x004D2E40;
+static constexpr ULONG_PTR RVA_PROJECTION_SETUP = 0x0065B530;
+static constexpr ULONG_PTR RVA_PROJECT = 0x0065CEF0;
+static constexpr ULONG_PTR RVA_CAMERA = 0x07CCAB48;
+static constexpr ULONG_PTR RVA_POS_Y_OBF = 0x068FCCF0;
 static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
 static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
@@ -690,20 +690,20 @@ static bool WriteVisibleVidsSnapshot() {
 #define STATUS_FILENAME L"python_loader.status.txt"
 #endif
 
-// RVAs from the analyzed Lirin game EXE (SHA-256 DBD69CAD...D3636D72F2).
-static constexpr ULONG_PTR RVA_GIL_ENSURE = 0x00AB1520;
-static constexpr ULONG_PTR RVA_GIL_RELEASE = 0x00AB15D0;
-static constexpr ULONG_PTR RVA_IMPORT_ADD_MODULE = 0x00ABED90;
-static constexpr ULONG_PTR RVA_MODULE_GET_DICT = 0x00AA9820;
-static constexpr ULONG_PTR RVA_RUN_STRING_FLAGS = 0x00AB5E60;
-static constexpr ULONG_PTR RVA_AUTO_INTERPRETER_STATE = 0x07B9AC88;
+// RVAs from the analyzed Lirin game EXE (SHA-256 8B6F5EA9...A75A0, build 2026-10-16).
+static constexpr ULONG_PTR RVA_GIL_ENSURE = 0x00AF2750;
+static constexpr ULONG_PTR RVA_GIL_RELEASE = 0x00AF2800;
+static constexpr ULONG_PTR RVA_IMPORT_ADD_MODULE = 0x00B0D5D0;
+static constexpr ULONG_PTR RVA_MODULE_GET_DICT = 0x00B07000;
+static constexpr ULONG_PTR RVA_RUN_STRING_FLAGS = 0x00AF7090;
+static constexpr ULONG_PTR RVA_AUTO_INTERPRETER_STATE = 0x07DFB058;
 #ifdef USE_WINDOW_HOOK
-static constexpr ULONG_PTR RVA_CURRENT_THREAD_STATE = 0x07B9AC70;
-static constexpr ULONG_PTR RVA_AUTO_TLS_KEY = 0x07B9AC90;
-static constexpr ULONG_PTR RVA_TLS_GET_VALUE = 0x00ACA170;
+static constexpr ULONG_PTR RVA_CURRENT_THREAD_STATE = 0x07DFB040;
+static constexpr ULONG_PTR RVA_AUTO_TLS_KEY = 0x07DFB060;
+static constexpr ULONG_PTR RVA_TLS_GET_VALUE = 0x00B069C0;
 #endif
-static constexpr DWORD EXPECTED_TIMESTAMP = 0x6ACA943D;
-static constexpr DWORD EXPECTED_IMAGE_SIZE = 0x094C1000;
+static constexpr DWORD EXPECTED_TIMESTAMP = 0x6AD21E5A;
+static constexpr DWORD EXPECTED_IMAGE_SIZE = 0x09735000;
 
 using GilEnsure = int (*)();
 using GilRelease = void (*)(int);
