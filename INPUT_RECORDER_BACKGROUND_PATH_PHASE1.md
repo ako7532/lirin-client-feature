@@ -249,3 +249,47 @@ synthetic recorder calls", is an open design point recorded in §7.4.
   `140492700`, `1407f7d30`, `1407f7b80`, `1405fc300`, `1408020e0`.
 - `decomp/run_background_input_trace.py`, `decomp/run_background_input_trace2.py` —
   reproducible PyGhidra runners.
+
+---
+
+## 9. Gap closure (continued)
+
+### 9.1 Viewport OnMouseDown hop (was §7.1)
+
+The press chain is confirmed by xref: `FUN_1403e5940` (`CPythonPlayer::SetMouseState`)
+→ `FUN_1403ec0f0` (click-action router) → `FUN_1403ebdd0` (queue duplicate/add) →
+`FUN_1403e41a0` (queue add). `FUN_1403e5940`'s only **direct** code callers are the
+Python `player.SetMouseState` binding (`FUN_1403f8190`, cases 0 and 5) and
+`FUN_1403ec0f0`'s own release call. It is also present in a `.rdata` slot at
+`1492157b8` (adjacent to `FUN_1403e5280` at `149215770`, a per-frame "mouse held →
+`FUN_1403ec0f0`" updater), so the physical viewport OnMouseDown reaches the press via an
+indirect (vtable) call. The wrapper's direct `FUN_1403e5940` call is therefore the same
+function the physical path reaches; the wrapper only skips the UI-element pick that
+tracks the pressed object (`game[+0xb0]`).
+
+### 9.2 Background-mode flag (was §7.2)
+
+`DAT_147a734c0 + 0x20` is read (never written) by every referencing function in the
+recorder/input set; only a `.rdata` slot references its absolute address (`147a734e0`).
+It is the **app-active/focus flag**: `0` = unfocused/background (recorder derives button
+state from player `+0xff/+0x100`), non-zero = focused (`GetAsyncKeyState`). It does **not**
+distinguish minimized from merely-unfocused (both leave it `0`); a minimized check would
+need window visibility/iconic state, which is not captured by this flag.
+
+### 9.3 Recorder `+0x9C/+0xA0` writers
+
+Four writers, all inside the recorder module: `FUN_140471d20`, `FUN_140471920`,
+`FUN_140472870` (foreground branch, refreshed from `FUN_1407e13b0`), and
+`FUN_1404720c0` (setup, zeroes the pair).
+
+### 9.4 Cursor refresh ordering
+
+`game[+0x20/+0x24]` (the client cursor) is written by `FUN_1407e3e70`/`FUN_1407e3fd0`
+on mouse down/up. The recorder's periodic tick `FUN_140472870` reads those values in
+foreground mode, or the stored `+0x9c/+0xa0` in background mode, for its code-0 samples.
+
+### 9.5 Config-adapter caller
+
+`FUN_1403ba7b0` has **no direct code caller**; it is referenced only from a `.rdata`
+slot at `149212c80` (a method/callback table). It is a table-registered recorder-config
+adapter (wrapping `FUN_1404720c0`), not a server-audit command path.
