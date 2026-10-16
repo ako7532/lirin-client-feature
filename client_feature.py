@@ -153,31 +153,6 @@ def _queue_add(vid):
     return player.MetinQueueAdd(vid)
 
 
-def _ui_click(control):
-    """Click a UI control through the full-dispatch path at its screen center.
-
-    Returns True when a click was actually dispatched (the control must not be
-    re-clicked through its legacy callback), or False when the control lacks
-    position/size APIs or the wrapper is inactive (in which case the caller may
-    fall back to its legacy callback, since nothing was dispatched)."""
-    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
-        return False
-    try:
-        get_pos = getattr(control, "GetGlobalPosition", None)
-        get_w = getattr(control, "GetWidth", None)
-        get_h = getattr(control, "GetHeight", None)
-        if not callable(get_pos) or not callable(get_w) or not callable(get_h):
-            return False
-        pos = get_pos()
-        x = int(pos[0])
-        y = int(pos[1])
-        cx = x + int(get_w()) // 2
-        cy = y + int(get_h()) // 2
-        return bool(player.MetinQueueAdd(0, cx, cy))
-    except Exception:
-        return False
-
-
 class NativeActionCoordinator(object):
     """Tracks in-flight native actions through an explicit state machine.
 
@@ -1785,9 +1760,8 @@ class MetinScanner(ui.BoardWithTitleBar):
             elif not self.reaction_started:
                 play_button = getattr(window, "playButton", None)
                 if play_button is not None and play_button.IsShow():
-                    if not _ui_click(play_button):
-                        emit_synthetic_click()
-                        window._ReactionGameWindow__OnClickPlay()
+                    emit_synthetic_click()
+                    window._ReactionGameWindow__OnClickPlay()
                     self.reaction_started = True
                     self.AddLine("Reaction game start requested")
                 return True
@@ -1816,9 +1790,8 @@ class MetinScanner(ui.BoardWithTitleBar):
                 return True
             if now < self.reaction_click_at:
                 return True
-            if not _ui_click(buttons[slot]):
-                emit_synthetic_click()
-                window._ReactionGameWindow__OnClickSlot(slot)
+            emit_synthetic_click()
+            window._ReactionGameWindow__OnClickSlot(slot)
             self.reaction_last_ball = ball_key
             self.reaction_pending_ball = None
             self.reaction_click_at = 0.0
@@ -2060,14 +2033,13 @@ class MetinScanner(ui.BoardWithTitleBar):
                     bool(getattr(card, "played", False)) if card is not None else None))
             return False
         tracker.mark_pending(key)
-        if not _ui_click(card):
-            emit_synthetic_click()
-            try:
-                card.OnMouseLeftButtonDown()
-            except Exception as exc:
-                tracker.clear_pending()
-                self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc))
-                return False
+        emit_synthetic_click()
+        try:
+            card.OnMouseLeftButtonDown()
+        except Exception as exc:
+            tracker.clear_pending()
+            self._DuelDebugLog("Yin Yang Duel: card click error %s" % ascii_text(exc))
+            return False
         note = (" vs %d" % snapshot.exact_opponent_led_value
                 if snapshot.exact_opponent_led_value is not None else "")
         self.AddLine("Yin Yang Duel: played %d (%s)%s" %
