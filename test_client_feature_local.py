@@ -913,4 +913,69 @@ with tempfile.TemporaryDirectory() as directory:
                         our_score=0, opponent_score=0)
     d3 = solver.choose_move(full, time.time() + 3.0)
     assert d3 is not None and d3["card_value"] in duel_mask_cards(0x1FF), d3
+
+    # Brute-force reference (no memoization) for small exact-follow hands.
+    def brute_value(om, pm, sd, leader):
+        oc = duel_mask_cards(om)
+        pc = duel_mask_cards(pm)
+        if not oc:
+            return terminal_duel_value(sd)
+        if leader == "us":
+            best = None
+            for a in oc:
+                exp = [0.0, 0.0, 0.0, 0.0]
+                worst = None
+                for b in pc:
+                    v = brute_value(duel_mask_remove(om, a), duel_mask_remove(pm, b),
+                                    sd + round_score_delta(a, b), "them")
+                    for i in range(4):
+                        exp[i] += v[i] / len(pc)
+                    if worst is None or v < worst:
+                        worst = v
+                val = tuple(0.75 * exp[i] + 0.25 * worst[i] for i in range(4))
+                if best is None or val > best:
+                    best = val
+            return best
+        exp = [0.0, 0.0, 0.0, 0.0]
+        worst = None
+        for b in pc:
+            best_a = None
+            for a in oc:
+                v = brute_value(duel_mask_remove(om, a), duel_mask_remove(pm, b),
+                                sd + round_score_delta(a, b), "us")
+                if best_a is None or v > best_a:
+                    best_a = v
+            for i in range(4):
+                exp[i] += best_a[i] / len(pc)
+            if worst is None or best_a < worst:
+                worst = best_a
+        return tuple(0.75 * exp[i] + 0.25 * worst[i] for i in range(4))
+
+    def brute_exact(our_mask, opp_mask, score_delta, b):
+        best_val, best_card = None, None
+        for a in duel_mask_cards(our_mask):
+            v = brute_value(duel_mask_remove(our_mask, a),
+                            duel_mask_remove(opp_mask, b),
+                            score_delta + round_score_delta(a, b), "us")
+            if best_val is None or v > best_val or (v == best_val and a < best_card):
+                best_val, best_card = v, a
+        return best_card
+
+    rng = duel_globals["random"].Random(7)
+    for _ in range(25):
+        size = rng.randint(1, 4)
+        our_vals = rng.sample(range(9), size)
+        opp_vals = rng.sample(range(9), size)
+        led = rng.choice(opp_vals)
+        our_mask = sum(1 << v for v in our_vals)
+        opp_mask = sum(1 << v for v in opp_vals)
+        snap = DuelSnapshot(match_id=1, round_num=9 - size, state=2, we_lead=False,
+                            visible_color=duel_card_color(led),
+                            exact_opponent_led_value=led, exact_value_confident=True,
+                            our_remaining_mask=our_mask,
+                            opponent_remaining_mask=opp_mask & ~(1 << led),
+                            our_score=0, opponent_score=0)
+        got = solver.choose_move(snap, time.time() + 2.0)
+        expect = brute_exact(our_mask, opp_mask, 0, led)
+        assert got is not None and got["card_value"] == expect, (our_vals, opp_vals, led, got, expect)
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")

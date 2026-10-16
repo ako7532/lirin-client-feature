@@ -2,6 +2,7 @@
 
 import __main__
 import gc
+import json
 import math
 import os
 import random
@@ -74,7 +75,8 @@ BOSS_RETURN_STALL_SECONDS = 3.0
 BOSS_RETURN_PROGRESS_DISTANCE = 25
 YINYANG_DUEL_POLL_SECONDS = 1.0
 YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
-YINYANG_DUEL_HISTORY_CSV = os.path.join(DIRECTORY, "yin_yang_duel_history.csv")
+YINYANG_DUEL_HISTORY_JSONL = os.path.join(DIRECTORY, "yin_yang_duel_history.jsonl")
+YINYANG_DUEL_HISTORY_SCHEMA = 1
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -908,6 +910,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_debug = None
         self.yinyang_duel_solver = DuelSolver()
         self.yinyang_duel_tracker = DuelRoundTracker()
+        self.yinyang_duel_last_scores = None
+        self.yinyang_duel_last_state = None
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -1659,14 +1663,17 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.yinyang_duel_debug = message
             self.AddLine(message)
 
-    def _DuelRecordPlay(self, actor, round_num, card_value, leads):
+    def _DuelRecordEvent(self, event):
+        """Append one versioned JSON-lines event to the duel history."""
         try:
-            line = "%s,%s,%d,%d,%s\n" % (
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                actor, int(round_num), int(card_value),
-                "1" if leads else "0")
-            data = line.encode("ascii")
-            fd = os.open(YINYANG_DUEL_HISTORY_CSV,
+            event = dict(event)
+            event.setdefault("schema", YINYANG_DUEL_HISTORY_SCHEMA)
+            event.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S",
+                                                 time.localtime()))
+            event.setdefault("feature_version", FEATURE_VERSION)
+            line = json.dumps(event, sort_keys=True)
+            data = line.encode("ascii") + b"\n"
+            fd = os.open(YINYANG_DUEL_HISTORY_JSONL,
                          os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
             try:
                 offset = 0
@@ -1677,8 +1684,18 @@ class MetinScanner(ui.BoardWithTitleBar):
                     offset += written
             finally:
                 os.close(fd)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._DuelDebugLog("Yin Yang Duel: history write error %s" %
+                               ascii_text(exc))
+
+    def _DuelRecordPlay(self, actor, round_num, card_value, leads):
+        self._DuelRecordEvent({
+            "event": "play",
+            "actor": actor,
+            "round": int(round_num),
+            "card": int(card_value),
+            "leads": 1 if leads else 0,
+        })
 
     def _DuelTryPlay(self, window):
         """If it is our turn, solve and play a card.  Returns True when played."""
@@ -1699,7 +1716,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             except Exception:
                 pass
         deadline = time.time() + DUEL_SOLVER_BUDGET_SECONDS
+        solve_started = time.time()
         decision = self.yinyang_duel_solver.choose_move(snapshot, deadline)
+        solver_elapsed_ms = (time.time() - solve_started) * 1000.0
         if decision is None or decision.get("card_value") is None:
             return False
         value = int(decision["card_value"])
@@ -1727,7 +1746,29 @@ class MetinScanner(ui.BoardWithTitleBar):
                 if snapshot.exact_opponent_led_value is not None else "")
         self.AddLine("Yin Yang Duel: played %d (%s)%s" %
                      (value, decision.get("mode"), note))
-        self._DuelRecordPlay("us", snapshot.round_num, value, snapshot.we_lead)
+        self._DuelRecordEvent({
+            "event": "decision",
+            "match_id": snapshot.match_id,
+            "round": snapshot.round_num,
+            "state": snapshot.state,
+            "we_lead": 1 if snapshot.we_lead else 0,
+            "visible_color": snapshot.visible_color,
+            "exact_opponent_led_value": snapshot.exact_opponent_led_value,
+            "exact_value_confident": 1 if snapshot.exact_value_confident else 0,
+            "our_score_before": snapshot.our_score,
+            "opponent_score_before": snapshot.opponent_score,
+            "our_remaining_mask": snapshot.our_remaining_mask,
+            "opponent_remaining_mask": snapshot.opponent_remaining_mask,
+            "chosen_card": value,
+            "decision_mode": decision.get("mode"),
+            "win_probability": decision.get("win_probability"),
+            "loss_probability": decision.get("loss_probability"),
+            "expected_final_score_delta": decision.get("expected_score_delta"),
+            "worst_case_utility": decision.get("worst_case_utility"),
+            "complete_search": 1 if decision.get("complete_search") else 0,
+            "solver_elapsed_ms": round(solver_elapsed_ms, 3),
+            "model_version": decision.get("model_version"),
+        })
         self.yinyang_duel_label.SetText("Yin Yang Duel: played %d" % value)
         return True
 
@@ -1779,6 +1820,41 @@ class MetinScanner(ui.BoardWithTitleBar):
             newly, _exact = tracker.observe_opponent(window)
             for value in newly:
                 self._DuelRecordPlay("them", round_num, value, we_lead)
+            # Correlate resolved rounds and the match finish from score/state
+            # transitions.
+            our_score = int(getattr(window, "playerScore", 0) or 0)
+            opp_score = int(getattr(window, "opponentScore", 0) or 0)
+            prev_state = self.yinyang_duel_last_state
+            if state == 2 and prev_state in (0, None):
+                # A new match started; reset score tracking.
+                self.yinyang_duel_last_scores = (our_score, opp_score)
+            else:
+                last_scores = self.yinyang_duel_last_scores
+                if last_scores is not None and last_scores != (our_score, opp_score):
+                    our_delta = our_score - last_scores[0]
+                    opp_delta = opp_score - last_scores[1]
+                    outcome = ("win" if our_delta > 0 else
+                               ("lose" if opp_delta > 0 else "tie"))
+                    self._DuelRecordEvent({
+                        "event": "result",
+                        "match_id": tracker.match_id,
+                        "round": round_num,
+                        "round_outcome": outcome,
+                        "our_score": our_score,
+                        "opponent_score": opp_score,
+                    })
+                    self.yinyang_duel_last_scores = (our_score, opp_score)
+                if prev_state in (2, 3, 4) and state == 0:
+                    final_outcome = ("win" if our_score > opp_score else
+                                     ("lose" if our_score < opp_score else "tie"))
+                    self._DuelRecordEvent({
+                        "event": "finish",
+                        "match_id": tracker.match_id,
+                        "our_score": our_score,
+                        "opponent_score": opp_score,
+                        "outcome": final_outcome,
+                    })
+            self.yinyang_duel_last_state = state
             # Clear the pending click once state leaves the pickable round.
             if state != 2 or round_num != tracker.last_round:
                 tracker.clear_pending()
