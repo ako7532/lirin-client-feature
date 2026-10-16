@@ -1973,6 +1973,8 @@ class MetinScanner(ui.BoardWithTitleBar):
                         (int(cooldown), used, maximum))
                     return
                 self._DuelEnsureStarted(window, state)
+            else:
+                self.yinyang_duel_label.SetText("Yin Yang Duel: duel in progress")
         except Exception as exc:
             problem = ascii_text(exc)
             if problem != self.yinyang_duel_last_error:
