@@ -854,4 +854,63 @@ with tempfile.TemporaryDirectory() as directory:
     assert choose_duel_card_lead([0, 1, 2, 3, 4, 5, 6, 7, 8], {1, 3, 5, 7}) == 6
     assert choose_duel_card_lead([0, 1, 2], {7, 8}) == 0
     assert choose_duel_card_lead([], {}) is None
+
+    # Yin Yang Duel solver (pure card-game logic).
+    DuelSolver = duel_globals["DuelSolver"]
+    DuelSnapshot = duel_globals["DuelSnapshot"]
+    duel_mask_cards = duel_globals["duel_mask_cards"]
+    duel_mask_count = duel_globals["duel_mask_count"]
+    duel_mask_remove = duel_globals["duel_mask_remove"]
+    duel_mask_color = duel_globals["duel_mask_color"]
+    round_score_delta = duel_globals["round_score_delta"]
+    terminal_duel_value = duel_globals["terminal_duel_value"]
+
+    assert duel_mask_cards(0x1FF) == [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    assert duel_mask_count(0x1FF) == 9
+    assert duel_mask_remove(0x1FF, 4) == 0x1FF & ~(1 << 4)
+    assert duel_mask_cards(duel_mask_color(0x1FF, "black")) == [0, 2, 4, 6, 8]
+    assert round_score_delta(6, 3) == 1
+    assert round_score_delta(3, 6) == -1
+    assert round_score_delta(5, 5) == 0
+    assert terminal_duel_value(2) == (1.0, 0.0, 2.0, 1.0)
+    assert terminal_duel_value(-1) == (0.0, -1.0, -1.0, -1.0)
+    assert terminal_duel_value(0) == (0.0, 0.0, 0.0, 0.0)
+
+    solver = DuelSolver()
+    # One-card exact follow: only card 7, opponent led 6 -> must play 7.
+    one_card = DuelSnapshot(match_id=1, round_num=9, state=2, we_lead=False,
+                            visible_color="black", exact_opponent_led_value=6,
+                            exact_value_confident=True,
+                            our_remaining_mask=1 << 7,
+                            opponent_remaining_mask=1 << 6,
+                            our_score=4, opponent_score=4)
+    d = solver.choose_move(one_card, time.time() + 2.0)
+    assert d is not None and d["card_value"] == 7, d
+    # One-card exact follow where we cannot beat: only card 2 vs led 6.
+    lose_card = DuelSnapshot(match_id=1, round_num=9, state=2, we_lead=False,
+                             visible_color="black", exact_opponent_led_value=6,
+                             exact_value_confident=True,
+                             our_remaining_mask=1 << 2,
+                             opponent_remaining_mask=1 << 6,
+                             our_score=4, opponent_score=4)
+    d2 = solver.choose_move(lose_card, time.time() + 2.0)
+    assert d2 is not None and d2["card_value"] == 2, d2
+    # 2-card exact follow: {5,7} vs led 6, opponent remaining {8}.  Playing 7
+    # ties the match; playing 5 loses it, so the solver must choose 7.
+    follow2 = DuelSnapshot(match_id=1, round_num=8, state=2, we_lead=False,
+                           visible_color="black", exact_opponent_led_value=6,
+                           exact_value_confident=True,
+                           our_remaining_mask=(1 << 5) | (1 << 7),
+                           opponent_remaining_mask=1 << 8,
+                           our_score=0, opponent_score=0)
+    d4 = solver.choose_move(follow2, time.time() + 2.0)
+    assert d4 is not None and d4["card_value"] == 7, d4
+    # Full-hand lead decision must return a valid in-hand card (and not crash).
+    full = DuelSnapshot(match_id=1, round_num=1, state=2, we_lead=True,
+                        visible_color=None, exact_opponent_led_value=None,
+                        exact_value_confident=False,
+                        our_remaining_mask=0x1FF, opponent_remaining_mask=0x1FF,
+                        our_score=0, opponent_score=0)
+    d3 = solver.choose_move(full, time.time() + 3.0)
+    assert d3 is not None and d3["card_value"] in duel_mask_cards(0x1FF), d3
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")
