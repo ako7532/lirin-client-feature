@@ -87,6 +87,9 @@ BOSS_CHANGE_CHANNEL = "change_channel"
 BOSS_WAIT_CHANNEL = "wait_channel"
 BOSS_SETTLE_CHANNEL = "settle_channel"
 BOSS_RETURN_POSITION = "return_position"
+BOSS_SWEEP_BUSY_STATES = (BOSS_WAIT_SPAWN, BOSS_FIND, BOSS_ATTACK,
+                          BOSS_CHANGE_CHANNEL, BOSS_WAIT_CHANNEL,
+                          BOSS_SETTLE_CHANNEL, BOSS_RETURN_POSITION)
 
 PHASE_LOADING = 4
 PHASE_GAME = 5
@@ -1874,7 +1877,7 @@ class MetinScanner(ui.BoardWithTitleBar):
     def PollYinYangDuel(self, now):
         if not self.yinyang_duel_enabled:
             return
-        if self.boss_enabled:
+        if self.boss_enabled and self.boss_state in BOSS_SWEEP_BUSY_STATES:
             self.yinyang_duel_label.SetText("Yin Yang Duel: waiting for Boss Sweep")
             return
         if now < self.yinyang_duel_next_poll:
