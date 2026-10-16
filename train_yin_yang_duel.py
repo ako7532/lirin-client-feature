@@ -17,7 +17,6 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-HISTORY = os.path.join(HERE, "yin_yang_duel_history.jsonl")
 MODEL = os.path.join(HERE, "yin_yang_duel_model.json")
 
 
@@ -33,28 +32,45 @@ def round_bucket(round_num):
     return "late"
 
 
-def load_events():
-    if not os.path.exists(HISTORY):
-        return []
+def find_history_paths():
+    """History may live in the repository root (older runs) or in a per-branch
+    runtime directory (`.runtime/<branch>/yin_yang_duel_history.jsonl`)."""
+    paths = []
+    root = os.path.join(HERE, "yin_yang_duel_history.jsonl")
+    if os.path.isfile(root):
+        paths.append(root)
+    runtime_root = os.path.join(HERE, ".runtime")
+    if os.path.isdir(runtime_root):
+        for branch in sorted(os.listdir(runtime_root)):
+            candidate = os.path.join(runtime_root, branch,
+                                     "yin_yang_duel_history.jsonl")
+            if os.path.isfile(candidate):
+                paths.append(candidate)
+    return paths
+
+
+def load_events(paths):
     events = []
-    with open(HISTORY, "rb") as source:
-        data = source.read()
-    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            events.append(json.loads(raw))
-        except ValueError:
-            continue
+    for path in paths:
+        with open(path, "rb") as source:
+            data = source.read()
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        for raw in text.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                continue
     return events
 
 
 def main():
-    events = load_events()
+    paths = sys.argv[1:] if len(sys.argv) > 1 else find_history_paths()
+    events = load_events(paths)
     if not events:
-        print("No history found:", HISTORY)
+        print("No history found (searched: %s)" % (paths or find_history_paths()))
         return
 
     by_match = collections.defaultdict(list)

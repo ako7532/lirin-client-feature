@@ -33,7 +33,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 40
+FEATURE_VERSION = 43
 HUNTER_LIMIT = 5
 HUNTER_BURST_DELAY_MIN = 0.70
 HUNTER_BURST_DELAY_MAX = 2.50
@@ -136,6 +136,17 @@ YINYANG_DUEL_WHITE = (1, 3, 5, 7)
 
 def duel_card_color(value):
     return "black" if (int(value) % 2) == 0 else "white"
+
+
+def duel_we_lead(lead_info):
+    """Whether WE lead (play blind) this round, from the window's `leadInfo`.
+
+    Live observation (round 1): when `leadInfo.leads` is True the opponent
+    already has exactly one card marked `played`, so `leads=True` actually
+    means the OPPONENT led and we are following.  (The `black` flag is their
+    led card's colour.)
+    """
+    return not bool((lead_info or {}).get("leads", False))
 
 
 def choose_duel_card(my_hand, opponent_color):
@@ -574,6 +585,7 @@ class DuelRoundTracker(object):
         self.last_round = None
         self.opponent_played_mask = 0
         self.opponent_last = None
+        self.opponent_round = None
         self.pending = None
 
     def on_window(self, window):
@@ -584,6 +596,7 @@ class DuelRoundTracker(object):
             self.last_round = None
             self.opponent_played_mask = 0
             self.opponent_last = None
+            self.opponent_round = None
             self.pending = None
 
     @staticmethod
@@ -609,7 +622,13 @@ class DuelRoundTracker(object):
         where exact is the led value when exactly one card appeared in an
         opponent-led, colour-matching state."""
         lead_info = getattr(window, "leadInfo", None) or {}
-        we_lead = bool(lead_info.get("leads", False))
+        we_lead = duel_we_lead(lead_info)
+        round_num = lead_info.get("round", 0)
+        if round_num != self.opponent_round:
+            # A new round invalidates the previously-detected led card: a stale
+            # value must never be reused as the exact led card of this round.
+            self.opponent_round = round_num
+            self.opponent_last = None
         played_mask, valid = self.read_mask(getattr(window, "opponentCards", None),
                                             played=True)
         if not valid:
@@ -628,7 +647,7 @@ class DuelRoundTracker(object):
 
     def build_snapshot(self, window):
         lead_info = getattr(window, "leadInfo", None) or {}
-        we_lead = bool(lead_info.get("leads", False))
+        we_lead = duel_we_lead(lead_info)
         our_remaining, our_valid = self.read_mask(getattr(window, "playerCards", None),
                                                   played=False)
         opp_remaining, opp_valid = self.read_mask(getattr(window, "opponentCards", None),
@@ -993,6 +1012,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
         self.yinyang_duel_debug = None
+        self.yinyang_duel_stall = None
         self.yinyang_duel_solver = DuelSolver(
             load_trained_duel_models() or DuelBaselineModels())
         self.yinyang_duel_tracker = DuelRoundTracker()
@@ -1675,6 +1695,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_button.SetText("ON" if self.yinyang_duel_enabled else "OFF")
         self.yinyang_duel_next_poll = 0.0
         self.yinyang_duel_last_error = None
+        self.yinyang_duel_debug = None
+        self.yinyang_duel_stall = None
         if self.yinyang_duel_enabled:
             if not self.running:
                 self.Start()
@@ -1749,6 +1771,13 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.yinyang_duel_debug = message
             self.AddLine(message)
 
+    def _DuelStallLog(self, reason, detail=""):
+        """Throttled log of *why* a card was not played, to diagnose stalls."""
+        message = "Yin Yang Duel: no play (%s)%s" % (reason, detail)
+        if message != self.yinyang_duel_stall:
+            self.yinyang_duel_stall = message
+            self.AddLine(message)
+
     def _DuelRecordEvent(self, event):
         """Append one versioned JSON-lines event to the duel history."""
         try:
@@ -1793,14 +1822,32 @@ class MetinScanner(ui.BoardWithTitleBar):
         tracker = self.yinyang_duel_tracker
         snapshot = tracker.build_snapshot(window)
         if snapshot is None:
+            our_rm, our_ok = tracker.read_mask(getattr(window, "playerCards", None),
+                                               played=False)
+            opp_rm, opp_ok = tracker.read_mask(getattr(window, "opponentCards", None),
+                                               played=False)
+            lead_info = getattr(window, "leadInfo", None) or {}
+            self._DuelStallLog(
+                "snapshot rejected",
+                ": we_lead=%s round=%s our=%d(%s) opp=%d(%s)" % (
+                    duel_we_lead(lead_info),
+                    lead_info.get("round", 0),
+                    duel_mask_count(our_rm), our_ok,
+                    duel_mask_count(opp_rm), opp_ok))
             return False
         key = snapshot.decision_key()
         if tracker.has_pending(key):
+            self._DuelStallLog(
+                "pending click not cleared",
+                ": round=%s we_lead=%s" % (snapshot.round_num, snapshot.we_lead))
             return False
         can_pick = getattr(window, "CanPickCard", None)
         if callable(can_pick):
             try:
                 if not can_pick():
+                    self._DuelStallLog(
+                        "CanPickCard returned false",
+                        ": round=%s we_lead=%s" % (snapshot.round_num, snapshot.we_lead))
                     return False
             except Exception:
                 pass
@@ -1809,6 +1856,12 @@ class MetinScanner(ui.BoardWithTitleBar):
         decision = self.yinyang_duel_solver.choose_move(snapshot, deadline)
         solver_elapsed_ms = (time.time() - solve_started) * 1000.0
         if decision is None or decision.get("card_value") is None:
+            self._DuelStallLog(
+                "solver produced no decision",
+                ": round=%s we_lead=%s our=%d opp=%d" % (
+                    snapshot.round_num, snapshot.we_lead,
+                    duel_mask_count(snapshot.our_remaining_mask),
+                    duel_mask_count(snapshot.opponent_remaining_mask)))
             return False
         value = int(decision["card_value"])
         cards = getattr(window, "playerCards", None) or {}
@@ -1822,6 +1875,11 @@ class MetinScanner(ui.BoardWithTitleBar):
                 except Exception:
                     continue
         if card is None or getattr(card, "played", False):
+            self._DuelStallLog(
+                "chosen card unavailable",
+                ": card=%d played=%s" % (
+                    value,
+                    bool(getattr(card, "played", False)) if card is not None else None))
             return False
         tracker.mark_pending(key)
         emit_synthetic_click()
@@ -1861,14 +1919,20 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_label.SetText("Yin Yang Duel: played %d" % value)
         return True
 
-    def _DuelEnsureStarted(self, window, state):
+    def _DuelEnsureVisible(self, window):
+        """Open the duel window if it is hidden; returns True when opened."""
         try:
             if not window.IsShow():
                 window.Open()
-                self.yinyang_duel_label.SetText("Yin Yang Duel: opening window")
-                return
+                return True
         except Exception:
             pass
+        return False
+
+    def _DuelEnsureStarted(self, window, state):
+        if self._DuelEnsureVisible(window):
+            self.yinyang_duel_label.SetText("Yin Yang Duel: opening window")
+            return
         if state == 0:
             start = getattr(window, "_YinYangDuelWindow__OnStartClicked", None)
             if callable(start):
@@ -1904,7 +1968,11 @@ class MetinScanner(ui.BoardWithTitleBar):
             state = getattr(window, "state", None)
             lead_info = getattr(window, "leadInfo", None) or {}
             round_num = lead_info.get("round", 0)
-            we_lead = bool(lead_info.get("leads", False))
+            we_lead = duel_we_lead(lead_info)
+            # Keep the duel window visible while a duel is active, so the
+            # automation isn't playing cards on a hidden window.
+            if state in (2, 3, 4):
+                self._DuelEnsureVisible(window)
             # Warm the solver cache during non-pick active states so the next
             # pick decision is fast and closer to exact.
             if state in (3, 4):

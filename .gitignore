@@ -6,6 +6,7 @@
 client_feature_run_*.dll
 
 # Runtime state
+.runtime/
 client_feature_active.txt
 client_feature_vids.txt
 client_feature_config.txt

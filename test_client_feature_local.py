@@ -978,4 +978,46 @@ with tempfile.TemporaryDirectory() as directory:
         got = solver.choose_move(snap, time.time() + 2.0)
         expect = brute_exact(our_mask, opp_mask, 0, led)
         assert got is not None and got["card_value"] == expect, (our_vals, opp_vals, led, got, expect)
+
+    # DuelRoundTracker: a stale exact-led value must be cleared when the round
+    # advances, so a later follow round never reuses a previous round's card.
+    DuelRoundTracker = duel_globals["DuelRoundTracker"]
+
+    class DuelCard:
+        def __init__(self, value, played=False):
+            self.value = value
+            self.played = played
+
+    class DuelWindow:
+        def __init__(self):
+            self.state = 2
+            self.playerScore = 0
+            self.opponentScore = 0
+            self.leadInfo = {"leads": True, "black": True, "round": 1}
+            self.playerCards = {v: DuelCard(v) for v in range(9)}
+            self.opponentCards = {v: DuelCard(v) for v in range(9)}
+
+    tracker = DuelRoundTracker()
+    window = DuelWindow()
+    tracker.on_window(window)
+    # Round 1: `leads=True` means the opponent led (we follow).  Their led card
+    # 4 is black, so it is detected as the exact led value.
+    window.opponentCards[4].played = True
+    newly, exact = tracker.observe_opponent(window)
+    assert newly == [4] and exact == 4, (newly, exact)
+    snap = tracker.build_snapshot(window)
+    assert snap is not None and snap.exact_opponent_led_value == 4
+    assert snap.we_lead is False
+    # We answered in round 1 (our card 2 played); round advances to 2 and the
+    # opponent leads again, but the reported colour mismatches (card 6 is
+    # black, flag says white) so detection fails.  The stale round-1 value must
+    # not leak into the snapshot.
+    window.playerCards[2].played = True
+    window.leadInfo = {"leads": True, "black": False, "round": 2}
+    window.opponentCards[6].played = True
+    newly, exact = tracker.observe_opponent(window)
+    assert exact is None, exact
+    snap = tracker.build_snapshot(window)
+    assert snap is not None, "count validation rejected a valid follow state"
+    assert snap.exact_opponent_led_value is None, snap.exact_opponent_led_value
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")
