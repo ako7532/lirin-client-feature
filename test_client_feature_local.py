@@ -1071,6 +1071,364 @@ with tempfile.TemporaryDirectory() as directory:
     assert snap is not None, "count validation rejected a valid follow state"
     assert snap.exact_opponent_led_value is None, snap.exact_opponent_led_value
 
+    # --- Twin Souls (YinYangMemory / Pexeso) ---
+    ts = panel.PollTwinSouls.__globals__
+    MemoryBoardSnapshot = ts["MemoryBoardSnapshot"]
+    MemoryKnowledge = ts["MemoryKnowledge"]
+    MemorySolver = ts["MemorySolver"]
+    MemoryBoardTracker = ts["MemoryBoardTracker"]
+    MemoryActionAdapter = ts["MemoryActionAdapter"]
+    enumerate_memory_cards = ts["enumerate_memory_cards"]
+    normalize_memory_face = ts["normalize_memory_face"]
+    classify_memory_state = ts["classify_memory_state"]
+    resolve_minigame_owner = ts["resolve_minigame_owner"]
+
+    def make_ts_snapshot(state="playing", awaiting=False, busy=False,
+                         open_cells=(), matched=(), visible=None,
+                         selectable=(), cell_count=8, pair_count=4,
+                         pairs_found=0, plays_max=5, plays_max_hwid=10,
+                         plays_used=0, plays_used_hwid=0):
+        return MemoryBoardSnapshot(
+            board_id=1, window_id=1, state=state, phase=None,
+            cell_count=cell_count, pair_count=pair_count,
+            pairs_found=pairs_found, time_remaining=30.0,
+            bonus_remaining=None, awaiting_flip=awaiting, busy=busy,
+            open_cells=tuple(open_cells), matched_cells=frozenset(matched),
+            visible_faces=dict(visible or {}),
+            selectable_cells=tuple(selectable),
+            plays_used=plays_used, plays_max=plays_max,
+            plays_used_hwid=plays_used_hwid, plays_max_hwid=plays_max_hwid,
+            generation_signature=())
+
+    def make_ts_knowledge(known=None, unmatched=None):
+        k = MemoryKnowledge()
+        k.known_face_by_cell = dict(known or {})
+        k.unmatched_cells_by_face = dict(
+            (face, set(cells)) for face, cells in (unmatched or {}).items())
+        return k
+
+    ts_solver = MemorySolver()
+
+    # Solver: known open mate is selected.
+    d = ts_solver.choose_cell(
+        make_ts_snapshot(open_cells=(0,), selectable=(1, 2, 3), visible={0: 7}),
+        make_ts_knowledge(known={0: 7, 1: 7}, unmatched={7: {0, 1}}))
+    assert d["mode"] == "known_mate" and d["cell_index"] == 1 and d["face"] == 7, d
+    assert d["mate_cell"] == 0, d
+
+    # Solver: a complete known pair is selected before exploration.
+    d = ts_solver.choose_cell(
+        make_ts_snapshot(selectable=(0, 1, 2, 3)),
+        make_ts_knowledge(known={0: 5, 1: 5}, unmatched={5: {0, 1}}))
+    assert d["mode"] == "complete_pair" and d["cell_index"] == 0 and d["mate_cell"] == 1, d
+
+    # Solver: an unknown cell is selected when no pair exists.
+    d = ts_solver.choose_cell(make_ts_snapshot(selectable=(0, 1, 2, 3)),
+                              make_ts_knowledge())
+    assert d["mode"] == "explore" and d["cell_index"] == 0, d
+
+    # Solver: matched cells are excluded from a known mate.
+    d = ts_solver.choose_cell(
+        make_ts_snapshot(open_cells=(2,), matched=(3,), selectable=(0, 1),
+                         visible={2: 9}),
+        make_ts_knowledge(known={2: 9, 3: 9}, unmatched={9: {2, 3}}))
+    assert d["mode"] == "explore" and d["cell_index"] == 0, d
+
+    # Solver: waits for non-playing, busy, awaiting, and two-open states.
+    assert ts_solver.choose_cell(make_ts_snapshot(state="idle"),
+                                 make_ts_knowledge())["mode"] == "wait"
+    assert ts_solver.choose_cell(make_ts_snapshot(busy=True),
+                                 make_ts_knowledge())["reason"] == "client busy"
+    assert ts_solver.choose_cell(make_ts_snapshot(awaiting=True),
+                                 make_ts_knowledge())["reason"] == "client busy"
+    assert ts_solver.choose_cell(make_ts_snapshot(open_cells=(0, 1)),
+                                 make_ts_knowledge())["reason"] == "two cards resolving"
+
+    # Solver: deterministic tie-break chooses the lowest first cell.
+    d = ts_solver.choose_cell(
+        make_ts_snapshot(selectable=(0, 1, 2, 3)),
+        make_ts_knowledge(known={0: 3, 2: 3, 1: 4, 3: 4},
+                          unmatched={3: {0, 2}, 4: {1, 3}}))
+    assert d["cell_index"] == 0 and d["face"] == 3, d
+
+    # Solver: no legal cell returns a wait, not an invalid index.
+    d = ts_solver.choose_cell(make_ts_snapshot(selectable=(), matched=(0, 1, 2, 3)),
+                              make_ts_knowledge())
+    assert d["mode"] == "wait" and d["cell_index"] is None, d
+
+    # Card enumeration: list and dict shapes normalize identically.
+    class MCard:
+        def __init__(self, index, face=0, matched=False, busy=False):
+            self.index = index
+            self.face = face
+            self.matched = matched
+            self._busy = busy
+        def IsBusy(self):
+            return self._busy
+
+    pairs, ok, _reason = enumerate_memory_cards([MCard(0), MCard(1), MCard(2)])
+    assert ok and [i for i, _ in pairs] == [0, 1, 2], pairs
+    pairs, ok, _reason = enumerate_memory_cards({2: MCard(2), 0: MCard(0), 1: MCard(1)})
+    assert ok and [i for i, _ in pairs] == [0, 1, 2], pairs
+    pairs, ok, reason = enumerate_memory_cards([MCard(0), MCard(0)])
+    assert not ok and "duplicate" in reason, reason
+    pairs, ok, reason = enumerate_memory_cards("not cards")
+    assert not ok, reason
+
+    # Face normalization preserves a zero face and only accepts visible faces.
+    assert normalize_memory_face(0, True) == 0
+    assert normalize_memory_face(7, True) == 7
+    assert normalize_memory_face(0, False) is None
+    assert normalize_memory_face("x", True) is None
+
+    # State classification treats unverified numeric states as unknown.
+    assert classify_memory_state(None) == "unknown"
+    assert classify_memory_state("playing") == "playing"
+    assert classify_memory_state(2) == "unknown"
+    assert classify_memory_state("idle") == "idle"
+
+    # Minigame arbitration: active owner keeps the slot; deterministic priority.
+    assert resolve_minigame_owner(True, True, False, False) == "duel"
+    assert resolve_minigame_owner(False, False, True, True) == "twin_souls"
+    assert resolve_minigame_owner(True, False, True, False) == "duel"
+    assert resolve_minigame_owner(False, False, True, False) == "twin_souls"
+    assert resolve_minigame_owner(False, False, False, False) is None
+
+    class FakeMemoryWindow:
+        def __init__(self, cards=None):
+            self.state = "playing"
+            self.phase = None
+            self.cards = cards if cards is not None else []
+            self.openCells = []
+            self.faceCount = 0
+            self.pairsFound = 0
+            self.awaitingFlip = False
+            self.playsUsed = 0
+            self.playsMax = 5
+            self.playsUsedHwid = 0
+            self.playsMaxHwid = 10
+            self.timeLeftSec = 30.0
+        def GetTimeRemaining(self):
+            return self.timeLeftSec
+        def GetCooldownRemaining(self):
+            return 0.0
+        def GetBonusRemaining(self):
+            return 0.0
+
+    def ts_window(card_specs, open_cells=(), pairs_found=0):
+        window = FakeMemoryWindow([MCard(i, f, m) for i, f, m in card_specs])
+        window.faceCount = len(card_specs) // 2
+        window.pairsFound = pairs_found
+        window.openCells = list(open_cells)
+        return window
+
+    # Tracker: a revealed face is learned from authoritative state.
+    mt = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 0, False), (2, 8, False), (3, 0, False)],
+                  open_cells=(0,))
+    snap, err = mt.observe(w, 1.0)
+    assert err is None and snap.visible_faces == {0: 7}, (snap.visible_faces, err)
+    assert mt.known_face_by_cell.get(0) == 7
+
+    # Tracker: mismatch faces remain known after the cards close.
+    w.openCells = [0, 2]
+    w.cards[0].face = 7
+    w.cards[2].face = 8
+    snap, err = mt.observe(w, 2.0)
+    assert snap.visible_faces == {0: 7, 2: 8}
+    w.openCells = []
+    w.cards[0].face = 0
+    w.cards[2].face = 0
+    snap, err = mt.observe(w, 3.0)
+    assert snap.visible_faces == {}
+    assert mt.known_face_by_cell.get(0) == 7
+    assert mt.known_face_by_cell.get(2) == 8
+
+    # Tracker: matched cells leave the unmatched index.
+    mt2 = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 7, False), (2, 8, False), (3, 8, False)],
+                  open_cells=(0, 1))
+    mt2.observe(w, 1.0)
+    assert mt2.known_cells_by_face.get(7) == {0, 1}
+    w.cards[0].matched = True
+    w.cards[1].matched = True
+    w.openCells = []
+    mt2.observe(w, 2.0)
+    assert not mt2.known_cells_by_face.get(7)
+
+    # Tracker: a new window clears all old knowledge.
+    mt3 = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 0, False)], open_cells=(0,))
+    mt3.observe(w, 1.0)
+    assert mt3.known_face_by_cell.get(0) == 7
+    board_before = mt3.board_id
+    w2 = ts_window([(0, 9, False), (1, 0, False)], open_cells=(0,))
+    mt3.observe(w2, 2.0)
+    assert mt3.board_id == board_before + 1
+    assert mt3.known_face_by_cell == {0: 9}
+
+    # Tracker: a within-window board reset (pairsFound back to zero) clears.
+    mt4 = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 7, False), (2, 8, False), (3, 8, False)],
+                  open_cells=(0, 1), pairs_found=1)
+    w.cards[0].matched = True
+    w.cards[1].matched = True
+    mt4.observe(w, 1.0)
+    assert mt4.known_face_by_cell.get(0) == 7
+    board_before = mt4.board_id
+    w.pairsFound = 0
+    w.cards[0].matched = False
+    w.cards[1].matched = False
+    w.cards[0].face = 0
+    w.cards[1].face = 0
+    w.openCells = []
+    mt4.observe(w, 2.0)
+    assert mt4.board_id == board_before + 1
+    assert mt4.known_face_by_cell == {}
+
+    # Tracker: a contradictory face mutation inside one board is rejected.
+    mt5 = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 0, False)], open_cells=(0,))
+    mt5.observe(w, 1.0)
+    w.cards[0].face = 8
+    mt5.observe(w, 2.0)
+    assert mt5.known_face_by_cell.get(0) == 7
+    assert mt5.last_error is not None
+
+    # Tracker: list and dictionary card collections normalize consistently.
+    mt_list = MemoryBoardTracker()
+    mt_dict = MemoryBoardTracker()
+    cards = [(0, 7, False), (1, 0, False), (2, 8, False), (3, 0, False)]
+    w_list = ts_window(cards, open_cells=(0,))
+    w_dict = FakeMemoryWindow({i: MCard(i, f, m) for i, f, m in cards})
+    w_dict.faceCount = 2
+    w_dict.openCells = [0]
+    s_list, _ = mt_list.observe(w_list, 1.0)
+    s_dict, _ = mt_dict.observe(w_dict, 1.0)
+    assert s_list.visible_faces == s_dict.visible_faces == {0: 7}
+    assert s_list.selectable_cells == s_dict.selectable_cells
+
+    # Tracker: pending flip clears only on authoritative progress.
+    mt6 = MemoryBoardTracker()
+    w = ts_window([(0, 7, False), (1, 0, False)], open_cells=())
+    snap, _ = mt6.observe(w, 1.0)
+    mt6.mark_pending_flip(0, snap)
+    assert mt6.has_pending_flip()
+    w.openCells = []
+    snap2, _ = mt6.observe(w, 2.0)
+    assert mt6.resolve_pending_flip(snap2, 2.0) is False
+    assert mt6.has_pending_flip()
+    w.openCells = [0]
+    snap3, _ = mt6.observe(w, 3.0)
+    assert mt6.resolve_pending_flip(snap3, 3.0) is True
+    assert not mt6.has_pending_flip()
+
+    # Controller lifecycle (observation only; no dispatch without the adapter).
+    controller_window = FakeMemoryWindow(
+        [MCard(0, 7, False), MCard(1, 0, False), MCard(2, 8, False), MCard(3, 0, False)])
+    controller_window.faceCount = 2
+    original_find = panel.FindRuntimeObject
+    panel.FindRuntimeObject = lambda name, methods: (
+        controller_window if name == "YinYangMemoryWindow" else None)
+
+    def reset_ts_controller():
+        panel.twin_souls_enabled = True
+        panel.twin_souls_next_poll = 0.0
+        panel.twin_souls_discover_at = 0.0
+        panel.twin_souls_window = None
+        panel.twin_souls_last_state = None
+        panel.twin_souls_last_board = None
+        panel.twin_souls_last_finished_board = None
+        panel.twin_souls_tracker = MemoryBoardTracker()
+        panel.twin_souls_adapter = MemoryActionAdapter()
+        panel.boss_enabled = False
+        panel.yinyang_duel_enabled = False
+
+    # Uninitialized limits prevent automatic spending.
+    reset_ts_controller()
+    controller_window.state = "idle"
+    controller_window.playsMax = 0
+    controller_window.playsMaxHwid = 0
+    controller_window.playsUsed = 0
+    controller_window.playsUsedHwid = 0
+    controller_window.openCells = []
+    controller_window.GetCooldownRemaining = lambda: 0.0
+    panel.PollTwinSouls(10.0)
+    assert "waiting for limits/state" in panel.twin_souls_label.text, panel.twin_souls_label.text
+
+    # An initialized daily limit disables the mode.
+    controller_window.playsMax = 2
+    controller_window.playsUsed = 2
+    controller_window.playsMaxHwid = 10
+    controller_window.playsUsedHwid = 0
+    reset_ts_controller()
+    panel.PollTwinSouls(11.0)
+    assert not panel.twin_souls_enabled
+    assert "daily limit 2/2" in panel.twin_souls_label.text, panel.twin_souls_label.text
+
+    # Cooldown blocks start.
+    controller_window.playsMax = 5
+    controller_window.playsUsed = 0
+    reset_ts_controller()
+    controller_window.GetCooldownRemaining = lambda: 42.0
+    panel.PollTwinSouls(12.0)
+    assert "cooldown 42s" in panel.twin_souls_label.text, panel.twin_souls_label.text
+    controller_window.GetCooldownRemaining = lambda: 0.0
+
+    # The unverified adapter issues no start (no pending, no dispatch).
+    reset_ts_controller()
+    assert not panel.twin_souls_adapter.is_verified()
+    panel.PollTwinSouls(13.0)
+    assert "waiting for verified background input" in panel.twin_souls_label.text, \
+        panel.twin_souls_label.text
+    assert not panel.twin_souls_tracker.has_pending_start()
+
+    # A verified adapter marks exactly one pending start for an idle board.
+    class VerifiedAdapter:
+        def is_verified(self):
+            return True
+    reset_ts_controller()
+    panel.twin_souls_adapter = VerifiedAdapter()
+    panel.PollTwinSouls(14.0)
+    assert panel.twin_souls_tracker.has_pending_start()
+
+    # openPending suppresses a duplicate start.
+    controller_window.openPending = True
+    panel.twin_souls_tracker.pending_start = False
+    panel.twin_souls_next_poll = 0.0
+    panel.twin_souls_window = None
+    panel.PollTwinSouls(15.0)
+    assert "start pending" in panel.twin_souls_label.text, panel.twin_souls_label.text
+    assert not panel.twin_souls_tracker.has_pending_start()
+    controller_window.openPending = False
+
+    # A finishing board never starts and performs no solver action.
+    controller_window.state = "finishing"
+    reset_ts_controller()
+    panel.twin_souls_adapter = VerifiedAdapter()
+    panel.PollTwinSouls(16.0)
+    assert "finished" in panel.twin_souls_label.text, panel.twin_souls_label.text
+    assert not panel.twin_souls_tracker.has_pending_start()
+
+    # An active playing board is solved and recorded, but not dispatched.
+    controller_window.state = "playing"
+    controller_window.openCells = [0]
+    reset_ts_controller()
+    panel.PollTwinSouls(17.0)
+    assert "background input unverified" in panel.twin_souls_label.text, \
+        panel.twin_souls_label.text
+
+    # Disable clears pending state and board memory.
+    panel.twin_souls_enabled = True
+    panel.twin_souls_tracker.mark_pending_start()
+    panel.twin_souls_tracker.mark_pending_flip(0, snap)
+    panel.ToggleTwinSouls()
+    assert not panel.twin_souls_enabled
+    assert not panel.twin_souls_tracker.has_pending_start()
+    assert panel.twin_souls_tracker.pending_flip is None
+
+    panel.FindRuntimeObject = original_find
+
     # NativeActionCoordinator: explicit state machine with phase + deadline.
     NativeActionCoordinator = duel_globals["NativeActionCoordinator"]
     phase_box = [5]
@@ -1119,5 +1477,4 @@ with tempfile.TemporaryDirectory() as directory:
     coord.dispatch(aid6)
     assert (coord.acknowledge(aid6, NativeActionCoordinator.UNKNOWN) ==
             NativeActionCoordinator.UNKNOWN)
-
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")

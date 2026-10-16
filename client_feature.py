@@ -33,7 +33,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 43
+FEATURE_VERSION = 44
 HUNTER_LIMIT = 5
 HUNTER_BURST_DELAY_MIN = 0.70
 HUNTER_BURST_DELAY_MAX = 2.50
@@ -78,6 +78,31 @@ YINYANG_DUEL_RESULT_CLOSE_DELAY = 1.5
 YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
 YINYANG_DUEL_HISTORY_JSONL = os.path.join(DIRECTORY, "yin_yang_duel_history.jsonl")
 YINYANG_DUEL_HISTORY_SCHEMA = 1
+
+# --- Twin Souls (YinYangMemory / Pexeso) ---
+# The client module `uiyinyangmemory` exposes YinYangMemoryWindow and MemoryCard.
+# The winning tactic is deterministic perfect memory: remember every
+# server-confirmed face, complete known pairs, otherwise reveal an unseen cell.
+# The client is authoritative; the controller only learns faces the client
+# reveals and waits for server/animation transitions before acting again.
+TWIN_SOULS_IDLE_POLL_SECONDS = 1.0
+TWIN_SOULS_ACTIVE_POLL_SECONDS = 0.15
+TWIN_SOULS_DISCOVERY_SECONDS = 1.0
+TWIN_SOULS_MIN_ACTION_GAP = 0.05
+TWIN_SOULS_ACK_TIMEOUT = 3.0
+TWIN_SOULS_ERROR_RETRY_SECONDS = 10.0
+TWIN_SOULS_HISTORY_JSONL = os.path.join(DIRECTORY, "twin_souls_history.jsonl")
+TWIN_SOULS_HISTORY_SCHEMA = 1
+
+TWIN_SOULS_STATE_IDLE = "idle"
+TWIN_SOULS_STATE_PLAYING = "playing"
+TWIN_SOULS_STATE_FINISHING = "finishing"
+TWIN_SOULS_STATE_UNKNOWN = "unknown"
+
+TWIN_SOULS_MODE_KNOWN_MATE = "known_mate"
+TWIN_SOULS_MODE_COMPLETE_PAIR = "complete_pair"
+TWIN_SOULS_MODE_EXPLORE = "explore"
+TWIN_SOULS_MODE_WAIT = "wait"
 
 BOSS_IDLE = "idle"
 BOSS_WAIT_TIMER = "wait_timer"
@@ -844,6 +869,537 @@ class DuelRoundTracker(object):
         self.pending = None
 
 
+# --- Twin Souls solver/tracker (pure, deterministic memory matching) ---
+# The controller reads the client and clicks; the solver and tracker below are
+# pure logic over primitive snapshots and fakeable window/card objects. No UI,
+# disk, timing, or network access lives in these classes.
+
+def enumerate_memory_cards(cards):
+    """Normalize list/tuple/dict-shaped `cards` into sorted (index, card) pairs.
+
+    Prefers a valid integer `card.index`; falls back to a numeric collection key
+    or position. Returns (pairs, ok, reason).
+    """
+    if cards is None:
+        return None, False, "no card collection"
+    if isinstance(cards, dict):
+        items = list(cards.items())
+    elif isinstance(cards, (list, tuple)):
+        items = list(enumerate(cards))
+    else:
+        return None, False, "unsupported card collection type"
+    pairs = []
+    seen = set()
+    for key, card in items:
+        index = None
+        try:
+            value = getattr(card, "index", None)
+            if isinstance(value, INTEGER_TYPES) and not isinstance(value, bool):
+                index = int(value)
+        except Exception:
+            index = None
+        if index is None:
+            if isinstance(key, INTEGER_TYPES) and not isinstance(key, bool):
+                index = int(key)
+        if index is None:
+            return None, False, "card without an integer index"
+        if index in seen:
+            return None, False, "duplicate card index %d" % index
+        seen.add(index)
+        pairs.append((index, card))
+    pairs.sort()
+    return pairs, True, None
+
+
+def normalize_memory_face(raw_face, visible):
+    """Return the face value when a card is proven revealed/matched, else None.
+
+    A face value of zero is preserved (it is not assumed to be the hidden
+    sentinel); visibility comes from the card/open state, not the face value.
+    """
+    if not visible:
+        return None
+    try:
+        return int(raw_face)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_memory_state(raw_state):
+    """Map a raw window.state value to a semantic Twin Souls state.
+
+    The client's numeric idle/playing/finish constants are not yet verified by a
+    diagnostic trace, so numeric states map to UNKNOWN instead of being guessed.
+    String states are matched conservatively. Pin the numeric mapping only after
+    a live observation establishes the constants (see DiagnosticTwinSouls).
+    """
+    if raw_state is None:
+        return TWIN_SOULS_STATE_UNKNOWN
+    if isinstance(raw_state, (str, unicode)):
+        lowered = raw_state.lower()
+        if "play" in lowered or "pick" in lowered or "turn" in lowered:
+            return TWIN_SOULS_STATE_PLAYING
+        if ("finish" in lowered or "result" in lowered or
+                "end" in lowered or "win" in lowered):
+            return TWIN_SOULS_STATE_FINISHING
+        if "idle" in lowered or "cooldown" in lowered or "wait" in lowered:
+            return TWIN_SOULS_STATE_IDLE
+        return TWIN_SOULS_STATE_UNKNOWN
+    return TWIN_SOULS_STATE_UNKNOWN
+
+
+def resolve_minigame_owner(duel_enabled, duel_owns, twin_souls_enabled,
+                           twin_souls_owns):
+    """Return the single minigame allowed to act this update cycle.
+
+    A controller with an active session or pending request (`*_owns`) keeps the
+    slot until it becomes idle/disabled; otherwise the deterministic priority
+    favours Yin Yang Duel.
+    """
+    if duel_owns:
+        return "duel"
+    if twin_souls_owns:
+        return "twin_souls"
+    if duel_enabled:
+        return "duel"
+    if twin_souls_enabled:
+        return "twin_souls"
+    return None
+
+
+def memory_known_closed_mate(knowledge, face, snapshot, excluding):
+    """Return the lowest closed/selectable unmatched mate of `face`, else None."""
+    if face is None:
+        return None
+    best = None
+    for cell in knowledge.unmatched_cells_by_face.get(face, ()):
+        if cell == excluding:
+            continue
+        if cell in snapshot.matched_cells:
+            continue
+        if cell in snapshot.open_cells:
+            continue
+        if cell not in snapshot.selectable_cells:
+            continue
+        if best is None or cell < best:
+            best = cell
+    return best
+
+
+def memory_unknown_closed_selectable(snapshot, knowledge, excluding=None):
+    """Return sorted unknown, unmatched, closed/selectable cell indices."""
+    result = []
+    for cell in snapshot.selectable_cells:
+        if cell in snapshot.matched_cells:
+            continue
+        if cell in snapshot.open_cells:
+            continue
+        if cell in knowledge.known_face_by_cell:
+            continue
+        if excluding is not None and cell == excluding:
+            continue
+        result.append(cell)
+    result.sort()
+    return result
+
+
+def memory_complete_known_pairs(knowledge, snapshot):
+    """Return sorted (face, first, second) tuples for complete closed pairs."""
+    pairs = []
+    for face, cells in knowledge.unmatched_cells_by_face.items():
+        closed = []
+        for cell in cells:
+            if cell in snapshot.matched_cells:
+                continue
+            if cell in snapshot.open_cells:
+                continue
+            if cell not in snapshot.selectable_cells:
+                continue
+            closed.append(cell)
+        if len(closed) >= 2:
+            closed.sort()
+            pairs.append((face, closed[0], closed[1]))
+    pairs.sort(key=lambda item: (item[1], item[2]))
+    return pairs
+
+
+class MemoryBoardSnapshot(object):
+    """Immutable-by-convention view of one coherent YinYangMemoryWindow read."""
+
+    __slots__ = ("board_id", "window_id", "state", "phase", "cell_count",
+                 "pair_count", "pairs_found", "time_remaining",
+                 "bonus_remaining", "awaiting_flip", "busy", "open_cells",
+                 "matched_cells", "visible_faces", "selectable_cells",
+                 "plays_used", "plays_max", "plays_used_hwid", "plays_max_hwid",
+                 "generation_signature")
+
+    def __init__(self, **kwargs):
+        for key in self.__slots__:
+            setattr(self, key, kwargs.get(key))
+
+    def observation_key(self):
+        return (self.state, self.phase, self.awaiting_flip, self.pairs_found,
+                self.open_cells, tuple(sorted(self.matched_cells)),
+                tuple(sorted(self.visible_faces.items())))
+
+
+class MemoryKnowledge(object):
+    """Primitive solver input: remembered faces and unmatched face indexes."""
+
+    __slots__ = ("known_face_by_cell", "unmatched_cells_by_face")
+
+    def __init__(self):
+        self.known_face_by_cell = {}
+        self.unmatched_cells_by_face = {}
+
+
+class MemorySolver(object):
+    """Deterministic perfect-memory card matcher. Pure function of snapshot."""
+
+    def choose_cell(self, snapshot, knowledge):
+        decision = {
+            "cell_index": None,
+            "mode": TWIN_SOULS_MODE_WAIT,
+            "face": None,
+            "mate_cell": None,
+            "known_pair_count": 0,
+            "unknown_cell_count": 0,
+            "reason": "",
+        }
+        pairs = memory_complete_known_pairs(knowledge, snapshot)
+        unknown = memory_unknown_closed_selectable(snapshot, knowledge)
+        decision["known_pair_count"] = len(pairs)
+        decision["unknown_cell_count"] = len(unknown)
+
+        if snapshot.state != TWIN_SOULS_STATE_PLAYING:
+            decision["reason"] = "not playing"
+            return decision
+        if snapshot.awaiting_flip or snapshot.busy:
+            decision["reason"] = "client busy"
+            return decision
+
+        open_unmatched = [c for c in snapshot.open_cells
+                          if c not in snapshot.matched_cells]
+        if len(open_unmatched) > 1:
+            decision["reason"] = "two cards resolving"
+            return decision
+
+        if len(open_unmatched) == 1:
+            first = open_unmatched[0]
+            face = knowledge.known_face_by_cell.get(first)
+            mate = memory_known_closed_mate(knowledge, face, snapshot,
+                                            excluding=first)
+            if mate is not None:
+                decision.update({"cell_index": mate,
+                                 "mode": TWIN_SOULS_MODE_KNOWN_MATE,
+                                 "face": face, "mate_cell": first,
+                                 "reason": "known mate of open card"})
+                return decision
+            if unknown:
+                decision.update({"cell_index": unknown[0],
+                                 "mode": TWIN_SOULS_MODE_EXPLORE,
+                                 "reason": "explore next to open card"})
+                return decision
+            decision["reason"] = "waiting for a legal second card"
+            return decision
+
+        if pairs:
+            face, first, second = pairs[0]
+            decision.update({"cell_index": first,
+                             "mode": TWIN_SOULS_MODE_COMPLETE_PAIR,
+                             "face": face, "mate_cell": second,
+                             "reason": "complete a known pair"})
+            return decision
+
+        if unknown:
+            decision.update({"cell_index": unknown[0],
+                             "mode": TWIN_SOULS_MODE_EXPLORE,
+                             "reason": "explore an unseen cell"})
+            return decision
+
+        decision["reason"] = "no stable selectable cell"
+        return decision
+
+
+class MemoryBoardTracker(object):
+    """Owns one board generation's learned faces, matches, and pending requests.
+
+    It converts the mutable runtime window into a MemoryBoardSnapshot, learns
+    faces only from authoritative (revealed/matched) observations, retains
+    mismatch faces after cards close, and clears knowledge on a confirmed new
+    board or window.
+    """
+
+    def __init__(self):
+        self.board_id = 0
+        self.window_identity = None
+        self.generation_signature = None
+        self.known_face_by_cell = {}
+        self.known_cells_by_face = {}
+        self.matched_cells = set()
+        self.last_open_cells = ()
+        self.last_pairs_found = None
+        self.last_state = None
+        self.last_observation_key = None
+        self.last_progress_time = 0.0
+        self.last_error = None
+        self.pending_flip = None
+        self.pending_start = False
+
+    def on_window(self, window):
+        identity = id(window)
+        if identity != self.window_identity:
+            self.board_id += 1
+            self.window_identity = identity
+            self._clear_knowledge()
+
+    def _clear_knowledge(self):
+        self.generation_signature = None
+        self.known_face_by_cell = {}
+        self.known_cells_by_face = {}
+        self.matched_cells = set()
+        self.last_open_cells = ()
+        self.last_pairs_found = None
+        self.last_state = None
+        self.last_observation_key = None
+        self.last_progress_time = 0.0
+        self.last_error = None
+        self.pending_flip = None
+        self.pending_start = False
+
+    @staticmethod
+    def _card_busy(card):
+        is_busy = getattr(card, "IsBusy", None)
+        if not callable(is_busy):
+            return False
+        try:
+            return bool(is_busy())
+        except Exception:
+            return True  # exceptions are treated as busy
+
+    @staticmethod
+    def _call_float(window, method_name):
+        method = getattr(window, method_name, None)
+        if not callable(method):
+            return None
+        try:
+            value = method()
+        except Exception:
+            return None
+        if isinstance(value, (tuple, list)):
+            value = value[0] if value else None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_open_cells(window, pairs):
+        open_cells = getattr(window, "openCells", None)
+        if not open_cells:
+            return ()
+        card_by_id = dict((id(card), index) for index, card in pairs)
+        result = set()
+        if isinstance(open_cells, dict):
+            items = list(open_cells.keys())
+        else:
+            items = list(open_cells)
+        for item in items:
+            if isinstance(item, INTEGER_TYPES) and not isinstance(item, bool):
+                result.add(int(item))
+            else:
+                index = card_by_id.get(id(item))
+                if index is not None:
+                    result.add(index)
+        return tuple(sorted(result))
+
+    def build_snapshot(self, window, now):
+        cards = getattr(window, "cards", None)
+        pairs, ok, reason = enumerate_memory_cards(cards)
+        if not ok:
+            return None, reason
+        state = classify_memory_state(getattr(window, "state", None))
+        phase = getattr(window, "phase", None)
+        cell_count = len(pairs)
+        pair_count = int(getattr(window, "faceCount", 0) or 0)
+        if pair_count <= 0:
+            pair_count = cell_count // 2
+        pairs_found = int(getattr(window, "pairsFound", 0) or 0)
+        awaiting_flip = bool(getattr(window, "awaitingFlip", False))
+
+        open_cells = self._normalize_open_cells(window, pairs)
+        open_set = set(open_cells)
+        matched = set()
+        visible_faces = {}
+        busy_cells = []
+        for index, card in pairs:
+            card_matched = bool(getattr(card, "matched", False))
+            if card_matched:
+                matched.add(index)
+            card_busy = self._card_busy(card)
+            busy_cells.append(card_busy)
+            face = normalize_memory_face(
+                getattr(card, "face", None),
+                (index in open_set) or card_matched)
+            if face is not None:
+                visible_faces[index] = face
+
+        selectable = []
+        for index, card in pairs:
+            if index in matched or index in open_set:
+                continue
+            if self._card_busy(card):
+                continue
+            selectable.append(index)
+        selectable.sort()
+
+        busy = awaiting_flip or any(busy_cells)
+        generation_signature = tuple(id(card) for _, card in pairs)
+
+        return MemoryBoardSnapshot(
+            board_id=self.board_id,
+            window_id=self.window_identity,
+            state=state,
+            phase=phase,
+            cell_count=cell_count,
+            pair_count=pair_count,
+            pairs_found=pairs_found,
+            time_remaining=self._call_float(window, "GetTimeRemaining"),
+            bonus_remaining=self._call_float(window, "GetBonusRemaining"),
+            awaiting_flip=awaiting_flip,
+            busy=busy,
+            open_cells=open_cells,
+            matched_cells=frozenset(matched),
+            visible_faces=dict(visible_faces),
+            selectable_cells=tuple(selectable),
+            plays_used=int(getattr(window, "playsUsed", 0) or 0),
+            plays_max=int(getattr(window, "playsMax", 0) or 0),
+            plays_used_hwid=int(getattr(window, "playsUsedHwid", 0) or 0),
+            plays_max_hwid=int(getattr(window, "playsMaxHwid", 0) or 0),
+            generation_signature=generation_signature,
+        ), None
+
+    def _detect_reset(self, snapshot):
+        if self.generation_signature is None:
+            return False
+        if snapshot.generation_signature != self.generation_signature:
+            return True
+        if (self.last_pairs_found is not None and
+                snapshot.pairs_found < self.last_pairs_found):
+            return True
+        return False
+
+    def _reset_board(self):
+        self.board_id += 1
+        self._clear_knowledge()
+
+    def _learn(self, snapshot, now):
+        if snapshot.observation_key() != self.last_observation_key:
+            self.last_observation_key = snapshot.observation_key()
+            self.last_progress_time = now
+        for cell, face in snapshot.visible_faces.items():
+            previous = self.known_face_by_cell.get(cell)
+            if previous is not None and previous != face:
+                self.last_error = ("contradictory face at cell %d (%s vs %s)" %
+                                   (cell, previous, face))
+                continue
+            self.known_face_by_cell[cell] = face
+            if cell not in snapshot.matched_cells:
+                self.known_cells_by_face.setdefault(face, set()).add(cell)
+        for cell in snapshot.matched_cells:
+            self.matched_cells.add(cell)
+            face = self.known_face_by_cell.get(cell)
+            if face is not None:
+                bucket = self.known_cells_by_face.get(face)
+                if bucket is not None:
+                    bucket.discard(cell)
+        self.last_open_cells = snapshot.open_cells
+        self.last_pairs_found = snapshot.pairs_found
+        self.last_state = snapshot.state
+        self.generation_signature = snapshot.generation_signature
+
+    def observe(self, window, now):
+        self.on_window(window)
+        snapshot, error = self.build_snapshot(window, now)
+        if snapshot is None:
+            self.last_error = error
+            return None, error
+        if self._detect_reset(snapshot):
+            self._reset_board()
+            # Rebuild with the corrected board id/generation.
+            snapshot, error = self.build_snapshot(window, now)
+            if snapshot is None:
+                self.last_error = error
+                return None, error
+        self._learn(snapshot, now)
+        return snapshot, None
+
+    def knowledge(self):
+        result = MemoryKnowledge()
+        result.known_face_by_cell = dict(self.known_face_by_cell)
+        result.unmatched_cells_by_face = dict(
+            (face, set(cells))
+            for face, cells in self.known_cells_by_face.items())
+        return result
+
+    # --- pending flip / start ---
+
+    def mark_pending_flip(self, cell, snapshot):
+        self.pending_flip = {
+            "board_id": snapshot.board_id,
+            "cell": cell,
+            "request_time": time.time(),
+            "observation_key": snapshot.observation_key(),
+        }
+
+    def has_pending_flip(self):
+        return self.pending_flip is not None
+
+    def resolve_pending_flip(self, snapshot, now):
+        pending = self.pending_flip
+        if pending is None:
+            return False
+        if pending["board_id"] != snapshot.board_id:
+            self.pending_flip = None
+            return True
+        cell = pending["cell"]
+        if cell in snapshot.open_cells:
+            self.pending_flip = None
+            return True
+        if snapshot.observation_key() != pending["observation_key"]:
+            self.pending_flip = None
+            return True
+        if snapshot.state != TWIN_SOULS_STATE_PLAYING:
+            self.pending_flip = None
+            return True
+        return False
+
+    def mark_pending_start(self):
+        self.pending_start = True
+
+    def has_pending_start(self):
+        return self.pending_start
+
+    def clear_pending_start(self):
+        self.pending_start = False
+
+
+class MemoryActionAdapter(object):
+    """Dispatch boundary for Twin Souls UI actions.
+
+    The background-input feasibility gate (INPUT_RECORDER_IMPLEMENTATION_PLAN)
+    has not been verified, so this adapter reports UNAVAILABLE and performs no
+    dispatch. When a verified route exists, wire dispatch_start/dispatch_flip to
+    reach the client handlers exactly once; the controller must never call the
+    handlers itself.
+    """
+
+    def is_verified(self):
+        return False
+
+
 def disk_log(message):
     now = time.time()
     whole = int(now)
@@ -1100,7 +1656,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
         self.AddFlag("movable")
         self.AddFlag("float")
-        self.SetSize(820, 520)
+        self.SetSize(820, 555)
         self.SetPosition(40, 80)
         self.SetTitleName("Metin Radius Scanner")
         self.SetCloseEvent(self.MinimizePanel)
@@ -1173,6 +1729,18 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_tracker = DuelRoundTracker()
         self.yinyang_duel_last_scores = None
         self.yinyang_duel_last_state = None
+        self.twin_souls_enabled = False
+        self.twin_souls_window = None
+        self.twin_souls_next_poll = 0.0
+        self.twin_souls_discover_at = 0.0
+        self.twin_souls_last_error = None
+        self.twin_souls_last_status = None
+        self.twin_souls_last_state = None
+        self.twin_souls_last_board = None
+        self.twin_souls_last_finished_board = None
+        self.twin_souls_tracker = MemoryBoardTracker()
+        self.twin_souls_solver = MemorySolver()
+        self.twin_souls_adapter = MemoryActionAdapter()
         self.yinyang_duel_result_closed = True
         self.yinyang_duel_result_close_at = 0.0
         self.player_next_poll = 0.0
@@ -1290,6 +1858,9 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_title = make_text(self, 15, 466, "Yin Yang Duel")
         self.yinyang_duel_button = make_button(self, 110, "OFF", self.ToggleYinYangDuel, 461)
         self.yinyang_duel_label = make_text(self, 205, 466, "Plays the Yin Yang Duel minigame")
+        self.twin_souls_title = make_text(self, 15, 499, "Twin Souls")
+        self.twin_souls_button = make_button(self, 110, "OFF", self.ToggleTwinSouls, 494)
+        self.twin_souls_label = make_text(self, 205, 499, "Plays the Twin Souls memory minigame")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
         self.queue_admission_guard = get_metin_queue_admission_guard()
@@ -2239,6 +2810,378 @@ class MetinScanner(ui.BoardWithTitleBar):
             if problem != self.yinyang_duel_last_error:
                 self.AddLine("Yin Yang Duel error: %s" % problem)
                 self.yinyang_duel_last_error = problem
+
+    # --- Twin Souls controller ---
+
+    def ToggleTwinSouls(self):
+        self.twin_souls_enabled = not self.twin_souls_enabled
+        self.twin_souls_button.SetText("ON" if self.twin_souls_enabled else "OFF")
+        self.twin_souls_next_poll = 0.0
+        self.twin_souls_discover_at = 0.0
+        self.twin_souls_last_error = None
+        self.twin_souls_last_status = None
+        self.twin_souls_last_state = None
+        self.twin_souls_last_board = None
+        self.twin_souls_last_finished_board = None
+        if self.twin_souls_enabled:
+            if not self.running:
+                self.Start()
+                if not self.running:
+                    self.twin_souls_enabled = False
+                    self.twin_souls_button.SetText("OFF")
+                    self.twin_souls_label.SetText(
+                        "Twin Souls: enter the game world first")
+                    return
+            self.twin_souls_label.SetText("Twin Souls: probing runtime")
+            self.AddLine("Twin Souls ON")
+            self.DiagnosticTwinSouls()
+        else:
+            self._TwinSoulsRelease()
+            self.twin_souls_label.SetText("Twin Souls off")
+            self.AddLine("Twin Souls OFF")
+
+    def _TwinSoulsRelease(self):
+        self.twin_souls_window = None
+        tracker = self.twin_souls_tracker
+        tracker.pending_flip = None
+        tracker.pending_start = False
+
+    def _TwinSoulsFromInterface(self):
+        interface = getattr(__main__, "interface", None)
+        getter = getattr(interface, "GetYinYangMemoryWnd", None)
+        if not callable(getter):
+            return None
+        try:
+            window = getter()
+        except Exception:
+            return None
+        if window is not None and type(window).__name__ == "YinYangMemoryWindow":
+            return window
+        return None
+
+    def _TwinSoulsDiscover(self, now):
+        if now < self.twin_souls_discover_at and self.twin_souls_window is not None:
+            return self.twin_souls_window
+        self.twin_souls_discover_at = now + TWIN_SOULS_DISCOVERY_SECONDS
+        window = self._TwinSoulsFromInterface()
+        if window is None:
+            window = self.FindRuntimeObject("YinYangMemoryWindow", ())
+        if window is not None:
+            self.twin_souls_window = window
+        return window
+
+    def DiagnosticTwinSouls(self):
+        """Dump the YinYangMemoryWindow runtime API so the minigame can be
+        driven once the runtime shapes are confirmed. Read-only and bounded."""
+        window = self._TwinSoulsFromInterface()
+        if window is None:
+            window = self.FindRuntimeObject("YinYangMemoryWindow", ())
+        if window is None:
+            self.AddLine("YinYangMemoryWindow not found in runtime objects")
+            return
+        self.AddLine("YinYangMemoryWindow type=%s" % ascii_text(type(window).__name__))
+        for name in ("state", "enabled", "opened", "hasState", "isLoaded",
+                     "faceCount", "pairsFound", "awaitingFlip",
+                     "playsUsed", "playsMax", "playsUsedHwid", "playsMaxHwid",
+                     "timeLimitSec", "timeLeftSec", "cooldownSec",
+                     "openPending", "openCells", "openFaces"):
+            try:
+                value = getattr(window, name, None)
+                self.AddLine("  memory %s = %s" %
+                             (name, ascii_text(repr(value))[:140]))
+            except Exception as exc:
+                self.AddLine("  memory %s error: %s" % (name, exc))
+        for label, method in (("cooldown", "GetCooldownRemaining"),
+                              ("time", "GetTimeRemaining"),
+                              ("bonus", "GetBonusRemaining")):
+            try:
+                func = getattr(window, method, None)
+                if callable(func):
+                    self.AddLine("  memory %s remaining = %s" %
+                                 (label, ascii_text(repr(func()))))
+                else:
+                    self.AddLine("  memory %s remaining: method missing" % label)
+            except Exception as exc:
+                self.AddLine("  memory %s remaining error: %s" % (label, exc))
+        cards = getattr(window, "cards", None)
+        if cards is None:
+            self.AddLine("  memory cards: (none)")
+        else:
+            try:
+                self.AddLine("  memory cards type=%s len=%s" %
+                             (ascii_text(type(cards).__name__), len(cards)))
+                if isinstance(cards, dict):
+                    keys = list(cards.keys())[:12]
+                    sample = cards[keys[0]] if keys else None
+                    self.AddLine("  memory card keys = %s" % ascii_text(repr(keys)))
+                else:
+                    sample = cards[0] if len(cards) else None
+                    self.AddLine("  memory card indices = %s" %
+                                 ascii_text(repr(list(range(len(cards)))[:12])))
+                if sample is not None:
+                    self.AddLine("  memory card type=%s" %
+                                 ascii_text(type(sample).__name__))
+                    self.AddLine("  memory card dict=%s" %
+                                 ascii_text(repr(getattr(sample, "__dict__", {}))[:240]))
+                    for name in dir(sample):
+                        if not name.startswith("__"):
+                            self.AddLine("    card attr %s" % name)
+            except Exception as exc:
+                self.AddLine("  memory card dump error: %s" % exc)
+
+    def _TwinSoulsCooldownRemaining(self, window):
+        get_cd = getattr(window, "GetCooldownRemaining", None)
+        if callable(get_cd):
+            try:
+                value = get_cd()
+                if isinstance(value, (tuple, list)):
+                    value = value[0] if value else 0
+                return float(value)
+            except Exception:
+                pass
+        return 0.0
+
+    def _TwinSoulsLimitReached(self, snapshot):
+        if snapshot.plays_max > 0 and snapshot.plays_used >= snapshot.plays_max:
+            return ("daily", snapshot.plays_used, snapshot.plays_max)
+        if (snapshot.plays_max_hwid > 0 and
+                snapshot.plays_used_hwid >= snapshot.plays_max_hwid):
+            return ("HWID", snapshot.plays_used_hwid, snapshot.plays_max_hwid)
+        return None
+
+    def _TwinSoulsDisableForLimit(self, reached):
+        kind, used, maximum = reached
+        self.twin_souls_enabled = False
+        self.twin_souls_button.SetText("OFF")
+        self._TwinSoulsRelease()
+        self.twin_souls_label.SetText("Twin Souls: %s limit %d/%d" %
+                                      (kind, used, maximum))
+        self.AddLine("Twin Souls stopped: %s limit reached (%d/%d)" %
+                     (kind, used, maximum))
+        self._TwinSoulsRecordEvent({"event": "controller_error",
+                                    "reason": "%s_limit_reached" % kind.lower(),
+                                    "used": used, "maximum": maximum})
+
+    def _TwinSoulsStatus(self, message):
+        text = "Twin Souls: %s" % message
+        if text != self.twin_souls_last_status:
+            self.twin_souls_last_status = text
+            self.twin_souls_label.SetText(text)
+
+    def _TwinSoulsDebugLog(self, message):
+        if message != self.twin_souls_last_error:
+            self.twin_souls_last_error = message
+            self.AddLine(message)
+
+    def _TwinSoulsRecordEvent(self, event):
+        try:
+            event = dict(event)
+            event.setdefault("schema", TWIN_SOULS_HISTORY_SCHEMA)
+            event.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S",
+                                                 time.localtime()))
+            event.setdefault("feature_version", FEATURE_VERSION)
+            line = json.dumps(event, sort_keys=True)
+            if sys.version_info[0] == 2:
+                data = line + "\n"
+            else:
+                data = line.encode("ascii") + b"\n"
+            fd = os.open(TWIN_SOULS_HISTORY_JSONL,
+                         os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+            try:
+                offset = 0
+                while offset < len(data):
+                    written = os.write(fd, data[offset:])
+                    if written <= 0:
+                        break
+                    offset += written
+            finally:
+                os.close(fd)
+        except Exception as exc:
+            self._TwinSoulsDebugLog("Twin Souls: history write error %s" %
+                                    ascii_text(exc))
+
+    def _DuelOwnsSlot(self):
+        if not self.yinyang_duel_enabled:
+            return False
+        window = self.FindRuntimeObject("YinYangDuelWindow", ())
+        if window is None:
+            return False
+        return getattr(window, "state", None) in (2, 3, 4)
+
+    def _TwinSoulsArbiterOwner(self):
+        duel_owns = self._DuelOwnsSlot()
+        twin_owns = (self.twin_souls_tracker.has_pending_flip() or
+                     self.twin_souls_tracker.has_pending_start())
+        return resolve_minigame_owner(self.yinyang_duel_enabled, duel_owns,
+                                      self.twin_souls_enabled, twin_owns)
+
+    def _TwinSoulsSummary(self, snapshot):
+        if snapshot.time_remaining is not None:
+            return "%d/%d pairs, %ds left" % (snapshot.pairs_found,
+                                              snapshot.pair_count,
+                                              int(snapshot.time_remaining))
+        return "%d/%d pairs" % (snapshot.pairs_found, snapshot.pair_count)
+
+    def _TwinSoulsDecisionEvent(self, snapshot, knowledge, decision):
+        return {
+            "event": "decision",
+            "dispatched": 0,
+            "board_id": snapshot.board_id,
+            "state": snapshot.state,
+            "phase": snapshot.phase,
+            "pairs_found": snapshot.pairs_found,
+            "cell_count": snapshot.cell_count,
+            "open_cells": list(snapshot.open_cells),
+            "matched_cells": sorted(snapshot.matched_cells),
+            "known_face_count": len(knowledge.known_face_by_cell),
+            "known_pair_count": decision["known_pair_count"],
+            "unknown_count": decision["unknown_cell_count"],
+            "selected_cell": decision["cell_index"],
+            "selected_known_face": decision["face"],
+            "expected_mate": decision["mate_cell"],
+            "decision_mode": decision["mode"],
+            "time_remaining": snapshot.time_remaining,
+            "bonus_remaining": snapshot.bonus_remaining,
+            "plays_used": snapshot.plays_used,
+            "plays_max": snapshot.plays_max,
+            "plays_used_hwid": snapshot.plays_used_hwid,
+            "plays_max_hwid": snapshot.plays_max_hwid,
+        }
+
+    def _TwinSoulsHandlePlaying(self, window, snapshot, now):
+        tracker = self.twin_souls_tracker
+        if snapshot.board_id != self.twin_souls_last_board:
+            self.twin_souls_last_board = snapshot.board_id
+            self._TwinSoulsRecordEvent({"event": "board_start",
+                                        "board_id": snapshot.board_id,
+                                        "cell_count": snapshot.cell_count,
+                                        "pair_count": snapshot.pair_count})
+        tracker.resolve_pending_flip(snapshot, now)
+        if tracker.has_pending_flip():
+            self._TwinSoulsStatus("waiting for reveal")
+            return
+        if snapshot.awaiting_flip or snapshot.busy:
+            self._TwinSoulsStatus("waiting for animation")
+            return
+        knowledge = tracker.knowledge()
+        decision = self.twin_souls_solver.choose_cell(snapshot, knowledge)
+        if decision["cell_index"] is None:
+            self._TwinSoulsStatus("%s (%s)" % (self._TwinSoulsSummary(snapshot),
+                                               decision["reason"]))
+            return
+        self._TwinSoulsRecordEvent(
+            self._TwinSoulsDecisionEvent(snapshot, knowledge, decision))
+        if not self.twin_souls_adapter.is_verified():
+            self._TwinSoulsStatus(
+                "%s; next cell %d (%s) - background input unverified" %
+                (self._TwinSoulsSummary(snapshot), decision["cell_index"],
+                 decision["mode"]))
+            return
+        # Adapter verified: dispatch a card action exactly once.
+        card = self._TwinSoulsResolveCell(window, snapshot,
+                                          decision["cell_index"])
+        if card is None:
+            self._TwinSoulsStatus("chosen cell unavailable; revalidating")
+            return
+        tracker.mark_pending_flip(decision["cell_index"], snapshot)
+        # NOTE: dispatch through the verified adapter here; never call
+        # card.OnMouseLeftButtonDown() directly.
+
+    def _TwinSoulsResolveCell(self, window, snapshot, cell):
+        if window is None:
+            return None
+        cards = getattr(window, "cards", None)
+        pairs, ok, _reason = enumerate_memory_cards(cards)
+        if not ok:
+            return None
+        for index, card in pairs:
+            if index == cell:
+                return card
+        return None
+
+    def _TwinSoulsHandleFinishing(self, snapshot):
+        if (snapshot.board_id == self.twin_souls_last_board and
+                self.twin_souls_last_board != self.twin_souls_last_finished_board):
+            self.twin_souls_last_finished_board = snapshot.board_id
+            self._TwinSoulsRecordEvent({"event": "board_finish",
+                                        "board_id": snapshot.board_id,
+                                        "pairs_found": snapshot.pairs_found,
+                                        "pair_count": snapshot.pair_count})
+            self.AddLine("Twin Souls: board finished (%d/%d pairs)" %
+                         (snapshot.pairs_found, snapshot.pair_count))
+        self._TwinSoulsStatus("finished; waiting for idle/cooldown")
+
+    def _TwinSoulsHandleIdle(self, window, snapshot):
+        cooldown = self._TwinSoulsCooldownRemaining(window)
+        if cooldown > 0:
+            self._TwinSoulsStatus("cooldown %ds (%d/%d daily, %d/%d HWID)" %
+                                  (int(cooldown), snapshot.plays_used,
+                                   snapshot.plays_max, snapshot.plays_used_hwid,
+                                   snapshot.plays_max_hwid))
+            return
+        if snapshot.plays_max <= 0 and snapshot.plays_max_hwid <= 0:
+            self._TwinSoulsStatus("waiting for limits/state")
+            return
+        if not self.twin_souls_adapter.is_verified():
+            self._TwinSoulsStatus("idle; waiting for verified background input")
+            return
+        if (self.twin_souls_tracker.has_pending_start() or
+                bool(getattr(window, "openPending", False))):
+            self._TwinSoulsStatus("start pending")
+            return
+        # Adapter verified and all gates passed: dispatch one start here; never
+        # call _YinYangMemoryWindow__OnStartClicked() directly.
+        self.twin_souls_tracker.mark_pending_start()
+
+    def PollTwinSouls(self, now):
+        if not self.twin_souls_enabled:
+            return
+        if self.boss_enabled and self.boss_state in BOSS_SWEEP_BUSY_STATES:
+            self._TwinSoulsStatus("waiting for Boss Sweep")
+            return
+        if now < self.twin_souls_next_poll:
+            return
+        if self.twin_souls_last_state in (TWIN_SOULS_STATE_PLAYING,
+                                          TWIN_SOULS_STATE_FINISHING):
+            interval = TWIN_SOULS_ACTIVE_POLL_SECONDS
+        else:
+            interval = TWIN_SOULS_IDLE_POLL_SECONDS
+        self.twin_souls_next_poll = now + interval
+        try:
+            window = self._TwinSoulsDiscover(now)
+            if window is None:
+                self._TwinSoulsStatus("finding window")
+                return
+            snapshot, error = self.twin_souls_tracker.observe(window, now)
+            if snapshot is None:
+                self._TwinSoulsStatus("waiting for state: %s" % (error or "unreadable"))
+                return
+            self.twin_souls_last_state = snapshot.state
+            reached = self._TwinSoulsLimitReached(snapshot)
+            if reached:
+                self._TwinSoulsDisableForLimit(reached)
+                return
+            owner = self._TwinSoulsArbiterOwner()
+            if owner != "twin_souls":
+                if owner == "duel":
+                    self._TwinSoulsStatus("waiting for Yin Yang Duel")
+                else:
+                    self._TwinSoulsStatus("waiting for minigame slot")
+                return
+            if snapshot.state == TWIN_SOULS_STATE_FINISHING:
+                self._TwinSoulsHandleFinishing(snapshot)
+                return
+            if snapshot.state == TWIN_SOULS_STATE_PLAYING:
+                self._TwinSoulsHandlePlaying(window, snapshot, now)
+                return
+            self._TwinSoulsHandleIdle(window, snapshot)
+        except Exception as exc:
+            problem = ascii_text(exc)
+            if problem != self.twin_souls_last_error:
+                self.AddLine("Twin Souls error: %s" % problem)
+                self.twin_souls_last_error = problem
+            self.twin_souls_next_poll = now + TWIN_SOULS_ERROR_RETRY_SECONDS
+            self._TwinSoulsStatus("error; retrying")
 
     def ReadBossTimer(self):
         if self.boss_timer is None:
@@ -3233,6 +4176,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.last_radius_error = problem
         self.UpdateBossSweep(now, player_position)
         self.PollYinYangDuel(now)
+        self.PollTwinSouls(now)
         if now >= self.next_scan:
             try:
                 if player_position is None:
