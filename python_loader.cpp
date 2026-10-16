@@ -115,8 +115,10 @@ static void LogQueueInputState(int vid) {
         } else {
             unsigned bg = 0;
             __try {
-                bg = static_cast<unsigned>(
-                    *reinterpret_cast<BYTE*>(g_game_base + RVA_APP_GLOBAL + 0x20));
+                BYTE* app = *reinterpret_cast<BYTE**>(g_game_base + RVA_APP_GLOBAL);
+                if (app) {
+                    bg = static_cast<unsigned>(app[0x20]);
+                }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
             sprintf_s(line,

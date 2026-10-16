@@ -8,6 +8,14 @@ This is a **continuation** handover. The original handover is
 `handovers/HANDOVER_INPUT_RECORDER_LOGOUT.md`; the static-analysis notes are
 `INPUT_RECORDER_BACKGROUND_PATH_PHASE1.md` (both in the repo).
 
+> **Read this first.** An independent review of the release-2 logout exists at
+> `decomp/LOGOUT_RELEASE2_REVIEW_20261016.md` (in the separate `decomp` tree, not
+> this repo). It found several defects that **supersede** parts of this handover;
+> see §8. The two most important: (a) the new dispatch can **silently fall back**
+> to the old picker-override route when the projection fails, so "queue adds
+> succeeded" does **not** prove the new route ran; (b) the `bg=` diagnostic added
+> in `3e4069e` has a **pointer bug** and would report the wrong byte.
+
 ---
 
 ## 1. TL;DR for the next chat
@@ -134,3 +142,47 @@ Files:
 - Not resolved: the **logout** — it still happens, and the leading hypothesis
   (button state) is untested because the diagnostic release wasn't used.
 - The server's actual comparison rule remains **unknown**; do not promise a cure.
+
+---
+
+## 8. Release-2 review (supersedes parts of §2–§7)
+
+`decomp/LOGOUT_RELEASE2_REVIEW_20261016.md` (decomp tree) reviewed `release (2)`
+and, via offline reproduction, found these defects. They are more authoritative
+than the earlier parts of this handover where they disagree.
+
+1. **The new route can silently become the old route.** `_queue_add` falls back
+   to `player.MetinQueueAdd(vid)` (old picker-override path) when the projection
+   is missing, negative, or raises; the try/except also covers the dispatch call
+   itself. `player.GetProjectPosition` (`1403fa410`) resolves its argument via
+   `1403e2dc0(DAT_147a6b8e8, id)`, whereas the queue wrapper resolves the actor
+   via `1403d1d40` (a different manager) — so the projection may return
+   (-100,-100) for Metin VIDs and trigger the fallback. **Therefore the "Queued"
+   lines in §3 do not prove the new dispatch ran**; they may all have been the old
+   route. This is the single most important correction.
+2. **The `bg=` diagnostic in `3e4069e` has a pointer bug.** It reads
+   `*(base + 0x07A734C0 + 0x20)` (a byte near the pointer slot) instead of
+   dereferencing the app pointer at `0x07A734C0` first and then `+0x20`. Fix it
+   before relying on any new `bg` log; it was not in the failed release anyway.
+3. **Dispatch lacks completion/cleanup.** `DispatchClickAt` ignores the down/up
+   return values and has no finally-based release/cancel on exception; the
+   legacy `pressed=true` is set after the press call, so a fault between press
+   and the flag leaves `pressed=false` and skips release. No re-entrancy check
+   that the current thread is the game/window thread.
+4. **Python defeats the stronger ack.** `FeedMetinQueue` uses
+   `if result == 1 or new_size > size`, so UNKNOWN/REJECTED plus unrelated queue
+   growth reads as success. `_dispatch_native_add` calls `coordinator.finish`
+   on UNKNOWN (deleting the unresolved action) and converts exceptions to 0;
+   `validate()` returns a truthy string `"rejected"` that `if not validate(...)`
+   does not reject.
+5. **Tests/logging miss the route.** The local tests provide no
+   `GetProjectPosition`, so they exercise the fallback, not the 3-arg dispatch;
+   the DLL logs recorder state but not route selection, projection result,
+   requested/picked VID, button state, or raw result.
+
+The review's next step: fix the dispatch/acknowledgement contracts and add
+bounded route diagnostics; first establish whether `GetProjectPosition` accepts
+the real target identity and whether hit-testing selects that same VID. Do not
+silently fall back to the old path on verification failure. A fresh-process
+live control should start with automation OFF and observation-only diagnostics,
+then one narrowly scoped background action, then Hunter-only.
