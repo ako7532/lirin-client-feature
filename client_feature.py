@@ -74,6 +74,7 @@ BOSS_RETURN_DISTANCE = 120
 BOSS_RETURN_STALL_SECONDS = 3.0
 BOSS_RETURN_PROGRESS_DISTANCE = 25
 YINYANG_DUEL_POLL_SECONDS = 1.0
+YINYANG_DUEL_RESULT_CLOSE_DELAY = 1.5
 YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
 YINYANG_DUEL_HISTORY_JSONL = os.path.join(DIRECTORY, "yin_yang_duel_history.jsonl")
 YINYANG_DUEL_HISTORY_SCHEMA = 1
@@ -1166,6 +1167,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.yinyang_duel_tracker = DuelRoundTracker()
         self.yinyang_duel_last_scores = None
         self.yinyang_duel_last_state = None
+        self.yinyang_duel_result_closed = True
+        self.yinyang_duel_result_close_at = 0.0
         self.player_next_poll = 0.0
         self.last_player_position = None
         self.gameplay_phase = None
@@ -2080,6 +2083,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             pass
         return False
 
+    def _DuelCloseResult(self, window):
+        """Dismiss the end-of-duel result screen via its continue button."""
+        continue_btn = getattr(window, "_YinYangDuelWindow__OnResultContinue", None)
+        if not callable(continue_btn):
+            return False
+        try:
+            continue_btn()
+            self.yinyang_duel_label.SetText("Yin Yang Duel: result dismissed")
+            return True
+        except Exception:
+            return False
+
     def _DuelEnsureStarted(self, window, state):
         if self._DuelEnsureVisible(window):
             self.yinyang_duel_label.SetText("Yin Yang Duel: opening window")
@@ -2174,6 +2189,11 @@ class MetinScanner(ui.BoardWithTitleBar):
                         "opponent_score": opp_score,
                         "outcome": final_outcome,
                     })
+                    # Schedule dismissal of the end-of-duel result screen once
+                    # its short reveal animation has had time to appear.
+                    self.yinyang_duel_result_closed = False
+                    self.yinyang_duel_result_close_at = (
+                        now + YINYANG_DUEL_RESULT_CLOSE_DELAY)
             self.yinyang_duel_last_state = state
             # Clear the pending click once state leaves the pickable round.
             if state != 2 or round_num != tracker.last_round:
@@ -2194,6 +2214,11 @@ class MetinScanner(ui.BoardWithTitleBar):
             # an active duel (state 2/3/4) GetCooldownRemaining reports the
             # countdown to the next duel, which must not be shown as a stall.
             if state == 0:
+                # Dismiss the end-of-duel result screen once it has shown.
+                if (not self.yinyang_duel_result_closed and
+                        now >= self.yinyang_duel_result_close_at):
+                    if self._DuelCloseResult(window):
+                        self.yinyang_duel_result_closed = True
                 cooldown = self._DuelCooldownRemaining(window)
                 if cooldown > 0:
                     self.yinyang_duel_label.SetText(
