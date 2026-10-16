@@ -127,13 +127,15 @@ def add_metin(vid):
     if vid == 0:
         # The native wrapper's bare-click sentinel (emit_synthetic_click): no
         # queue change, mirrors the real VID-0 click-only path.
-        return True
+        return 1
     if vid in queue:
-        return True
+        # Already present; the wrapper reports a distinct code and does not
+        # dispatch a click (which the native path could turn into a removal).
+        return 2
     if len(queue) >= queue_state["max_size"]:
-        return False
+        return 0
     queue.append(vid)
-    return True
+    return 1
 player.MetinQueueAdd = add_metin
 player.MetinQueueClear = clear_metin_queue
 player.AddMetinQueueAllowedRace = lambda vnum: allowed_queue_races.add(int(vnum))

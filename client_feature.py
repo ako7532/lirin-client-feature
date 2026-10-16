@@ -125,6 +125,34 @@ def emit_synthetic_click():
         pass
 
 
+# Vertical offset (game units) added to a target's world position when
+# projecting it to client pixels for the full-dispatch click.  The entity's
+# world position is its base, so this lifts the click point into its visible
+# body and off the ground plane.  Tunable after a live test.
+PROJECT_CLICK_HEIGHT = 100
+
+
+def _queue_add(vid):
+    """Add a VID through the native queue wrapper.  When the client exposes the
+    forward projection (player.GetProjectPosition) and the target projects on
+    screen, pass the projected client-pixel coordinates so the wrapper can
+    reproduce the full WndProc mouse-down/up dispatch instead of forcing the
+    picker.  Otherwise fall back to the single-argument binding."""
+    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
+        return player.MetinQueueAdd(vid)
+    project = getattr(player, "GetProjectPosition", None)
+    if callable(project):
+        try:
+            projected = project(vid, PROJECT_CLICK_HEIGHT)
+            x = int(projected[0])
+            y = int(projected[1])
+            if x >= 0 and y >= 0:
+                return player.MetinQueueAdd(vid, x, y)
+        except Exception:
+            pass
+    return player.MetinQueueAdd(vid)
+
+
 # --- Yin Yang Duel strategy (cards 0..8; even=black, odd=white) ---
 # Both players hold the same 9-card hand (0..8).  Each round the higher card
 # wins; ties score nothing.  You only ever see the colour of the opponent's
@@ -2292,7 +2320,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         player.MetinQueueClear()
         player.AddMetinQueueAllowedRace(self.boss_vnum)
         player.MetinQueueSetEnabled(1)
-        player.MetinQueueAdd(vid)
+        _queue_add(vid)
         queue_size = int(player.MetinQueueGetSize())
         if queue_size < 1:
             player.MetinQueueSetEnabled(0)
@@ -2751,10 +2779,19 @@ class MetinScanner(ui.BoardWithTitleBar):
         distance, vid, name = random.choice(eligible)
         old_size = size
         add_started = time.time()
-        result = player.MetinQueueAdd(vid)
+        result = _queue_add(vid)
         add_elapsed_ms = (time.time() - add_started) * 1000.0
         new_size = int(player.MetinQueueGetSize())
-        if new_size > size:
+        if result == 2:
+            # Already present in the authoritative queue; the wrapper did not
+            # dispatch a click (a click could remove it).  Treat as queued.
+            self.hunter_queued_vids.add(vid)
+            self.AddLine("VID %d already queued (no click), queue %d/%d, call %.2fms" %
+                         (vid, new_size, cap, add_elapsed_ms))
+            if new_size >= cap:
+                self.ScheduleHunterRefill(now)
+            return
+        if result == 1 or new_size > size:
             self.hunter_queued_vids.add(vid)
             if new_size >= cap:
                 self.ScheduleHunterRefill(now)
@@ -2773,13 +2810,21 @@ class MetinScanner(ui.BoardWithTitleBar):
                          (name or "Metin", vid, distance, old_size, new_size,
                           cap, add_elapsed_ms, delay))
             return
-        if not result:
-            self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
-                         (vid, old_size, new_size, add_elapsed_ms))
-        else:
-            self.AddLine("Queue accepted VID %d without size change, queue %d->%d, call %.2fms; no retry" %
-                         (vid, old_size, new_size, add_elapsed_ms))
+        if result == 3:
+            # Outcome unknown: the dispatch ran but the requested VID is not in
+            # the queue.  Never retry the same action immediately (it may have
+            # executed); let the next scan re-evaluate.
             self.hunter_queued_vids.add(vid)
+            self.AddLine("Queue outcome unknown for VID %d, queue %d->%d/%d, call %.2fms; no immediate retry" %
+                         (vid, old_size, new_size, cap, add_elapsed_ms))
+            delay = random.uniform(HUNTER_BURST_DELAY_MIN,
+                                   HUNTER_BURST_DELAY_MAX)
+            self.hunter_next_add = now + delay
+            self.hunter_label.SetText(
+                "Outcome unknown %d/%d - recheck in %.1fs" % (new_size, cap, delay))
+            return
+        self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
+                     (vid, old_size, new_size, add_elapsed_ms))
         delay = random.uniform(HUNTER_BURST_DELAY_MIN,
                                HUNTER_BURST_DELAY_MAX)
         self.hunter_next_add = now + delay
@@ -2823,7 +2868,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.hunter_next_add = 0.0
             player.AddMetinQueueAllowedRace(vnum)
             player.MetinQueueSetEnabled(1)
-            player.MetinQueueAdd(vid)
+            _queue_add(vid)
             if int(player.MetinQueueGetSize()) < 1:
                 raise RuntimeError("one-target queue rejected VID %d" % vid)
             self.priority_event_vid = int(vid)
