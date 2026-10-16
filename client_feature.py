@@ -126,31 +126,28 @@ def emit_synthetic_click():
         pass
 
 
-# Vertical offset (game units) added to a target's world position when
-# projecting it to client pixels for the full-dispatch click.  The entity's
-# world position is its base, so this lifts the click point into its visible
-# body and off the ground plane.  Tunable after a live test.
-PROJECT_CLICK_HEIGHT = 100
+class QueueAddRejected(Exception):
+    """A queue add was rejected before any dispatch could run: the native
+    wrapper is missing or the target does not project on screen.  A certain,
+    pre-dispatch failure -- safe to try another target, and never to be
+    confused with an uncertain post-dispatch failure."""
 
 
 def _queue_add(vid):
-    """Add a VID through the native queue wrapper.  When the client exposes the
-    forward projection (player.GetProjectPosition) and the target projects on
-    screen, pass the projected client-pixel coordinates so the wrapper can
-    reproduce the full WndProc mouse-down/up dispatch instead of forcing the
-    picker.  Otherwise fall back to the single-argument binding."""
+    """Add a VID through the native queue wrapper's full-dispatch route only.
+
+    The wrapper projects the target to on-screen client-pixel coordinates
+    natively (with the projection-matrix refresh the pick path requires) and
+    then reproduces the real WndProc mouse-down/up dispatch.  There is no
+    Python-side projection and no silent fallback to the single-argument
+    picker-override path: if the target does not project on screen, the wrapper
+    rejects it and the caller reports an explicit rejection.
+
+    The final MetinQueueAdd call is intentionally NOT wrapped here: an
+    exception after dispatch has begun is uncertain and must not be turned into
+    a fallback or a retry by the caller."""
     if not NATIVE_QUEUE_WRAPPER_ACTIVE:
-        return player.MetinQueueAdd(vid)
-    project = getattr(player, "GetProjectPosition", None)
-    if callable(project):
-        try:
-            projected = project(vid, PROJECT_CLICK_HEIGHT)
-            x = int(projected[0])
-            y = int(projected[1])
-            if x >= 0 and y >= 0:
-                return player.MetinQueueAdd(vid, x, y)
-        except Exception:
-            pass
+        raise QueueAddRejected("native full-input queue wrapper missing")
     return player.MetinQueueAdd(vid)
 
 
@@ -175,9 +172,10 @@ class NativeActionCoordinator(object):
     _TERMINAL = (COMPLETED, CANCELLED, REJECTED, UNKNOWN)
     _PENDING = (REQUESTED, VALIDATED, DISPATCHED, AWAITING)
 
-    def __init__(self, phase_getter, clock=time.time):
+    def __init__(self, phase_getter, clock=time.time, retention=30.0):
         self._phase_getter = phase_getter
         self._clock = clock
+        self._retention = retention
         self._next_id = 1
         self._actions = {}
 
@@ -192,6 +190,7 @@ class NativeActionCoordinator(object):
             "phase": self._phase_getter(),
             "deadline": self._clock() + timeout,
             "detail": None,
+            "terminal_at": None,
         }
         return action_id
 
@@ -203,6 +202,8 @@ class NativeActionCoordinator(object):
         action = self._actions[action_id]
         action["state"] = state
         action["detail"] = detail
+        if state in self._TERMINAL and action["terminal_at"] is None:
+            action["terminal_at"] = self._clock()
         return action
 
     def validate(self, action_id, ok):
@@ -249,11 +250,16 @@ class NativeActionCoordinator(object):
                 self._transition(action_id, self.CANCELLED, "phase change")
 
     def poll(self):
-        """Move pending actions past their deadline to UNKNOWN."""
+        """Move pending actions past their deadline to UNKNOWN and age out
+        terminal actions whose retention window has expired."""
         now = self._clock()
         for action_id, action in list(self._actions.items()):
             if action["state"] in self._PENDING and now >= action["deadline"]:
                 self._transition(action_id, self.UNKNOWN, "deadline")
+            terminal_at = action.get("terminal_at")
+            if (action["state"] in self._TERMINAL and terminal_at is not None
+                    and now - terminal_at >= self._retention):
+                self._actions.pop(action_id, None)
 
     def has_pending(self):
         return any(a["state"] in self._PENDING for a in self._actions.values())
@@ -2362,6 +2368,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.DisableAndClearMetinQueue()
         self.boss_modes_paused = True
         self.hunter_label.SetText("Queue: paused for boss")
+        self.AddLine("Boss pause: hunter was enabled=%s, queue was enabled=%s" %
+                     (self.boss_saved_hunter_enabled, self.boss_saved_queue_enabled))
 
     def RestoreAfterBoss(self):
         self.StopBossAttack()
@@ -2385,6 +2393,10 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self.hunter_label.SetText("Queue: starting paced batch after boss")
             else:
                 self.hunter_label.SetText("Queue: boss sweep finished")
+        else:
+            self.AddLine("Boss restore skipped: boss_modes_paused was already False")
+        self.AddLine("Boss restore: hunter enabled=%s (saved was %s)" %
+                     (self.hunter_enabled, self.boss_saved_hunter_enabled))
         self.boss_modes_paused = False
         self.boss_saved_hunter_enabled = False
         self.boss_saved_queue_enabled = False
@@ -2835,18 +2847,35 @@ class MetinScanner(ui.BoardWithTitleBar):
         """Run a synchronous native queue add through the action coordinator's
         state machine, returning the raw wrapper result (0/1/2/3).  The
         coordinator records the phase generation and deadline so the surrounding
-        loop can detect a phase change or a hang."""
+        loop can detect a phase change or a hang.
+
+        A certain pre-dispatch rejection (QueueAddRejected) becomes REJECTED.
+        Any other exception from the dispatch call becomes UNKNOWN, because the
+        click may already have executed; it is never reclassified or retried."""
         action_id = self.action_coordinator.request("queue_add", vid, timeout)
-        if not self.action_coordinator.validate(action_id, vid > 0):
+        if (self.action_coordinator.validate(action_id, vid > 0) !=
+                NativeActionCoordinator.VALIDATED):
             return 0
         self.action_coordinator.dispatch(action_id)
         try:
             result = _queue_add(vid)
-        except Exception:
+        except QueueAddRejected:
+            # Certain pre-dispatch rejection: safe to report and move on.
             result = 0
-        outcome = _ADD_RESULT_OUTCOME.get(result, NativeActionCoordinator.UNKNOWN)
+            outcome = NativeActionCoordinator.REJECTED
+        except Exception:
+            # The dispatch call itself failed after it may have executed: the
+            # outcome is uncertain, never a rejection or an immediate retry.
+            result = 3
+            outcome = NativeActionCoordinator.UNKNOWN
+        else:
+            outcome = _ADD_RESULT_OUTCOME.get(
+                result, NativeActionCoordinator.UNKNOWN)
         self.action_coordinator.acknowledge(action_id, outcome)
-        self.action_coordinator.finish(action_id)
+        # Retain UNKNOWN actions (identity + detail survive for diagnostics);
+        # poll() ages them out.  Certain outcomes are dropped now.
+        if outcome != NativeActionCoordinator.UNKNOWN:
+            self.action_coordinator.finish(action_id)
         return result
 
     def FeedMetinQueue(self, candidates):
@@ -2957,7 +2986,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             if new_size >= cap:
                 self.ScheduleHunterRefill(now)
             return
-        if result == 1 or new_size > size:
+        # Success is the native result only (requested VID newly present in the
+        # authoritative queue).  Unrelated queue growth must not read as success.
+        if result == 1:
             self.hunter_queued_vids.add(vid)
             if new_size >= cap:
                 self.ScheduleHunterRefill(now)
@@ -2978,9 +3009,10 @@ class MetinScanner(ui.BoardWithTitleBar):
             return
         if result == 3:
             # Outcome unknown: the dispatch ran but the requested VID is not in
-            # the queue.  Never retry the same action immediately (it may have
-            # executed); let the next scan re-evaluate.
-            self.hunter_queued_vids.add(vid)
+            # the queue.  Do NOT mark it queued (it is not), and do NOT retry it
+            # immediately; let the next scan re-evaluate.  Re-attempting is safe:
+            # the wrapper checks membership first and reports "already present"
+            # without dispatching a click if the add actually landed.
             self.AddLine("Queue outcome unknown for VID %d, queue %d->%d/%d, call %.2fms; no immediate retry" %
                          (vid, old_size, new_size, cap, add_elapsed_ms))
             delay = random.uniform(HUNTER_BURST_DELAY_MIN,

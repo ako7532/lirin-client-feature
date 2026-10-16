@@ -42,6 +42,16 @@ static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07A6B480;
 static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x007E3E70;
 static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x007E3FD0;
 static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07A734C0;
+// World->screen projection (the forward projection used by the pick path).
+// FUN_1404a2ec0 reads an actor's world position; FUN_14061ca10 sets up the
+// projection matrix (camera 2) that FUN_14061e430 consumes; DAT_147a6b678 is
+// the camera/graphics context, and DAT_1466e6050 is the position-Y obfuscation
+// key applied before projection.
+static constexpr ULONG_PTR RVA_GET_ACTOR_POSITION = 0x004A2EC0;
+static constexpr ULONG_PTR RVA_PROJECTION_SETUP = 0x0061CA10;
+static constexpr ULONG_PTR RVA_PROJECT = 0x0061E430;
+static constexpr ULONG_PTR RVA_CAMERA = 0x07A6B678;
+static constexpr ULONG_PTR RVA_POS_Y_OBF = 0x066E6050;
 static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
 static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
@@ -103,6 +113,27 @@ using RecordInput = void (*)(void*, char, int, int);
 using GetCursorPosition = void (*)(void*, int*, int*);
 using GameDownDispatch = bool (*)(void*, int, int);
 using GameUpDispatch = bool (*)(void*, int, int);
+using GetActorPosition = void (*)(void*, float*);
+using ProjectionSetup = void (*)();
+using Project = void (*)(void*, float, float, float, float*, float*, int*);
+
+// The character-manager red-black tree node (std::set), the same tree the
+// entity snapshot and chr.GetProjectPosition walk.  Fields verified against
+// the loader's own snapshot walk.
+struct CharacterNode {
+    CharacterNode* left;   // +0x00
+    CharacterNode* parent; // +0x08
+    CharacterNode* right;  // +0x10
+    BYTE color;            // +0x18
+    BYTE is_nil;           // +0x19
+    BYTE padding[6];       // +0x1A..+0x1F
+    DWORD vid;             // +0x20
+    DWORD padding2;        // +0x24
+    void* actor;           // +0x28
+};
+static_assert(offsetof(CharacterNode, is_nil) == 0x19, "character node sentinel offset changed");
+static_assert(offsetof(CharacterNode, vid) == 0x20, "character node VID offset changed");
+static_assert(offsetof(CharacterNode, actor) == 0x28, "character node actor offset changed");
 
 // Observe only. Do not generate input records or alter recorder settings.
 static void LogQueueInputState(int vid) {
@@ -114,18 +145,24 @@ static void LogQueueInputState(int vid) {
                       GetTickCount64(), vid);
         } else {
             unsigned bg = 0;
+            unsigned mouse_down = 0;
             __try {
                 BYTE* app = *reinterpret_cast<BYTE**>(g_game_base + RVA_APP_GLOBAL);
                 if (app) {
                     bg = static_cast<unsigned>(app[0x20]);
                 }
+                BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+                if (player) {
+                    mouse_down = static_cast<unsigned>(player[PLAYER_MOUSE_DOWN_OFFSET]);
+                }
             } __except (EXCEPTION_EXECUTE_HANDLER) {
             }
             sprintf_s(line,
-                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u bg=%u",
+                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u bg=%u mouse_down=%u",
                       GetTickCount64(), vid, static_cast<unsigned>(recorder[8]),
                       static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 10)),
-                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)), bg);
+                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)),
+                      bg, mouse_down);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         strcpy_s(line, "queue input diagnostic: recorder read unavailable");
@@ -186,31 +223,180 @@ static bool EmitSyntheticClick() {
 // Reproduce the WndProc mouse-down/up sequence at explicit client-pixel
 // coordinates: record down (code 1) -> game down dispatch -> record up
 // (code 2) -> game up dispatch.  No picker override; the client's own
-// hit-testing picks whatever is under those coordinates.  Returns false only
-// when the game instance is missing or the dispatch faulted.
-static bool DispatchClickAt(int x, int y) {
+// hit-testing picks whatever is under those coordinates.
+//
+// The down/up dispatch results are captured and logged (route diagnostics),
+// and an access fault after the down dispatch triggers a best-effort release
+// so the player is never left in a pressed state.  Returns false when the game
+// instance is missing, the down dispatch faulted, or the down dispatch
+// reported that nothing was handled.
+// Log the viewport bounds and the player's post-down pick state so a failed
+// queue add can be classified as off-screen, ground-click, or wrong-actor.
+// player+0xec pick code: 0=cleared/unknown, 1=ground move, 2=item, 5=actor
+// (picked VID stored at player+0x58).  game+0x1c/0x18 are the viewport
+// width/height, game+0x30/0x34 the client offsets, game+0x20/0x24 the
+// normalized cursor written by the down dispatch.
+static void LogClickPickState(int vid, int x, int y) {
+    char line[352] = {};
+    __try {
+        void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
+        BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+        int view_w = 0, view_h = 0, x_off = 0, y_off = 0, cur_x = 0, cur_y = 0;
+        unsigned pick_code = 0, picked_vid = 0, mouse_down = 0;
+        if (game_instance) {
+            view_w = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x1c);
+            view_h = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x18);
+            x_off = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x30);
+            y_off = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x34);
+            cur_x = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x20);
+            cur_y = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x24);
+        }
+        if (player) {
+            pick_code = *reinterpret_cast<unsigned*>(player + 0xec);
+            picked_vid = *reinterpret_cast<unsigned*>(player + 0x58);
+            mouse_down = static_cast<unsigned>(player[PLAYER_MOUSE_DOWN_OFFSET]);
+        }
+        sprintf_s(line,
+                  "native click pick: vid=%d x=%d y=%d viewport=%dx%d off=%d,%d cursor=%d,%d pick_code=%u picked_vid=%u mouse_down=%u",
+                  vid, x, y, view_w, view_h, x_off, y_off, cur_x, cur_y,
+                  pick_code, picked_vid, mouse_down);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        sprintf_s(line, "native click pick: vid=%d x=%d y=%d unavailable", vid, x, y);
+    }
+    AppendStatus(g_feature_status_path, line);
+}
+
+static bool DispatchClickAt(int vid, int x, int y) {
     void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
     if (!game_instance) return false;
     auto record_input = reinterpret_cast<RecordInput>(g_game_base + RVA_RECORD_INPUT);
     BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
     auto game_down = reinterpret_cast<GameDownDispatch>(g_game_base + RVA_GAME_DOWN_DISPATCH);
     auto game_up = reinterpret_cast<GameUpDispatch>(g_game_base + RVA_GAME_UP_DISPATCH);
+
+    bool down_dispatched = false;
+    bool up_dispatched = false;
+    bool fault = false;
     __try {
         if (recorder) record_input(recorder, 1, x, y);
-        game_down(game_instance, x, y);
+        down_dispatched = game_down(game_instance, x, y);
+        LogClickPickState(vid, x, y);
         if (recorder) record_input(recorder, 2, x, y);
-        game_up(game_instance, x, y);
+        up_dispatched = game_up(game_instance, x, y);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fault = true;
+    }
+
+    // If the down dispatch ran but the up dispatch faulted (or vice versa)
+    // before release, attempt a release once so player +0xFF is not stuck.
+    if (fault && down_dispatched) {
+        __try {
+            game_up(game_instance, x, y);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    {
+        char line[192] = {};
+        sprintf_s(line,
+                  "native click dispatch: x=%d y=%d down=%d up=%d fault=%d",
+                  x, y, down_dispatched ? 1 : 0, up_dispatched ? 1 : 0,
+                  fault ? 1 : 0);
+        AppendStatus(g_feature_status_path, line);
+    }
+
+    if (fault) {
         AppendStatus(g_feature_status_path, "native queue wrapper click dispatch fault");
         return false;
     }
-    return true;
+    return down_dispatched;
 }
 
 // Performs the actual click dispatch for a positive VID, assuming the
 // re-entrancy guard is held.  Returns an ADD_* code.  The acknowledgement is
 // derived from the requested VID's membership in the authoritative queue, not
 // from a raw size delta (a click can remove-then-add, keeping the size equal).
+static constexpr int PROJECT_CLICK_HEIGHT = 100;
+
+// Linear scan of the character-manager tree for the actor matching a VID.
+// Mirrors chr.GetProjectPosition's resolution (the same tree the entity
+// snapshot walks) so the projected position matches what the pick uses.
+static void* FindActorByVid(BYTE* manager, int vid) {
+    __try {
+        CharacterNode* head = manager ? *reinterpret_cast<CharacterNode**>(manager + 0xf8) : nullptr;
+        if (!head) return nullptr;
+        CharacterNode* node = head->left;
+        for (int count = 0; node && node != head && count < 4096; ++count) {
+            if (node->is_nil) break;
+            if (node->actor && static_cast<int>(node->vid) == vid) {
+                return node->actor;
+            }
+            if (node->right && !node->right->is_nil) {
+                node = node->right;
+                int hops = 0;
+                while (node->left && !node->left->is_nil && hops++ < 4096) node = node->left;
+                if (hops >= 4096) return nullptr;
+            } else {
+                CharacterNode* parent = node->parent;
+                int hops = 0;
+                while (parent && !parent->is_nil && node == parent->right && hops++ < 4096) {
+                    node = parent;
+                    parent = parent->parent;
+                }
+                if (hops >= 4096) return nullptr;
+                node = parent;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return nullptr;
+}
+
+// Project an actor VID to client-pixel screen coordinates.  Unlike the Python
+// chr.GetProjectPosition binding, this refreshes the projection matrix first
+// (FUN_14061ca10, which player.GetProjectPosition also calls but
+// chr.GetProjectPosition skips), so the result aligns with the rendered screen
+// rect the pick uses.  Returns false when the actor is unresolvable or the
+// projection reports the point is behind the camera.
+static bool ProjectActorToScreen(int vid, int height, int* out_x, int* out_y) {
+    *out_x = -100;
+    *out_y = -100;
+    __try {
+        BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
+        void* actor = FindActorByVid(manager, vid);
+        if (!actor) return false;
+
+        float pos[3] = { 0.0f, 0.0f, 0.0f };
+        auto get_position = reinterpret_cast<GetActorPosition>(g_game_base + RVA_GET_ACTOR_POSITION);
+        get_position(actor, pos);
+
+        auto setup = reinterpret_cast<ProjectionSetup>(g_game_base + RVA_PROJECTION_SETUP);
+        setup();
+
+        void* camera = *reinterpret_cast<void**>(g_game_base + RVA_CAMERA);
+        if (!camera) return false;
+
+        float x = pos[0];
+        unsigned y_bits = *reinterpret_cast<unsigned*>(&pos[1]) ^
+                          *reinterpret_cast<unsigned*>(g_game_base + RVA_POS_Y_OBF);
+        float y = *reinterpret_cast<float*>(&y_bits);
+        float z = static_cast<float>(height) + pos[2];
+
+        auto project = reinterpret_cast<Project>(g_game_base + RVA_PROJECT);
+        float screen_x = 0.0f;
+        float screen_y = 0.0f;
+        int behind = 0;
+        project(camera, x, y, z, &screen_x, &screen_y, &behind);
+        if (behind == 1) return false;
+
+        *out_x = static_cast<int>(screen_x);
+        *out_y = static_cast<int>(screen_y);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static int NativeMetinQueueAddInner(int vid, int click_x, int click_y) {
     LogQueueInputState(vid);
 
@@ -253,71 +439,68 @@ static int NativeMetinQueueAddInner(int vid, int click_x, int click_y) {
         return ADD_NOT_ADDED;
     }
 
-    // A real left click first passes through the Windows mouse handler, which
-    // records a down/up pair (codes 1/2) into the client input recorder before
-    // driving the game.  FUN_140471b10 is a no-op while the recorder is
-    // disabled.
-    auto record_input = reinterpret_cast<RecordInput>(
-        g_game_base + RVA_RECORD_INPUT);
-    BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
-
-    if (click_x >= 0 && click_y >= 0) {
-        // Full physical-path dispatch at the target's projected client-pixel
-        // coordinates (UI hit-test -> world pick -> player press -> queue add)
-        // with no picker override.
-        if (!DispatchClickAt(click_x, click_y)) {
+    // Resolve the click coordinates: explicit, or native projection.
+    int px = click_x;
+    int py = click_y;
+    if (click_x < 0 || click_y < 0) {
+        if (!ProjectActorToScreen(vid, PROJECT_CLICK_HEIGHT, &px, &py)) {
+            AppendStatus(g_feature_status_path,
+                         "native queue wrapper rejected: actor not projectable");
             return ADD_NOT_ADDED;
         }
-    } else {
-        // Fallback (no explicit coordinates): picker override plus player
-        // press/release, recording at the client's stored cursor position.
-        void** picked_actor = reinterpret_cast<void**>(
-            manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
-        void* saved_picked_actor = *picked_actor;
-        auto set_mouse_state = reinterpret_cast<SetMouseState>(
-            g_game_base + RVA_SET_MOUSE_STATE);
-
-        // Read the client's own cursor position (the same source the recorder
-        // uses for its movement samples) rather than the OS cursor, so the
-        // synthetic down/up stays on the recorded path regardless of focus.
-        int cursor_x = 0;
-        int cursor_y = 0;
-        GetGameCursorPosition(&cursor_x, &cursor_y);
-
-        bool pressed = false;
-        __try {
-            *picked_actor = target_actor;
-            if (recorder) record_input(recorder, 1, cursor_x, cursor_y);
-            set_mouse_state(player, 1, 0);
-            pressed = true;
-            if (recorder) record_input(recorder, 2, cursor_x, cursor_y);
-            set_mouse_state(player, 0, 0);
-            pressed = false;
-        } __finally {
-            // Exception-safe cleanup: if press succeeded but release did not,
-            // still attempt release once.  Never touch physical OS input.
-            if (pressed) {
-                __try {
-                    set_mouse_state(player, 0, 0);
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                }
-            }
-            // Restore the picker only if the character manager is still the
-            // same object we overrode (do not write through a stale pointer
-            // after a phase change).
-            __try {
-                if (*reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) == manager) {
-                    *picked_actor = saved_picked_actor;
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-            }
+        {
+            char line[160] = {};
+            sprintf_s(line,
+                      "native queue wrapper route: native-projection vid=%d x=%d y=%d",
+                      vid, px, py);
+            AppendStatus(g_feature_status_path, line);
         }
+    } else {
+        {
+            char line[160] = {};
+            sprintf_s(line,
+                      "native queue wrapper route: full-dispatch vid=%d x=%d y=%d",
+                      vid, px, py);
+            AppendStatus(g_feature_status_path, line);
+        }
+    }
+
+    // Reproduce the hover-pick state a physical mouse establishes: the click
+    // router resolves its actor through the manager's picked-actor field
+    // (manager+0xE0), which the synthetic down dispatch does not set (a real
+    // mouse sets it on hover, before the click).  Override it for the duration
+    // of the click, then restore it.  Combined with the full down/up dispatch
+    // above this reproduces the physical path: hover-pick + click.
+    void** picked_actor = reinterpret_cast<void**>(
+        manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
+    void* saved_picked_actor = *picked_actor;
+    bool dispatched = false;
+    __try {
+        *picked_actor = target_actor;
+        dispatched = DispatchClickAt(vid, px, py);
+    } __finally {
+        // Restore only if the manager is still the same object we overrode.
+        __try {
+            if (*reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) == manager) {
+                *picked_actor = saved_picked_actor;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    if (!dispatched) {
+        return ADD_NOT_ADDED;
     }
 
     // Acknowledge by requested-VID membership change.  If the VID is not
     // present after dispatch the outcome is unknown: do not report success and
     // never immediately retry (the click may already have executed).
-    return QueueContainsVid(player, vid) ? ADD_ADDED : ADD_UNKNOWN;
+    int outcome = QueueContainsVid(player, vid) ? ADD_ADDED : ADD_UNKNOWN;
+    {
+        char line[128] = {};
+        sprintf_s(line, "native queue wrapper result: vid=%d code=%d", vid, outcome);
+        AppendStatus(g_feature_status_path, line);
+    }
+    return outcome;
 }
 
 static void* NativeMetinQueueAdd(void*, void* args) {
@@ -355,7 +538,7 @@ static void* NativeMetinQueueAdd(void*, void* args) {
             // a full-dispatch click on a UI control.  The latter is the
             // replacement for the deprecated bare-record UI path.
             if (click_x >= 0 && click_y >= 0) {
-                result = DispatchClickAt(click_x, click_y) ? 1 : 0;
+                result = DispatchClickAt(vid, click_x, click_y) ? 1 : 0;
             } else {
                 result = EmitSyntheticClick() ? 1 : 0;
             }
@@ -417,21 +600,6 @@ static void RestoreNativeMetinQueueWrapper() {
     VirtualProtect(method, sizeof(*method), old_protection, &ignored);
     g_native_queue_wrapper_installed = false;
 }
-
-struct CharacterNode {
-    CharacterNode* left;
-    CharacterNode* parent;
-    CharacterNode* right;
-    BYTE color;
-    BYTE is_nil;
-    BYTE padding[6];
-    DWORD vid;
-    DWORD padding2;
-    void* actor;
-};
-static_assert(offsetof(CharacterNode, is_nil) == 0x19, "character node sentinel offset changed");
-static_assert(offsetof(CharacterNode, vid) == 0x20, "character node VID offset changed");
-static_assert(offsetof(CharacterNode, actor) == 0x28, "character node actor offset changed");
 
 static bool IsCurrentFeatureDll() {
     HANDLE file = CreateFileW(g_active_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,

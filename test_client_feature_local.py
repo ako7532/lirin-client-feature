@@ -123,11 +123,19 @@ def set_metin_queue_enabled(enabled):
 player.MetinQueueSetEnabled = set_metin_queue_enabled
 player.MetinQueueGetSize = lambda: len(queue)
 player.MetinQueueGetMaxSize = lambda: queue_state["max_size"]
-def add_metin(vid):
+add_calls = []  # ('native', vid) for each single-argument world add
+projectable_vids = set(range(1, 12))  # VIDs 1..11 "project on screen" natively
+
+def add_metin(vid, x=None, y=None):
     if vid == 0:
         # The native wrapper's bare-click sentinel (emit_synthetic_click): no
         # queue change, mirrors the real VID-0 click-only path.
         return 1
+    # The world add is single-argument: the wrapper projects natively then
+    # dispatches.  Simulate the native projection here.
+    add_calls.append(("native", int(vid)))
+    if vid not in projectable_vids:
+        return 0  # native projection failed -> rejected
     if vid in queue:
         # Already present; the wrapper reports a distinct code and does not
         # dispatch a click (which the native path could turn into a removal).
@@ -500,11 +508,12 @@ with tempfile.TemporaryDirectory() as directory:
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert not queue
     actor_stone_overrides.pop(7)
-    # Hunter admission no longer depends on screen projection or camera motion;
-    # the native wrapper now routes the target through the mouse-state path.
+    # A projectable target goes through the native full-dispatch route (the
+    # wrapper projects and dispatches natively from the single-argument call).
     panel.hunter_next_add = 0
     panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
     assert queue == [7]
+    assert ("native", 7) in add_calls
     queue[:] = []
     panel.hunter_queued_vids.clear()
     player.SetMetinQueueVIDImmune(7, 1)
@@ -523,6 +532,38 @@ with tempfile.TemporaryDirectory() as directory:
     queue_guard_log = log_path.read_text(encoding="ascii")
     assert "native immune VID" in queue_guard_log
     assert "native untargetable VID" in queue_guard_log
+
+    # A target that does not project on screen is rejected by the native
+    # projection (result 0), never queued and never retried immediately.
+    queue[:] = []
+    panel.hunter_queued_vids.clear()
+    add_calls[:] = []
+    projectable_vids.discard(7)
+    panel.hunter_next_add = 0
+    panel.FeedMetinQueue([(1400, 7, "Jealousy Metin")])
+    assert not queue and 7 not in panel.hunter_queued_vids
+    assert add_calls == [("native", 7)]  # single-argument call, then rejected
+    projectable_vids.add(7)
+    queue[:] = []
+    panel.hunter_queued_vids.clear()
+
+    # _dispatch_native_add maps a post-dispatch exception to UNKNOWN (3), never
+    # a rejection, because the click may already have executed.
+    add_calls[:] = []
+    original_add = player.MetinQueueAdd
+
+    def raise_on_add(vid, x=None, y=None):
+        raise RuntimeError("dispatch exploded")
+
+    player.MetinQueueAdd = raise_on_add
+    assert panel._dispatch_native_add(7, 2.0) == 3
+    player.MetinQueueAdd = original_add
+
+    # A non-positive VID is rejected before any dispatch or projection.
+    add_calls[:] = []
+    assert panel._dispatch_native_add(0, 2.0) == 0
+    assert add_calls == []
+
     panel.ToggleMetinHunter()
     queue[:] = [90, 91, 92]
     queue_state["max_size"] = 3
@@ -740,7 +781,14 @@ with tempfile.TemporaryDirectory() as directory:
     assert 1 not in panel.hunter_queued_vids and not queue
     player.CanAttackInstance = original_can_attack
     original_queue_add = player.MetinQueueAdd
-    player.MetinQueueAdd = lambda vid: False
+    player.MetinQueueAdd = lambda vid, x=None, y=None: False
+    panel.FeedMetinQueue([(500, 1, "Battle Metin")])
+    assert 1 not in panel.hunter_queued_vids and not queue
+    player.MetinQueueAdd = original_queue_add
+    # An UNKNOWN outcome must not be marked queued, so the next scan re-attempts
+    # (the wrapper reports "already present" if the add actually landed).
+    original_queue_add = player.MetinQueueAdd
+    player.MetinQueueAdd = lambda vid, x=None, y=None: 3
     panel.FeedMetinQueue([(500, 1, "Battle Metin")])
     assert 1 not in panel.hunter_queued_vids and not queue
     player.MetinQueueAdd = original_queue_add
