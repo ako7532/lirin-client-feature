@@ -1397,6 +1397,28 @@ with tempfile.TemporaryDirectory() as directory:
     assert mt6.resolve_pending_flip(snap3, 3.0) is True
     assert not mt6.has_pending_flip()
 
+    # Tracker: an unverified numeric state is resolved from reliable signals.
+    mt_num = MemoryBoardTracker()
+    w_num = ts_window([(0, 7, False), (1, 7, False), (2, 8, False), (3, 8, False)])
+    w_num.state = 0
+    w_num.GetCooldownRemaining = lambda: 0.0
+    snap_num, _ = mt_num.observe(w_num, 1.0)
+    assert snap_num.state == "idle", snap_num.state
+    # A dispatched start (pending_start) makes a numeric state resolve to playing.
+    mt_num.mark_pending_start()
+    snap_num2, _ = mt_num.observe(w_num, 2.0)
+    assert snap_num2.state == "playing", snap_num2.state
+    # A completed board resolves to finishing even while a start is pending.
+    w_num.pairsFound = 2
+    snap_num3, _ = mt_num.observe(w_num, 3.0)
+    assert snap_num3.state == "finishing", snap_num3.state
+    # A nonzero cooldown resolves to idle.
+    mt_num.clear_pending_start()
+    w_num.pairsFound = 0
+    w_num.GetCooldownRemaining = lambda: 30.0
+    snap_num4, _ = mt_num.observe(w_num, 4.0)
+    assert snap_num4.state == "idle", snap_num4.state
+
     # Controller lifecycle (observation only; no dispatch without the adapter).
     controller_window = FakeMemoryWindow(
         [MCard(0, 7, False), MCard(1, 0, False), MCard(2, 8, False), MCard(3, 0, False)])
@@ -1449,22 +1471,71 @@ with tempfile.TemporaryDirectory() as directory:
     assert "cooldown 42s" in panel.twin_souls_label.text, panel.twin_souls_label.text
     controller_window.GetCooldownRemaining = lambda: 0.0
 
-    # The unverified adapter issues no start (no pending, no dispatch).
-    reset_ts_controller()
-    assert not panel.twin_souls_adapter.is_verified()
-    panel.PollTwinSouls(13.0)
-    assert "waiting for verified background input" in panel.twin_souls_label.text, \
-        panel.twin_souls_label.text
-    assert not panel.twin_souls_tracker.has_pending_start()
+    # The real adapter drives the client UI handlers directly, preceded by a
+    # synthetic click, and reports success only when the handler runs.
+    start_log = []
+    flip_log = []
 
-    # A verified adapter marks exactly one pending start for an idle board.
-    class VerifiedAdapter:
-        def is_verified(self):
+    class FakeStartWindow(object):
+        def _YinYangMemoryWindow__OnStartClicked(self):
+            start_log.append("start")
+
+    class FakeFlipCard(object):
+        def OnMouseLeftButtonDown(self):
+            flip_log.append("flip")
+
+    real_adapter = MemoryActionAdapter()
+    assert real_adapter.dispatch_start(FakeStartWindow()) is True
+    assert real_adapter.dispatch_flip(FakeFlipCard()) is True
+    assert start_log == ["start"] and flip_log == ["flip"], (start_log, flip_log)
+    # Missing handlers fail safely without raising.
+    assert real_adapter.dispatch_start(object()) is False
+    assert real_adapter.dispatch_flip(object()) is False
+    # A handler that raises is reported as a failed dispatch, not an exception.
+    class RaisingStart(object):
+        def _YinYangMemoryWindow__OnStartClicked(self):
+            raise RuntimeError("boom")
+    class RaisingCard(object):
+        def OnMouseLeftButtonDown(self):
+            raise RuntimeError("boom")
+    assert real_adapter.dispatch_start(RaisingStart()) is False
+    assert real_adapter.dispatch_flip(RaisingCard()) is False
+
+    # A recording adapter observes the controller's dispatch calls.
+    class RecordingAdapter(object):
+        def __init__(self):
+            self.starts = []
+            self.flips = []
+        def dispatch_start(self, window):
+            self.starts.append(window)
             return True
+        def dispatch_flip(self, card):
+            self.flips.append(card)
+            return True
+
+    # An idle board dispatches exactly one start and marks pending.
+    controller_window.state = "idle"
+    controller_window.openCells = []
     reset_ts_controller()
-    panel.twin_souls_adapter = VerifiedAdapter()
-    panel.PollTwinSouls(14.0)
+    rec = RecordingAdapter()
+    panel.twin_souls_adapter = rec
+    panel.PollTwinSouls(13.0)
+    assert len(rec.starts) == 1, rec.starts
     assert panel.twin_souls_tracker.has_pending_start()
+    assert "start dispatched" in panel.twin_souls_label.text, panel.twin_souls_label.text
+
+    # A failed start dispatch never marks pending (retries next poll).
+    class FailingStartAdapter(RecordingAdapter):
+        def dispatch_start(self, window):
+            self.starts.append(window)
+            return False
+    reset_ts_controller()
+    controller_window.state = "idle"
+    controller_window.openCells = []
+    panel.twin_souls_adapter = FailingStartAdapter()
+    panel.PollTwinSouls(14.0)
+    assert not panel.twin_souls_tracker.has_pending_start()
+    assert "start unavailable" in panel.twin_souls_label.text, panel.twin_souls_label.text
 
     # openPending suppresses a duplicate start.
     controller_window.openPending = True
@@ -1479,18 +1550,33 @@ with tempfile.TemporaryDirectory() as directory:
     # A finishing board never starts and performs no solver action.
     controller_window.state = "finishing"
     reset_ts_controller()
-    panel.twin_souls_adapter = VerifiedAdapter()
+    panel.twin_souls_adapter = RecordingAdapter()
     panel.PollTwinSouls(16.0)
     assert "finished" in panel.twin_souls_label.text, panel.twin_souls_label.text
     assert not panel.twin_souls_tracker.has_pending_start()
 
-    # An active playing board is solved and recorded, but not dispatched.
+    # An active playing board dispatches exactly one flip and marks pending.
     controller_window.state = "playing"
     controller_window.openCells = [0]
     reset_ts_controller()
+    rec2 = RecordingAdapter()
+    panel.twin_souls_adapter = rec2
     panel.PollTwinSouls(17.0)
-    assert "background input unverified" in panel.twin_souls_label.text, \
-        panel.twin_souls_label.text
+    assert len(rec2.flips) == 1, rec2.flips
+    assert panel.twin_souls_tracker.has_pending_flip()
+
+    # A failed flip dispatch never marks pending (retries next poll).
+    class FailingFlipAdapter(RecordingAdapter):
+        def dispatch_flip(self, card):
+            self.flips.append(card)
+            return False
+    reset_ts_controller()
+    controller_window.state = "playing"
+    controller_window.openCells = [0]
+    panel.twin_souls_adapter = FailingFlipAdapter()
+    panel.PollTwinSouls(18.0)
+    assert not panel.twin_souls_tracker.has_pending_flip()
+    assert "flip unavailable" in panel.twin_souls_label.text, panel.twin_souls_label.text
 
     # Disable clears pending state and board memory.
     panel.twin_souls_enabled = True

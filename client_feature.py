@@ -33,7 +33,7 @@ CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 44
+FEATURE_VERSION = 45
 HUNTER_LIMIT = 5
 HUNTER_BURST_DELAY_MIN = 0.70
 HUNTER_BURST_DELAY_MAX = 2.50
@@ -1262,7 +1262,8 @@ class MemoryBoardTracker(object):
         pairs, ok, reason = enumerate_memory_cards(cards)
         if not ok:
             return None, reason
-        state = classify_memory_state(getattr(window, "state", None))
+        raw_state = getattr(window, "state", None)
+        state = classify_memory_state(raw_state)
         phase = getattr(window, "phase", None)
         cell_count = len(pairs)
         pair_count = int(getattr(window, "faceCount", 0) or 0)
@@ -1270,6 +1271,9 @@ class MemoryBoardTracker(object):
             pair_count = cell_count // 2
         pairs_found = int(getattr(window, "pairsFound", 0) or 0)
         awaiting_flip = bool(getattr(window, "awaitingFlip", False))
+        if state == TWIN_SOULS_STATE_UNKNOWN:
+            state = self._resolve_unknown_state(window, raw_state,
+                                                pair_count, pairs_found)
 
         open_cells = self._normalize_open_cells(window, pairs)
         open_set = set(open_cells)
@@ -1322,6 +1326,29 @@ class MemoryBoardTracker(object):
             plays_max_hwid=int(getattr(window, "playsMaxHwid", 0) or 0),
             generation_signature=generation_signature,
         ), None
+
+    def _resolve_unknown_state(self, window, raw_state, pair_count, pairs_found):
+        """Map an unverified numeric `state` to a semantic state.
+
+        The client's integer idle/playing/finish constants are not pinned, so we
+        infer the phase from signals that are observable and reliable: a
+        completed board (all pairs found) is finishing, a nonzero cooldown is
+        idle, an in-flight start (`openPending`) is still idle, and a nonzero
+        state (or one of our own pending requests) is playing. Falls back to
+        idle, which is the safe default for an unstarted board.
+        """
+        if pair_count > 0 and pairs_found >= pair_count:
+            return TWIN_SOULS_STATE_FINISHING
+        cooldown = self._call_float(window, "GetCooldownRemaining")
+        if cooldown is not None and cooldown > 0:
+            return TWIN_SOULS_STATE_IDLE
+        if bool(getattr(window, "openPending", False)):
+            return TWIN_SOULS_STATE_IDLE
+        if isinstance(raw_state, INTEGER_TYPES) and raw_state != 0:
+            return TWIN_SOULS_STATE_PLAYING
+        if self.pending_start or self.pending_flip:
+            return TWIN_SOULS_STATE_PLAYING
+        return TWIN_SOULS_STATE_IDLE
 
     def _detect_reset(self, snapshot):
         if self.generation_signature is None:
@@ -1427,19 +1454,42 @@ class MemoryBoardTracker(object):
     def clear_pending_start(self):
         self.pending_start = False
 
+    def clear_pending_flip(self):
+        self.pending_flip = None
+
 
 class MemoryActionAdapter(object):
     """Dispatch boundary for Twin Souls UI actions.
 
-    The background-input feasibility gate (INPUT_RECORDER_IMPLEMENTATION_PLAN)
-    has not been verified, so this adapter reports UNAVAILABLE and performs no
-    dispatch. When a verified route exists, wire dispatch_start/dispatch_flip to
-    reach the client handlers exactly once; the controller must never call the
-    handlers itself.
+    Twin Souls is a UI minigame, like Yin Yang Duel and the reaction game, so its
+    start and flips go through the same proven route: record a synthetic click,
+    then invoke the client's own UI handler directly (no world projection, no
+    cursor move, no audited world-click path).
     """
 
-    def is_verified(self):
-        return False
+    def dispatch_start(self, window):
+        start = getattr(window, "_YinYangMemoryWindow__OnStartClicked", None)
+        if not callable(start):
+            return False
+        emit_synthetic_click()
+        try:
+            start()
+            return True
+        except Exception:
+            return False
+
+    def dispatch_flip(self, card):
+        if card is None:
+            return False
+        click = getattr(card, "OnMouseLeftButtonDown", None)
+        if not callable(click):
+            return False
+        emit_synthetic_click()
+        try:
+            click()
+            return True
+        except Exception:
+            return False
 
 
 def disk_log(message):
@@ -1783,6 +1833,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.twin_souls_tracker = MemoryBoardTracker()
         self.twin_souls_solver = MemorySolver()
         self.twin_souls_adapter = MemoryActionAdapter()
+        self.twin_souls_trace_key = None
         self.yinyang_duel_result_closed = True
         self.yinyang_duel_result_close_at = 0.0
         self.player_next_poll = 0.0
@@ -2933,6 +2984,7 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def _TwinSoulsRelease(self):
         self.twin_souls_window = None
+        self.twin_souls_trace_key = None
         tracker = self.twin_souls_tracker
         tracker.pending_flip = None
         tracker.pending_start = False
@@ -3019,6 +3071,11 @@ class MetinScanner(ui.BoardWithTitleBar):
                             self.AddLine("    card attr %s" % name)
             except Exception as exc:
                 self.AddLine("  memory card dump error: %s" % exc)
+        members = [n for n in dir(window)
+                   if any(t in n.lower()
+                          for t in ("start", "click", "open", "begin", "play",
+                                    "result"))]
+        self.AddLine("  memory window action members = %s" % ascii_text(repr(members)))
 
     def _TwinSoulsCooldownRemaining(self, window):
         get_cd = getattr(window, "GetCooldownRemaining", None)
@@ -3090,6 +3147,23 @@ class MetinScanner(ui.BoardWithTitleBar):
         except Exception as exc:
             self._TwinSoulsDebugLog("Twin Souls: history write error %s" %
                                     ascii_text(exc))
+
+    def _TwinSoulsTraceState(self, window, snapshot):
+        raw_state = getattr(window, "state", None)
+        cooldown = self._TwinSoulsCooldownRemaining(window)
+        open_pending = bool(getattr(window, "openPending", False))
+        key = (raw_state, snapshot.state, cooldown, open_pending,
+               snapshot.pairs_found, snapshot.pair_count,
+               snapshot.awaiting_flip, snapshot.busy)
+        if key == self.twin_souls_trace_key:
+            return
+        self.twin_souls_trace_key = key
+        self.AddLine(
+            "Twin Souls trace: raw_state=%r state=%s cooldown=%s openPending=%s "
+            "pairs=%d/%d awaiting=%s busy=%s" %
+            (raw_state, snapshot.state, cooldown, open_pending,
+             snapshot.pairs_found, snapshot.pair_count,
+             snapshot.awaiting_flip, snapshot.busy))
 
     def _DuelWindow(self):
         """Return the duel window, or None when disabled or not yet discovered."""
@@ -3190,21 +3264,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             return
         self._TwinSoulsRecordEvent(
             self._TwinSoulsDecisionEvent(snapshot, knowledge, decision))
-        if not self.twin_souls_adapter.is_verified():
-            self._TwinSoulsStatus(
-                "%s; next cell %d (%s) - background input unverified" %
-                (self._TwinSoulsSummary(snapshot), decision["cell_index"],
-                 decision["mode"]))
-            return
-        # Adapter verified: dispatch a card action exactly once.
         card = self._TwinSoulsResolveCell(window, snapshot,
                                           decision["cell_index"])
         if card is None:
             self._TwinSoulsStatus("chosen cell unavailable; revalidating")
             return
+        if not self.twin_souls_adapter.dispatch_flip(card):
+            self._TwinSoulsStatus(
+                "%s; next cell %d (%s) - flip unavailable" %
+                (self._TwinSoulsSummary(snapshot), decision["cell_index"],
+                 decision["mode"]))
+            return
         tracker.mark_pending_flip(decision["cell_index"], snapshot)
-        # NOTE: dispatch through the verified adapter here; never call
-        # card.OnMouseLeftButtonDown() directly.
 
     def _TwinSoulsResolveCell(self, window, snapshot, cell):
         if window is None:
@@ -3219,6 +3290,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         return None
 
     def _TwinSoulsHandleFinishing(self, snapshot):
+        self.twin_souls_tracker.clear_pending_start()
+        self.twin_souls_tracker.clear_pending_flip()
         if (snapshot.board_id == self.twin_souls_last_board and
                 self.twin_souls_last_board != self.twin_souls_last_finished_board):
             self.twin_souls_last_finished_board = snapshot.board_id
@@ -3233,6 +3306,8 @@ class MetinScanner(ui.BoardWithTitleBar):
     def _TwinSoulsHandleIdle(self, window, snapshot):
         cooldown = self._TwinSoulsCooldownRemaining(window)
         if cooldown > 0:
+            self.twin_souls_tracker.clear_pending_start()
+            self.twin_souls_tracker.clear_pending_flip()
             self._TwinSoulsStatus("cooldown %ds (%d/%d daily, %d/%d HWID)" %
                                   (int(cooldown), snapshot.plays_used,
                                    snapshot.plays_max, snapshot.plays_used_hwid,
@@ -3241,16 +3316,15 @@ class MetinScanner(ui.BoardWithTitleBar):
         if snapshot.plays_max <= 0 and snapshot.plays_max_hwid <= 0:
             self._TwinSoulsStatus("waiting for limits/state")
             return
-        if not self.twin_souls_adapter.is_verified():
-            self._TwinSoulsStatus("idle; waiting for verified background input")
-            return
         if (self.twin_souls_tracker.has_pending_start() or
                 bool(getattr(window, "openPending", False))):
             self._TwinSoulsStatus("start pending")
             return
-        # Adapter verified and all gates passed: dispatch one start here; never
-        # call _YinYangMemoryWindow__OnStartClicked() directly.
+        if not self.twin_souls_adapter.dispatch_start(window):
+            self._TwinSoulsStatus("idle; start unavailable")
+            return
         self.twin_souls_tracker.mark_pending_start()
+        self._TwinSoulsStatus("start dispatched")
 
     def PollTwinSouls(self, now):
         if not self.twin_souls_enabled:
@@ -3276,6 +3350,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 self._TwinSoulsStatus("waiting for state: %s" % (error or "unreadable"))
                 return
             self.twin_souls_last_state = snapshot.state
+            self._TwinSoulsTraceState(window, snapshot)
             reached = self._TwinSoulsLimitReached(snapshot)
             if reached:
                 self._TwinSoulsDisableForLimit(reached)
