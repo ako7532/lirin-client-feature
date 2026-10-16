@@ -384,4 +384,4 @@ with the login-screen snapshot.
 
 ## Private launcher updater
 
-See [setup, packaging, recovery, and validation](docs/LAUNCHER_UPDATER.md). The updater uses each user's GitHub authorization and requires a packaged installation under Program Files. Live two-account verification is still pending.
+See [setup, packaging, recovery, and validation](docs/LAUNCHER_UPDATER.md). The updater uses each user's GitHub authorization and supports portable installs in any folder outside a Git checkout. Live two-account verification is still pending.

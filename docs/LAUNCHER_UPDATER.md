@@ -48,17 +48,16 @@ and RepositoryPaths still use the original author's absolute Python 3.11 path;
 that existing limitation must be resolved separately for a different Windows
 profile before injection can work there. Updater tests do not invoke injection.
 
-Extract the complete package into a dedicated folder, for example
-`C:\Program Files\LirinFeature`. Use an elevated Explorer/PowerShell copy and
-make **Administrators** the owner of the package directory and files. Keep
-standard inherited Program Files permissions: ordinary users may read/execute,
-but must not write/delete/change permissions. Existing custom parent ACLs can
-cause a safe refusal. Never install into the Program Files root itself.
+Extract the complete package into any dedicated folder you control. Portable
+installs are supported: Program Files is no longer required, and the launcher
+self-updates in place wherever it is installed. The only location restrictions
+are that the folder must not be inside a Git checkout and must not sit on a
+reparse point (for example a OneDrive-redirected folder or a junction).
 
 The launcher refuses automatic replacement in a Git checkout, without a valid
-distribution marker/build identity, outside Program Files, through reparse
-points, or with nonadministrative write access. Portable/old/source builds can
-check releases but need manual migration. Existing settings, logs and `.runtime`
+distribution marker/build identity, or through reparse points. Portable/old/
+source builds can check releases but need manual migration. Existing settings,
+logs and `.runtime`
 can be copied into the new installation; they are never package-managed.
 
 Run the launcher as usual with its existing administrator requirement. Select

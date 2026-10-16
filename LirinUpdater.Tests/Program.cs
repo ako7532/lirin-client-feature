@@ -134,9 +134,13 @@ static Task Guards()
 {
     using var temp = new Temp();
     using (var operation = Installation.Lock(temp.Root)) Reject(() => { using var other = Installation.Lock(temp.Root); });
-    Reject(() => SafePaths.Installation(temp.Root));
-    Fixture(temp.Child("repo"), 1); File.WriteAllText(Path.Combine(temp.Child("repo"), ".git"), "gitdir: elsewhere");
-    Reject(() => SafePaths.Installation(temp.Child("repo")));
+    // Portable installs: any folder with the distribution marker is accepted, even outside Program Files.
+    Reject(() => SafePaths.Installation(temp.Child("nomarker")));
+    var portable = temp.Child("portable"); Fixture(portable, 1);
+    SafePaths.Installation(portable); // must not throw
+    // A Git checkout is still refused regardless of location.
+    var repo = temp.Child("repo"); Fixture(repo, 1); File.WriteAllText(Path.Combine(repo, ".git"), "gitdir: elsewhere");
+    Reject(() => SafePaths.Installation(repo));
     return Task.CompletedTask;
 }
 static HttpResponseMessage Response(string json, HttpStatusCode status = HttpStatusCode.OK) => new(status) { Content = new StringContent(json) };

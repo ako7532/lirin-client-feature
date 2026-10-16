@@ -16,7 +16,10 @@ public static class Installation
     }
     public static void ValidateStage(string root, string stage)
     {
-        if (Path.GetDirectoryName(Path.GetFullPath(stage)) != Path.GetFullPath(root) ||
+        if (!string.Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetDirectoryName(Path.GetFullPath(stage))!),
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)),
+                StringComparison.OrdinalIgnoreCase) ||
             !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(stage), "^\\.update-[a-f0-9]{32}$"))
             throw new IOException("Invalid update staging path.");
         SafePaths.AssertProtected(stage);

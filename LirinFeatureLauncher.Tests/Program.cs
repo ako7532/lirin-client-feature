@@ -7,7 +7,8 @@ List<(string Name, Func<Task> Body)> tests = new()
     ("selection is preserved only while PID remains", TestSelectionPreservation),
     ("PowerShell command uses separate arguments", TestCommandArguments),
     ("fast process exits preserve stdout and stderr", TestFastProcessExitRace),
-    ("errors are actionable and visible", TestVisibleErrors)
+    ("errors are actionable and visible", TestVisibleErrors),
+    ("repository root is normalized without a trailing separator", TestRepositoryRootNormalization)
 };
 
 int failures = 0;
@@ -118,6 +119,13 @@ static Task TestVisibleErrors()
     StatusPresentation executionPresentation = StatusPresentation.ForExecution(new ProcessExecutionResult(1, false, string.Empty, "specific runner failure\r\n"));
     Equal(LauncherState.Failed, executionPresentation.State);
     Contains("specific runner failure", executionPresentation.Message);
+    return Task.CompletedTask;
+}
+
+static Task TestRepositoryRootNormalization()
+{
+    Equal(@"C:\Program Files\LirinFeature", RepositoryPaths.FromRoot(@"C:\Program Files\LirinFeature\").Root);
+    Equal(@"C:\Program Files\LirinFeature", RepositoryPaths.FromRoot(@"C:\Program Files\LirinFeature").Root);
     return Task.CompletedTask;
 }
 

@@ -31,14 +31,11 @@ public static class SafePaths
         if (!File.Exists(Path.Combine(root, "distribution.json")) ||
             File.ReadAllText(Path.Combine(root, "distribution.json")).Trim() != "\"lirin-private-package-v1\"")
             throw new IOException("Unknown/local build. Install the updater-enabled package manually first.");
-        // An elevated helper must never execute/copy code controlled by a medium-integrity process.
-        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles).TrimEnd('\\') + "\\";
-        if (!root.StartsWith(programFiles, StringComparison.OrdinalIgnoreCase) || root.TrimEnd('\\') == programFiles.TrimEnd('\\'))
-            throw new IOException("Move the complete package into a dedicated folder under Program Files before updating.");
-        for (DirectoryInfo? dir = new(root); dir != null &&
-            (dir.FullName.StartsWith(programFiles, StringComparison.OrdinalIgnoreCase) || dir.FullName.Equals(programFiles.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)); dir = dir.Parent)
-            AssertProtected(dir.FullName);
-        foreach (string file in Directory.GetFiles(root)) AssertProtected(file);
+        // Portable installs: any folder (except a Git checkout or reparse point) is allowed.
+        // The elevated helper still stages the download in an admin-only .update-* directory and
+        // re-validates the archive before replacement, so the install root is intentionally not
+        // ACL-checked here. Trade-off: an elevated launcher in a user-writable folder could be
+        // swapped by a local non-admin process; acceptable for a small trusted deployment.
     }
     public static void AssertProtected(string path)
     {

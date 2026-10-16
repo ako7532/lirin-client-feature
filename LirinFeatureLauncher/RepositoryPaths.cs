@@ -4,7 +4,7 @@ public sealed record RepositoryPaths(string Root, string Runner, string FeatureL
 {
     public static RepositoryPaths FromRoot(string root)
     {
-        string fullRoot = Path.GetFullPath(root);
+        string fullRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         return new(
             fullRoot,
             Path.Combine(fullRoot, "run_client_feature.ps1"),
