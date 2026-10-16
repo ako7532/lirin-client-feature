@@ -1022,4 +1022,54 @@ with tempfile.TemporaryDirectory() as directory:
     snap = tracker.build_snapshot(window)
     assert snap is not None, "count validation rejected a valid follow state"
     assert snap.exact_opponent_led_value is None, snap.exact_opponent_led_value
+
+    # NativeActionCoordinator: explicit state machine with phase + deadline.
+    NativeActionCoordinator = duel_globals["NativeActionCoordinator"]
+    phase_box = [5]
+    clock_box = [1000.0]
+
+    def coord_phase():
+        return phase_box[0]
+
+    def coord_clock():
+        return clock_box[0]
+
+    coord = NativeActionCoordinator(coord_phase, coord_clock)
+    # Normal flow to completed.
+    aid = coord.request("queue_add", 10, 2.0)
+    assert coord.state(aid) == NativeActionCoordinator.REQUESTED
+    assert coord.validate(aid, True) == NativeActionCoordinator.VALIDATED
+    assert coord.dispatch(aid) == NativeActionCoordinator.AWAITING
+    assert (coord.acknowledge(aid, NativeActionCoordinator.COMPLETED) ==
+            NativeActionCoordinator.COMPLETED)
+    assert not coord.has_pending()
+    # Validation failure rejects.
+    aid2 = coord.request("queue_add", 0, 2.0)
+    assert coord.validate(aid2, False) == NativeActionCoordinator.REJECTED
+    # Deadline expiry becomes unknown.
+    aid3 = coord.request("queue_add", 11, 2.0)
+    coord.validate(aid3, True)
+    coord.dispatch(aid3)
+    assert coord.has_pending()
+    clock_box[0] += 10.0
+    coord.poll()
+    assert coord.state(aid3) == NativeActionCoordinator.UNKNOWN
+    assert not coord.has_pending()
+    # Phase change cancels a pending action.
+    aid4 = coord.request("queue_add", 12, 2.0)
+    coord.validate(aid4, True)
+    coord.dispatch(aid4)
+    phase_box[0] = 4
+    coord.on_phase_change()
+    assert coord.state(aid4) == NativeActionCoordinator.CANCELLED
+    # Explicit cancel and unknown acknowledgement.
+    aid5 = coord.request("ui_click", "card", 2.0)
+    coord.validate(aid5, True)
+    assert coord.cancel(aid5, "manual") == NativeActionCoordinator.CANCELLED
+    aid6 = coord.request("queue_add", 13, 2.0)
+    coord.validate(aid6, True)
+    coord.dispatch(aid6)
+    assert (coord.acknowledge(aid6, NativeActionCoordinator.UNKNOWN) ==
+            NativeActionCoordinator.UNKNOWN)
+
 print("Local map, safe hunter queue, boss flow, config persistence, reaction, hotkey, and gameplay-exit guard: OK")
