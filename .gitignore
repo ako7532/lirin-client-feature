@@ -5,8 +5,11 @@
 *.pdb
 client_feature_run_*.dll
 
-# Runtime state
-.runtime/
+# Runtime state (per-branch staging; keep only the collected duel history)
+.runtime/*
+!.runtime/*/
+.runtime/*/*
+!.runtime/*/yin_yang_duel_history.jsonl
 client_feature_active.txt
 client_feature_vids.txt
 client_feature_config.txt
