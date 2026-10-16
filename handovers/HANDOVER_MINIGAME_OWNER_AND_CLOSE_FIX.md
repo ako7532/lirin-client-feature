@@ -5,7 +5,11 @@ Branch: `handover/minigame-fix` (handover only; no fix applied here)
 Repository: `C:\Users\andrej-pc\Documents\projects\lirin-client-feature`
 
 This is a bug report + code map for a fresh chat to fix two minigame defects.
-No code has been changed for these bugs on this branch.
+
+> **Resolution (applied on this branch):** both defects are fixed in
+> `client_feature.py` and covered by `test_client_feature_local.py` (green).
+> See the "Resolution" sections under each bug below for the chosen design and
+> the items that still need live confirmation.
 
 ## Two reported defects
 
@@ -96,6 +100,17 @@ Whatever you choose, update the test at line 1193 and add cases for:
 duel idle/cooldown + twin souls enabled → `"twin_souls"`; duel at daily limit +
 twin souls enabled → `"twin_souls"`.
 
+### Resolution (applied)
+
+Chose option 2 — an explicit "duel is available to start" signal. `resolve_minigame_owner`
+now takes `(duel_enabled, duel_owns, duel_startable, twin_souls_enabled, twin_souls_owns)`
+and `duel_enabled` alone never claims the slot; an enabled duel claims it only when
+`duel_owns` (actively playing) or `duel_enabled and duel_startable` (idle, off
+cooldown, below daily limit). `_TwinSoulsArbiterOwner` computes `duel_startable` via a
+new `_DuelStartable` helper using a single `_DuelWindow()` lookup. Tests updated at
+`test_client_feature_local.py` (~1190) plus new `_DuelOwnsSlot`/`_DuelStartable`/
+`_DuelCloseResult` cases.
+
 ## Bug 2 — duel result screen not dismissed after finish
 
 ### Root cause
@@ -131,6 +146,26 @@ existing handovers). Treat them as hypotheses to confirm.
   (see `Twin Souls`/Reaction adapters for the pattern), not a private method call.
 - Make finish detection robust to the real state values, and schedule the close on
   whatever state the game actually enters after a match.
+
+### Resolution (applied)
+
+- Finish detection now fires on leaving the active states (`prev_state in (2,3,4)` and
+  `state not in (2,3,4)`) instead of requiring `state == 0`.
+- The result-screen dismissal is attempted after `YINYANG_DUEL_RESULT_CLOSE_DELAY`
+  **regardless of the post-match state** (moved out of the `state == 0` gate), so a
+  dedicated result state cannot leave it stuck.
+- `_DuelCloseResult` now precedes every dispatch with `emit_synthetic_click()` (matching
+  the reaction/duel card click paths), tries `YINYANG_DUEL_RESULT_CONTINUE_MEMBERS`, then
+  discovers any callable result/continue/confirm member via `duel_result_continue_member`,
+  and finally falls back to `window.Close()`.
+- Added `_DuelFinishDiagnostic` — a one-shot log of the post-finish `state` and the
+  window's result/continue/confirm/close/finish/end members — so the real dismissal
+  member can still be confirmed on the next live run.
+
+**Still needs live confirmation** (cannot be observed from unit tests): the actual
+post-finish `state` value and the exact result-screen continue member for the current
+game build. Capture the `Yin Yang Duel: finish observed at state=…` /
+`result members = …` lines after a real finish to verify or pin them down.
 
 ## Interaction (fix both together)
 

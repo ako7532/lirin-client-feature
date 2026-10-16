@@ -1187,12 +1187,86 @@ with tempfile.TemporaryDirectory() as directory:
     assert classify_memory_state(2) == "unknown"
     assert classify_memory_state("idle") == "idle"
 
-    # Minigame arbitration: active owner keeps the slot; deterministic priority.
-    assert resolve_minigame_owner(True, True, False, False) == "duel"
-    assert resolve_minigame_owner(False, False, True, True) == "twin_souls"
-    assert resolve_minigame_owner(True, False, True, False) == "duel"
-    assert resolve_minigame_owner(False, False, True, False) == "twin_souls"
-    assert resolve_minigame_owner(False, False, False, False) is None
+    # Minigame arbitration: active owner keeps the slot; an enabled duel claims
+    # the slot only while it is actively playing or idle-but-startable.
+    assert resolve_minigame_owner(True, True, False, False, False) == "duel"
+    assert resolve_minigame_owner(False, False, False, True, True) == "twin_souls"
+    # Both enabled, neither owning: the duel is idle-but-startable, so it wins.
+    assert resolve_minigame_owner(True, False, True, True, False) == "duel"
+    # Both enabled, neither owning, duel on cooldown / at limit: Twin Souls wins.
+    assert resolve_minigame_owner(True, False, False, True, False) == "twin_souls"
+    assert resolve_minigame_owner(False, False, False, True, False) == "twin_souls"
+    assert resolve_minigame_owner(False, False, False, False, False) is None
+    # duel_enabled alone never claims the slot when the duel cannot act.
+    assert resolve_minigame_owner(True, False, False, False, False) is None
+
+    # Duel slot arbitration helpers (`_DuelOwnsSlot` / `_DuelStartable`) and the
+    # result-screen dismissal (`_DuelCloseResult`).
+    class FakeDuelWindow:
+        def __init__(self, state=0, used=0, maximum=8, cooldown=0.0):
+            self.state = state
+            self.duelsUsedHwid = used
+            self.duelsMaxHwid = maximum
+            self._cooldown = cooldown
+        def GetCooldownRemaining(self):
+            return self._cooldown
+
+    duel_original_find = panel.FindRuntimeObject
+    duel_window = FakeDuelWindow()
+    panel.FindRuntimeObject = lambda name, methods: (
+        duel_window if name == "YinYangDuelWindow" else None)
+    panel.yinyang_duel_enabled = True
+
+    duel_window.state = 2
+    assert panel._DuelOwnsSlot() is True
+    duel_window.state = 0
+    assert panel._DuelOwnsSlot() is False
+
+    assert panel._DuelStartable() is True
+    duel_window.duelsUsedHwid = 8
+    duel_window.duelsMaxHwid = 8
+    assert panel._DuelStartable() is False  # at daily limit
+    duel_window.duelsUsedHwid = 0
+    duel_window._cooldown = 30.0
+    assert panel._DuelStartable() is False  # on cooldown
+    duel_window._cooldown = 0.0
+    duel_window.state = 2
+    assert panel._DuelStartable() is False  # not idle
+    duel_window.state = 0
+    panel.yinyang_duel_enabled = False
+    assert panel._DuelStartable() is False  # disabled
+    assert panel._DuelOwnsSlot() is False
+    panel.yinyang_duel_enabled = True
+
+    # `_DuelCloseResult` dismisses via the known handler, a discovered member,
+    # or the Close() fallback.
+    dismissed = []
+    duel_window._YinYangDuelWindow__OnResultContinue = (
+        lambda: dismissed.append("continue"))
+    assert panel._DuelCloseResult(duel_window) is True
+    assert dismissed == ["continue"]
+    assert "result dismissed" in panel.yinyang_duel_label.text
+
+    dismissed[:] = []
+    del duel_window._YinYangDuelWindow__OnResultContinue
+    duel_window._YinYangDuelWindow__OnResultClicked = (
+        lambda: dismissed.append("discovered"))
+    assert panel._DuelCloseResult(duel_window) is True
+    assert dismissed == ["discovered"]
+
+    dismissed[:] = []
+    del duel_window._YinYangDuelWindow__OnResultClicked
+    duel_window.Close = lambda: dismissed.append("closed")
+    assert panel._DuelCloseResult(duel_window) is True
+    assert dismissed == ["closed"]
+    assert "closed" in panel.yinyang_duel_label.text
+
+    # No handler and no Close -> the result screen is left alone (returns False).
+    del duel_window.Close
+    assert panel._DuelCloseResult(duel_window) is False
+
+    panel.FindRuntimeObject = duel_original_find
+    panel.yinyang_duel_enabled = False
 
     class FakeMemoryWindow:
         def __init__(self, cards=None):

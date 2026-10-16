@@ -76,6 +76,17 @@ BOSS_RETURN_PROGRESS_DISTANCE = 25
 YINYANG_DUEL_POLL_SECONDS = 1.0
 YINYANG_DUEL_RESULT_CLOSE_DELAY = 1.5
 YINYANG_DUEL_ATTEMPTS_PER_DAY = 8
+# Reverse-engineered candidates for the end-of-duel result-screen continue
+# handler. The real member name is unverified against the current game build;
+# `duel_result_continue_member` also discovers any callable result/continue
+# member as a fallback, and `_DuelCloseResult` falls back to `Close()`.
+YINYANG_DUEL_RESULT_CONTINUE_MEMBERS = (
+    "_YinYangDuelWindow__OnResultContinue",
+    "_YinYangDuelWindow__OnResultClicked",
+    "_YinYangDuelWindow__OnClickResult",
+    "_YinYangDuelWindow__OnConfirm",
+    "_YinYangDuelWindow__OnOk",
+)
 YINYANG_DUEL_HISTORY_JSONL = os.path.join(DIRECTORY, "yin_yang_duel_history.jsonl")
 YINYANG_DUEL_HISTORY_SCHEMA = 1
 
@@ -948,23 +959,54 @@ def classify_memory_state(raw_state):
     return TWIN_SOULS_STATE_UNKNOWN
 
 
-def resolve_minigame_owner(duel_enabled, duel_owns, twin_souls_enabled,
-                           twin_souls_owns):
+def resolve_minigame_owner(duel_enabled, duel_owns, duel_startable,
+                           twin_souls_enabled, twin_souls_owns):
     """Return the single minigame allowed to act this update cycle.
 
     A controller with an active session or pending request (`*_owns`) keeps the
-    slot until it becomes idle/disabled; otherwise the deterministic priority
-    favours Yin Yang Duel.
+    slot until it becomes idle/disabled. An enabled duel additionally claims the
+    slot while it is idle-but-startable (off cooldown and below its daily limit)
+    so it can start a new duel. `duel_enabled` alone never claims the slot: a
+    duel that is idle and cannot act (cooldown, daily limit, or already
+    finished) yields to Twin Souls. When neither controller owns the slot the
+    deterministic priority still favours Yin Yang Duel (a startable duel wins
+    over an idle Twin Souls).
     """
     if duel_owns:
         return "duel"
     if twin_souls_owns:
         return "twin_souls"
-    if duel_enabled:
+    if duel_enabled and duel_startable:
         return "duel"
     if twin_souls_enabled:
         return "twin_souls"
     return None
+
+
+def duel_result_continue_member(window):
+    """Return (name, callable) for the duel result-screen continue handler.
+
+    The exact handler is reverse-engineered and unverified against the current
+    game build, so we try the known name-mangled candidates first and then any
+    callable member whose name mentions a result/continue/confirm action. Used
+    by `_DuelCloseResult` so a wrong guess degrades to a discovered member or a
+    `Close()` fallback instead of leaving the result screen stuck open.
+    """
+    for name in YINYANG_DUEL_RESULT_CONTINUE_MEMBERS:
+        member = getattr(window, name, None)
+        if callable(member):
+            return name, member
+    for name in dir(window):
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        lowered = name.lower()
+        if not any(token in lowered
+                   for token in ("result", "continue", "confirm")):
+            continue
+        member = getattr(window, name, None)
+        if callable(member):
+            return name, member
+    return None, None
 
 
 def memory_known_closed_mate(knowledge, face, snapshot, excluding):
@@ -2509,6 +2551,27 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.yinyang_duel_stall = message
             self.AddLine(message)
 
+    def _DuelFinishDiagnostic(self, window, state):
+        """Log the post-finish state and the window's result/continue members.
+
+        The post-match `state` and the result-screen continue handler are
+        reverse-engineered and unverified. This one-shot log (throttled by
+        `_DuelDebugLog`) captures the real values after a finish so the next
+        live run can confirm the dismissal member and any dedicated result
+        state.
+        """
+        self._DuelDebugLog("Yin Yang Duel: finish observed at state=%s" % state)
+        try:
+            members = [name for name in dir(window)
+                       if name.startswith("_YinYangDuelWindow__") and
+                       any(token in name.lower()
+                           for token in ("result", "continue", "confirm",
+                                         "close", "finish", "end"))]
+            self._DuelDebugLog("Yin Yang Duel: result members = %s" %
+                               ascii_text(repr(members)))
+        except Exception:
+            pass
+
     def _DuelRecordEvent(self, event):
         """Append one versioned JSON-lines event to the duel history."""
         try:
@@ -2661,16 +2724,35 @@ class MetinScanner(ui.BoardWithTitleBar):
         return False
 
     def _DuelCloseResult(self, window):
-        """Dismiss the end-of-duel result screen via its continue button."""
-        continue_btn = getattr(window, "_YinYangDuelWindow__OnResultContinue", None)
-        if not callable(continue_btn):
-            return False
-        try:
-            continue_btn()
-            self.yinyang_duel_label.SetText("Yin Yang Duel: result dismissed")
-            return True
-        except Exception:
-            return False
+        """Dismiss the end-of-duel result screen via its continue action.
+
+        The result-screen handler name is reverse-engineered and may vary by
+        build, so we try the known candidates, then any discovered
+        result/continue callable, and finally close the window as a last resort.
+        Each dispatch is preceded by a synthetic click so the handler sees the
+        same input a real click would produce (matching the reaction game and
+        the duel card click paths).
+        """
+        name, continue_action = duel_result_continue_member(window)
+        if continue_action is not None:
+            emit_synthetic_click()
+            try:
+                continue_action()
+                self.yinyang_duel_label.SetText(
+                    "Yin Yang Duel: result dismissed (%s)" % name)
+                return True
+            except Exception:
+                return False
+        close = getattr(window, "Close", None)
+        if callable(close):
+            emit_synthetic_click()
+            try:
+                close()
+                self.yinyang_duel_label.SetText("Yin Yang Duel: result window closed")
+                return True
+            except Exception:
+                return False
+        return False
 
     def _DuelEnsureStarted(self, window, state):
         if self._DuelEnsureVisible(window):
@@ -2756,7 +2838,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                         "opponent_score": opp_score,
                     })
                     self.yinyang_duel_last_scores = (our_score, opp_score)
-                if prev_state in (2, 3, 4) and state == 0:
+                if prev_state in (2, 3, 4) and state not in (2, 3, 4):
                     final_outcome = ("win" if our_score > opp_score else
                                      ("lose" if our_score < opp_score else "tie"))
                     self._DuelRecordEvent({
@@ -2767,10 +2849,15 @@ class MetinScanner(ui.BoardWithTitleBar):
                         "outcome": final_outcome,
                     })
                     # Schedule dismissal of the end-of-duel result screen once
-                    # its short reveal animation has had time to appear.
+                    # its short reveal animation has had time to appear. The
+                    # post-match state may be a dedicated result state rather
+                    # than exactly 0, so the finish is detected on leaving the
+                    # active states and the close is attempted regardless of the
+                    # exact state below.
                     self.yinyang_duel_result_closed = False
                     self.yinyang_duel_result_close_at = (
                         now + YINYANG_DUEL_RESULT_CLOSE_DELAY)
+                    self._DuelFinishDiagnostic(window, state)
             self.yinyang_duel_last_state = state
             # Clear the pending click once state leaves the pickable round.
             if state != 2 or round_num != tracker.last_round:
@@ -2787,15 +2874,19 @@ class MetinScanner(ui.BoardWithTitleBar):
                  duel_mask_count(_opp_rm), _opp_ok))
             if self._DuelTryPlay(window):
                 return
+            # Dismiss the end-of-duel result screen once its reveal delay has
+            # elapsed, regardless of the exact post-match state (the game may
+            # present the result in a dedicated state instead of returning to
+            # 0). Runs before the cooldown/start gating so the result screen
+            # can never block the next duel or Twin Souls.
+            if (not self.yinyang_duel_result_closed and
+                    now >= self.yinyang_duel_result_close_at):
+                if self._DuelCloseResult(window):
+                    self.yinyang_duel_result_closed = True
             # Only treat the cooldown as a gate when the duel is idle.  During
             # an active duel (state 2/3/4) GetCooldownRemaining reports the
             # countdown to the next duel, which must not be shown as a stall.
             if state == 0:
-                # Dismiss the end-of-duel result screen once it has shown.
-                if (not self.yinyang_duel_result_closed and
-                        now >= self.yinyang_duel_result_close_at):
-                    if self._DuelCloseResult(window):
-                        self.yinyang_duel_result_closed = True
                 cooldown = self._DuelCooldownRemaining(window)
                 if cooldown > 0:
                     self.yinyang_duel_label.SetText(
@@ -3000,19 +3091,47 @@ class MetinScanner(ui.BoardWithTitleBar):
             self._TwinSoulsDebugLog("Twin Souls: history write error %s" %
                                     ascii_text(exc))
 
-    def _DuelOwnsSlot(self):
+    def _DuelWindow(self):
+        """Return the duel window, or None when disabled or not yet discovered."""
         if not self.yinyang_duel_enabled:
-            return False
-        window = self.FindRuntimeObject("YinYangDuelWindow", ())
+            return None
+        return self.FindRuntimeObject("YinYangDuelWindow", ())
+
+    def _DuelOwnsSlot(self, window=None):
+        """True while a duel is actively playing (state 2/3/4)."""
+        if window is None:
+            window = self._DuelWindow()
+        return window is not None and getattr(window, "state", None) in (2, 3, 4)
+
+    def _DuelStartable(self, window=None):
+        """True when the duel is enabled, idle, off cooldown, and below its limit.
+
+        This is the signal that lets the duel claim the slot to *start* a new
+        duel; an enabled-but-idle duel on cooldown or at its daily limit is not
+        startable and therefore yields the slot to Twin Souls.
+        """
+        if window is None:
+            window = self._DuelWindow()
         if window is None:
             return False
-        return getattr(window, "state", None) in (2, 3, 4)
+        if getattr(window, "state", None) != 0:
+            return False
+        used = int(getattr(window, "duelsUsedHwid", 0) or 0)
+        maximum = int(getattr(window, "duelsMaxHwid", 0) or 0)
+        if maximum > 0 and used >= maximum:
+            return False
+        if self._DuelCooldownRemaining(window) > 0:
+            return False
+        return True
 
     def _TwinSoulsArbiterOwner(self):
-        duel_owns = self._DuelOwnsSlot()
+        window = self._DuelWindow()
+        duel_owns = self._DuelOwnsSlot(window)
+        duel_startable = self._DuelStartable(window)
         twin_owns = (self.twin_souls_tracker.has_pending_flip() or
                      self.twin_souls_tracker.has_pending_start())
         return resolve_minigame_owner(self.yinyang_duel_enabled, duel_owns,
+                                      duel_startable,
                                       self.twin_souls_enabled, twin_owns)
 
     def _TwinSoulsSummary(self, snapshot):
