@@ -1,0 +1,86 @@
+{
+  "validation_date_local": "2026-10-18",
+  "captured_utc": "2026-10-17T22:12:08.351057+00:00",
+  "scope": "opt-in native recorder-pair experiment; no manual-click equivalence or logout cure",
+  "repository": "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation",
+  "git_head": "36dccf64ec46fe6618a7286b9277bc29ca5bf9b7",
+  "feature_version": 50,
+  "executable_path": "C:\\Program Files (x86)\\Lirin\\app\\Lirin.exe",
+  "executable_sha256": "8b6f5ea90ae62f4fb54752b187897d60962ad80ff71bfc0a7bf277d5a52a75a0",
+  "files": {
+    "client_feature.py": {
+      "sha256": "9af5512e15fd007fd5c872ee67f189294758ad1b661a9becf885e5612fe5e6d9",
+      "bytes": 226293
+    },
+    "python_loader.cpp": {
+      "sha256": "e1229fda00d8ab3ca5ff824452fde16de61d77e204cfe2d53fcb7cd0734265ae",
+      "bytes": 42855
+    },
+    "run_client_feature.ps1": {
+      "sha256": "36af7eb85294183800f98d0f11d550ac00dc82b21cfdc4bda6b7859e1d831715",
+      "bytes": 8317
+    },
+    "test_hunter_recorder_pair.py": {
+      "sha256": "39a4e9f2a77735b389cb4821d17bbbd7cdd55c0953a31eda835052b214ab1f7d",
+      "bytes": 10711
+    },
+    "handovers/HANDOVER_HUNTER_RECORDER_PAIR_EXPERIMENT_20261018.md": {
+      "sha256": "250a202e5494bbf10a8647bbdff4d4f91dcee04fbb048aa04adf816034249d73",
+      "bytes": 10128
+    },
+    "client_feature_loader.dll": {
+      "sha256": "69bbbda4af4e85a172a7b46e0b7c8708f9154cc19ad66d80bd9a42ec19f84572",
+      "bytes": 152064
+    },
+    "client_feature_loader.obj": {
+      "sha256": "017f26bce22d5be23ab49febeaeaebc0b7f34c8c6bf161cdd118d73e1b6eac51",
+      "bytes": 39739
+    },
+    "test_client_feature_local.py": {
+      "sha256": "fc6564257e78212ca2627fa126649f797047e388cbba91d68bd0f7749ead87b4",
+      "bytes": 31022
+    },
+    "manual_queue_logging.py": {
+      "sha256": "be6455188db0a8f581c55fb8f35e86f9133a5665f0d0c66f99ba046057539e1d",
+      "bytes": 21134
+    },
+    "test_manual_queue_logging.py": {
+      "sha256": "d6552f10c384dc36fb02dea62298ddd8d6b5d465da0fe5fd528595c0481792f3",
+      "bytes": 11592
+    },
+    "build.ps1": {
+      "sha256": "799d8e37b68c67f8b74152604928d64de4ef784dbe6277414cbae2320e6b9e93",
+      "bytes": 2962
+    }
+  },
+  "preexisting_unrelated_base_files_verified_unchanged": [
+    "test_client_feature_local.py",
+    "manual_queue_logging.py",
+    "test_manual_queue_logging.py",
+    "build.ps1",
+    "scripts/analyze_manual_metin_queue.py"
+  ],
+  "checks": {
+    "experiment_tests": "python -B -m unittest -v test_hunter_recorder_pair: 18 passed",
+    "feature_checks": "python -B test_client_feature_local.py: OK",
+    "manual_logging_checks": "python -B test_manual_queue_logging.py: OK",
+    "git_diff_check": "git diff --check: passed; inherited line-ending warnings only",
+    "build": "build.ps1 -FeatureOnly: passed (normal x64 feature DLL build)",
+    "powershell_parser": "candidate run_client_feature.ps1 parsed; installed bytes match",
+    "python_ascii_syntax": "client_feature.py and test_hunter_recorder_pair.py: passed",
+    "native_guard_harness": "passed; exact extracted guards with producer calls stubbed; real SEH faults"
+  },
+  "native_guard_harness_sha256": "745f06868052aed21c9cccaffe2b1c72ecf47c802038bd0bdc648b24179e0180",
+  "native_guard_harness_source_sha256": "8011f508cebb042d3cd7acf2eadb17ee10273917de4d11e9fec736c17bef73f7",
+  "not_performed": [
+    "injection",
+    "game launch",
+    "live test",
+    "traffic capture",
+    "commit",
+    "push"
+  ],
+  "runtime_staging": "not changed by implementation; user-run launcher stages V50 later",
+  "scoped_diff_path": "C:\\Users\\andrej-pc\\Documents\\projects\\decomp\\recorder_pair_experiment_20261017\\artifacts\\RECORDER_PAIR_EXPERIMENT.patch",
+  "dirty_baseline_backup": "C:\\Users\\andrej-pc\\Documents\\projects\\decomp\\recorder_pair_experiment_20261017\\before"
+}

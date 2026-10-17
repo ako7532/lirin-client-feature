@@ -1,0 +1,240 @@
+{
+  "captured_utc": "2026-10-17T22:58:01.107476+00:00",
+  "feature_version": 52,
+  "scope": "radar displays the exact Hunter range snapshot; automation unchanged",
+  "repository": "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation",
+  "git_head": "36dccf64ec46fe6618a7286b9277bc29ca5bf9b7",
+  "executable_path": "C:\\Program Files (x86)\\Lirin\\app\\Lirin.exe",
+  "executable_sha256": "8b6f5ea90ae62f4fb54752b187897d60962ad80ff71bfc0a7bf277d5a52a75a0",
+  "files": {
+    "client_feature.py": {
+      "sha256": "f0ba3788ac2f93f7c945bbb56ecd5acbc443ab6a5d7a117b5370a8f068f91cc9",
+      "bytes": 230550
+    },
+    "python_loader.cpp": {
+      "sha256": "e1229fda00d8ab3ca5ff824452fde16de61d77e204cfe2d53fcb7cd0734265ae",
+      "bytes": 42855
+    },
+    "run_client_feature.ps1": {
+      "sha256": "36af7eb85294183800f98d0f11d550ac00dc82b21cfdc4bda6b7859e1d831715",
+      "bytes": 8317
+    },
+    "build.ps1": {
+      "sha256": "799d8e37b68c67f8b74152604928d64de4ef784dbe6277414cbae2320e6b9e93",
+      "bytes": 2962
+    },
+    "test_client_feature_local.py": {
+      "sha256": "fc6564257e78212ca2627fa126649f797047e388cbba91d68bd0f7749ead87b4",
+      "bytes": 31022
+    },
+    "test_hunter_recorder_pair.py": {
+      "sha256": "39a4e9f2a77735b389cb4821d17bbbd7cdd55c0953a31eda835052b214ab1f7d",
+      "bytes": 10711
+    },
+    "test_hunter_available_refill.py": {
+      "sha256": "be3fe615dd96ca6c86f87535b9b5e3fd3afe50e296fe9bf73b888d0df04eddca",
+      "bytes": 9765
+    },
+    "manual_queue_logging.py": {
+      "sha256": "0a6de940bf43031edc8bdb9462b655bcd8223c06dd11382f1873e6988a1f45e6",
+      "bytes": 21133
+    },
+    "test_manual_queue_logging.py": {
+      "sha256": "51f55c640c54c6b41e560579d881f8447d878ca5dc43da1a04c1c60e32c042d3",
+      "bytes": 11591
+    },
+    "scripts/analyze_manual_metin_queue.py": {
+      "sha256": "03d4a10fe207a2bebeebb2dbf6d0ce6c30dc338e38a00b5bc605432769436f90",
+      "bytes": 12883
+    },
+    "client_feature_loader.dll": {
+      "sha256": "497d5bd8aa87ababeb8034ca2bf398b72b11579fbd690ee9971657ac8b7b2590",
+      "bytes": 152064
+    },
+    "client_feature_loader.obj": {
+      "sha256": "16dbbd0a4419a3502bbf43f3495e0e307f58e0416ace6e452a7528f39251572e",
+      "bytes": 39739
+    },
+    "test_hunter_radar_range.py": {
+      "sha256": "edcb56d441e1f4949c800537dea75111c5525e769c5163835a71881bda049584",
+      "bytes": 7654
+    },
+    "handovers/HANDOVER_HUNTER_RADAR_RANGE_20261018.md": {
+      "sha256": "415b9ffcd8b2aade22559c5386efa0408330c81b7e68d8185c8f67ae3f6f6592",
+      "bytes": 5400
+    }
+  },
+  "unchanged_baseline_files": [
+    "python_loader.cpp",
+    "run_client_feature.ps1",
+    "build.ps1",
+    "test_client_feature_local.py",
+    "test_hunter_recorder_pair.py",
+    "test_hunter_available_refill.py"
+  ],
+  "checks": {
+    "-B -m unittest -v test_hunter_radar_range test_hunter_available_refill test_hunter_recorder_pair": {
+      "passed": true,
+      "output": "check_0.txt"
+    },
+    "-B test_client_feature_local.py": {
+      "passed": true,
+      "output": "check_1.txt"
+    },
+    "-B test_manual_queue_logging.py": {
+      "passed": true,
+      "output": "check_2.txt"
+    },
+    "git diff --check": {
+      "passed": true
+    },
+    "build.ps1 -FeatureOnly": {
+      "passed": true,
+      "output": "build_output.txt"
+    }
+  },
+  "artifacts": "C:\\Users\\andrej-pc\\Documents\\projects\\decomp\\radar_range_20261018",
+  "runtime_identities_verified_unchanged": {
+    "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation\\.runtime\\feature-hunter-reimplementation\\client_feature.py": "9af5512e15fd007fd5c872ee67f189294758ad1b661a9becf885e5612fe5e6d9",
+    "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation\\.runtime\\feature-hunter-reimplementation\\manual_queue_runtime_metadata.json": "eb14a85d14c8a910fdedd274e74096e27e9d1c202002bdd9a9d4c413fdde7f84",
+    "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation\\.runtime\\feature-hunter-reimplementation\\client_feature_run_0020908b45764c9d9755b4e3343bd33b.dll": "69bbbda4af4e85a172a7b46e0b7c8708f9154cc19ad66d80bd9a42ec19f84572"
+  },
+  "live_test_performed_by_agent": false,
+  "remaining_unknowns": [
+    "Exact reason for skipped stone; range checks unchanged",
+    "Complete manual-click equivalence and server acceptance",
+    "Logout cause and sustained live behavior"
+  ],
+  "publication_whitespace_normalization": {
+    "handovers/HANDOVER_MANUAL_QUEUE_LOGGING.md": {
+      "before_sha256": "876c8b0fbbfce3f00ad2885f0ca34638e1bb3a86672422968c9d9a5d87eae421",
+      "after_sha256": "325df355525d8c6c9d4f264f9367d4a78a1da7de0099d625931a3969ade89fa0",
+      "kind": "whitespace only"
+    },
+    "handovers/METIN_HUNTER_REIMPLEMENTATION_PLAN.md": {
+      "before_sha256": "66e6faa7d72c4d6f26ce948fade48be2ef8224f6465027e177ad90b0d80c6d68",
+      "after_sha256": "be8d1d4798fa299ac64ac5940b5cde52e90e378523cfd5a8a150e8947d4b2abd",
+      "kind": "whitespace only"
+    },
+    "manual_queue_logging.py": {
+      "before_sha256": "be6455188db0a8f581c55fb8f35e86f9133a5665f0d0c66f99ba046057539e1d",
+      "after_sha256": "0a6de940bf43031edc8bdb9462b655bcd8223c06dd11382f1873e6988a1f45e6",
+      "kind": "whitespace only; Python AST unchanged"
+    },
+    "native_contracts/1403ed2f0.c": {
+      "before_sha256": "8ce3fe58e60bce015e24e789119a0e620776fab95c52c960247b2b7f1d820817",
+      "after_sha256": "87335e2ac55dcd732a43fa5326a3d39e53e8f8d13a8043514ebbc1d289cbb85f",
+      "kind": "whitespace only"
+    },
+    "native_contracts/1403ed5a0.c": {
+      "before_sha256": "4013600f8c6f7c2edcf050c0a74879b197bbc541e8560ba40a025726e1cde875",
+      "after_sha256": "455dc0e320377f6f6651f492023e0b8910080b4c24a22f12f2fc6b6ec7384177",
+      "kind": "whitespace only"
+    },
+    "native_contracts/1403edec0.c": {
+      "before_sha256": "b3dc2b60022ab2f629cb9b7dedd6b97461ee5ab8a95dcf8afee2f49df68d035f",
+      "after_sha256": "0fdb73bffb9e66d29910f78e8e6d44171471ee0eb2aba819faa4c511408d5ce4",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140401210.c": {
+      "before_sha256": "ef1b5cbcc417b05e8714b4d7c4614715b6448f7a69bb3563170a55ab8cda44a1",
+      "after_sha256": "5f914bf48287cf91d807792dd48d8e895d8c8d85774712920555b2ac5f0489d0",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140401230.c": {
+      "before_sha256": "21014f59db6af11e748dbc0f14975362cecd31da766a4d5d10ef0d43b74e83ee",
+      "after_sha256": "ccfc14a1a1e020fc3ac87ee30aeb5a320907e0c80a91eb901812109cef6d552e",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140401290.c": {
+      "before_sha256": "4ab3fbdc261cda0bb096066f8869f80d5a6e65fc2135d2e9705d8e0e1ff59a60",
+      "after_sha256": "ba8b5b11c5b3efa2e1720b47417a7cfdf4c28336b529ed0761bf6dfe6d42efb6",
+      "kind": "whitespace only"
+    },
+    "native_contracts/1404012C0.c": {
+      "before_sha256": "6ce719fa22554fb26d04a9bd1eb3eed49faac39d6d19e34faf7594a6888ec095",
+      "after_sha256": "cdaff384a19e9b070647cf881008636ea350eb2d842f3f52f8da3fa721b9c079",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140401300.c": {
+      "before_sha256": "cf8e4409eaa4e73cf5613f6603707861bed08907c8da35c7366cc339782e934c",
+      "after_sha256": "299b57dfcc06da32acfc9e2908febdb4624582e2c94cd000854a30fe428def70",
+      "kind": "whitespace only"
+    },
+    "native_contracts/1408c7020.c": {
+      "before_sha256": "9180994b4c4b12fc1e3b781ec9f53d205f585808b1c36363de5ca473587cf06c",
+      "after_sha256": "f767ccd20b4ae4bb2d4354776a579c913547d94c5731e5ad5870297805dacf7e",
+      "kind": "whitespace only"
+    },
+    "native_contracts/1408c73e0.c": {
+      "before_sha256": "0d9d87d0237d74a0481fa34325a8ac4337bcef9e6d3b81cadb5c18beee64cb56",
+      "after_sha256": "73ee46fe2a0a259397e616c6aba4a5b557158c511d75e5f123a643b070301c39",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa5ea0.c": {
+      "before_sha256": "9791d0543a70d8910d9089d6aeaabb2cafa283a8c9ca9142c6c14de957425ce8",
+      "after_sha256": "ea2bdb4f46e5175d53cc5b440ce1bec9eefe88352ccdcd807e60da59083c9b73",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa6180.c": {
+      "before_sha256": "6c29a220cebc33ba9986393b420b52d5838f5b6d05e568de2eb479c95498f400",
+      "after_sha256": "d12cd8cc0842c824df29f38f78f4dbf5a987396953f76a8540e01550ac1576aa",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa6430.c": {
+      "before_sha256": "560a10f55b840995dc9e259f40bfa3172d1c19b144a1b32b7f38fa108d867ede",
+      "after_sha256": "304025bde997a2690a28f62f49d5bd13d894ed4cfe629df5abdaa9c54b34f670",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa65f0.c": {
+      "before_sha256": "002f0a1341964f6200d6cae460d45b472a6dac5d78269ee91af37af74ffbb1fc",
+      "after_sha256": "5958a18247aa60dc8f1ca16927710f472e61b8533d2e8b0962c99c5f6281f3f2",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa6700.c": {
+      "before_sha256": "c1759522064016fdcba8567cb5314d5e1d384ec61bcd7bd3af1e6915c5fb50f2",
+      "after_sha256": "9eb8a5fabee00861f350d55a503abac0853db4359dcd561b0554eb78e9f0356a",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140aa6c40.c": {
+      "before_sha256": "047f6ad347cfd59caadd6da268360df8c7d9db8ebb472e35c62ff565f960723f",
+      "after_sha256": "2abd4c7ca9ff8d6efb4e8415eb8603cd298c8c833debb754fd18a1745d3a8fe7",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140ace140.c": {
+      "before_sha256": "cc06a0609e5209122eabfc5a3b3eb64b44b142031e6d6a7e4917477b9bde37de",
+      "after_sha256": "8965c7e67d9ebbe85d5278af5041ba975af2900ccca40a33e5cf350788d2f138",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140adb780.c": {
+      "before_sha256": "58fb4373ed05ac37eb8d20f9468f910c3ea8c35f158111a45b0af52eea0cfdb9",
+      "after_sha256": "570ec1f36993697f7c3c127bf368a257b267d2a87a8878c496acb424f5dc9192",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140ae0f10.c": {
+      "before_sha256": "efe8b25d3c48d3200a53b864bbfaf86ef806a11638c40d8c862a67ffb856a8bc",
+      "after_sha256": "f2111def3f4b1129d7a7d75c54ad99bf0e92681f82f1857bb22249c7edb02bdd",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140b07000.c": {
+      "before_sha256": "a198b0881391d04ca25f6f8c2aff49673a65c8d5cb6b70932ca0f9acf3e13ca8",
+      "after_sha256": "f04eee24f12f6a4995138b8cc1edbaf44372f226fdc1b26491480258efdc8c53",
+      "kind": "whitespace only"
+    },
+    "native_contracts/140b0d5d0.c": {
+      "before_sha256": "3d1ef12c0601d7cda13c339f8c1838e392da6a17cc8571ae9ce340457febaa3f",
+      "after_sha256": "52c97f625e62080a27505c0f714b9b42de90c26025d14c3271e5b23e73e560c1",
+      "kind": "whitespace only"
+    },
+    "scripts/analyze_manual_metin_queue.py": {
+      "before_sha256": "a519d9429306f10deeea3743322e51a63fe492f3b9b68bad2e5e19d77cb0e81c",
+      "after_sha256": "03d4a10fe207a2bebeebb2dbf6d0ce6c30dc338e38a00b5bc605432769436f90",
+      "kind": "whitespace only; Python AST unchanged"
+    },
+    "test_manual_queue_logging.py": {
+      "before_sha256": "d6552f10c384dc36fb02dea62298ddd8d6b5d465da0fe5fd528595c0481792f3",
+      "after_sha256": "51f55c640c54c6b41e560579d881f8447d878ca5dc43da1a04c1c60e32c042d3",
+      "kind": "whitespace only; Python AST unchanged"
+    }
+  }
+}
