@@ -1,0 +1,95 @@
+{
+  "captured_utc": "2026-10-17T22:50:50.567877+00:00",
+  "feature_version": 51,
+  "scope": "available-fill burst completion; native recorder behavior unchanged",
+  "repository": "C:\\Users\\andrej-pc\\Documents\\projects\\lirin-client-feature-hunter-reimplementation",
+  "git_head": "36dccf64ec46fe6618a7286b9277bc29ca5bf9b7",
+  "executable_path": "C:\\Program Files (x86)\\Lirin\\app\\Lirin.exe",
+  "executable_sha256": "8b6f5ea90ae62f4fb54752b187897d60962ad80ff71bfc0a7bf277d5a52a75a0",
+  "files": {
+    "client_feature.py": {
+      "sha256": "dab3fa9b0c151a074e16e6ca8b97e06a57938d7b1ae607dc36de3d5d66169190",
+      "bytes": 227959
+    },
+    "python_loader.cpp": {
+      "sha256": "e1229fda00d8ab3ca5ff824452fde16de61d77e204cfe2d53fcb7cd0734265ae",
+      "bytes": 42855
+    },
+    "run_client_feature.ps1": {
+      "sha256": "36af7eb85294183800f98d0f11d550ac00dc82b21cfdc4bda6b7859e1d831715",
+      "bytes": 8317
+    },
+    "test_client_feature_local.py": {
+      "sha256": "fc6564257e78212ca2627fa126649f797047e388cbba91d68bd0f7749ead87b4",
+      "bytes": 31022
+    },
+    "test_hunter_recorder_pair.py": {
+      "sha256": "39a4e9f2a77735b389cb4821d17bbbd7cdd55c0953a31eda835052b214ab1f7d",
+      "bytes": 10711
+    },
+    "manual_queue_logging.py": {
+      "sha256": "be6455188db0a8f581c55fb8f35e86f9133a5665f0d0c66f99ba046057539e1d",
+      "bytes": 21134
+    },
+    "test_manual_queue_logging.py": {
+      "sha256": "d6552f10c384dc36fb02dea62298ddd8d6b5d465da0fe5fd528595c0481792f3",
+      "bytes": 11592
+    },
+    "build.ps1": {
+      "sha256": "799d8e37b68c67f8b74152604928d64de4ef784dbe6277414cbae2320e6b9e93",
+      "bytes": 2962
+    },
+    "client_feature_loader.dll": {
+      "sha256": "7a265ca09f976c8feeefaa34f3c053748db1f255b657198ffa8cba0ea704cab1",
+      "bytes": 152064
+    },
+    "client_feature_loader.obj": {
+      "sha256": "4d925811595ec757f09fd3d12c022cbd998f3447a16a6f235e0906b700305db8",
+      "bytes": 39739
+    },
+    "test_hunter_available_refill.py": {
+      "sha256": "be3fe615dd96ca6c86f87535b9b5e3fd3afe50e296fe9bf73b888d0df04eddca",
+      "bytes": 9765
+    },
+    "handovers/HANDOVER_HUNTER_AVAILABLE_REFILL_20261018.md": {
+      "sha256": "db8e747841d0a556b6852237be5584e7a9439c2b38094effbe45ebab4d5000d5",
+      "bytes": 5833
+    }
+  },
+  "unchanged_baseline_files": [
+    "python_loader.cpp",
+    "run_client_feature.ps1",
+    "test_client_feature_local.py",
+    "test_hunter_recorder_pair.py",
+    "manual_queue_logging.py",
+    "test_manual_queue_logging.py",
+    "build.ps1"
+  ],
+  "checks": {
+    "-B -m unittest -v test_hunter_available_refill test_hunter_recorder_pair": {
+      "passed": true,
+      "output": "check_0.txt"
+    },
+    "-B test_client_feature_local.py": {
+      "passed": true,
+      "output": "check_1.txt"
+    },
+    "-B test_manual_queue_logging.py": {
+      "passed": true,
+      "output": "check_2.txt"
+    },
+    "git diff --check": {
+      "passed": true
+    },
+    "build.ps1 -FeatureOnly": {
+      "passed": true
+    }
+  },
+  "artifacts": "C:\\Users\\andrej-pc\\Documents\\projects\\decomp\\available_refill_20261018",
+  "live_test_performed_by_agent": false,
+  "remaining_unknowns": [
+    "Exact reason for skipped stone; range checks unchanged",
+    "Complete manual-click equivalence and server acceptance",
+    "Logout cause and sustained live behavior"
+  ]
+}

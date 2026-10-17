@@ -31,91 +31,10 @@ static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_METHOD = 0x07525778;
 static constexpr ULONG_PTR RVA_METIN_QUEUE_ADD_BINDING = 0x004011C0;
 static constexpr ULONG_PTR RVA_PARSE_TUPLE_INTEGER = 0x008C7020;
 static constexpr ULONG_PTR RVA_ARGUMENT_ERROR = 0x008C7320;
-static constexpr ULONG_PTR RVA_BUILD_VALUE = 0x00AA5EA0;
-static constexpr ULONG_PTR RVA_INTEGER_FORMAT = 0x068FB3CC;
-static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x003EE6D0;
-static constexpr ULONG_PTR RVA_SET_MOUSE_STATE = 0x003E5940; // STALE (dead code since v35; no longer referenced)
-static constexpr ULONG_PTR RVA_RECORD_INPUT = 0x00497840;
 static constexpr ULONG_PTR RVA_INPUT_RECORDER = 0x07CCB198;
-static constexpr ULONG_PTR RVA_GET_CURSOR_POSITION = 0x00824180;
-static constexpr ULONG_PTR RVA_GAME_INSTANCE = 0x07CCAB50;
-static constexpr ULONG_PTR RVA_GAME_DOWN_DISPATCH = 0x00826C30;
-static constexpr ULONG_PTR RVA_GAME_UP_DISPATCH = 0x00826D90;
 static constexpr ULONG_PTR RVA_APP_GLOBAL = 0x07CD3168;
-// World->screen projection (the forward projection used by the pick path).
-// FUN_1404a2ec0 reads an actor's world position; FUN_14061ca10 sets up the
-// projection matrix (camera 2) that FUN_14061e430 consumes; DAT_147a6b678 is
-// the camera/graphics context, and DAT_1466e6050 is the position-Y obfuscation
-// key applied before projection.
-static constexpr ULONG_PTR RVA_GET_ACTOR_POSITION = 0x004D2E40;
-static constexpr ULONG_PTR RVA_PROJECTION_SETUP = 0x0065B530;
-static constexpr ULONG_PTR RVA_PROJECT = 0x0065CEF0;
-static constexpr ULONG_PTR RVA_CAMERA = 0x07CCAB48;
-static constexpr ULONG_PTR RVA_POS_Y_OBF = 0x068FCCF0;
-static constexpr ptrdiff_t CHARACTER_MANAGER_PICKED_ACTOR_OFFSET = 0xE0;
-static constexpr ptrdiff_t PLAYER_MOUSE_DOWN_OFFSET = 0xFF;
 static void AppendStatus(const wchar_t* status_path, const char* message);
 static BYTE* g_game_base = nullptr;
-static bool g_native_queue_wrapper_installed = false;
-static volatile LONG g_wrapper_owner = 0;
-
-// Return codes reported to Python through the wrapped MetinQueueAdd binding.
-// 0 = not added (invalid input, missing state, or the client rejected it);
-// 1 = requested VID newly present in the authoritative queue;
-// 2 = requested VID already present (no click dispatched);
-// 3 = outcome unknown (dispatch ran but queue membership did not change).
-static constexpr int ADD_NOT_ADDED = 0;
-static constexpr int ADD_ADDED = 1;
-static constexpr int ADD_ALREADY_PRESENT = 2;
-static constexpr int ADD_UNKNOWN = 3;
-
-static constexpr ptrdiff_t PLAYER_QUEUE_BEGIN_OFFSET = 0x4588;
-static constexpr ptrdiff_t PLAYER_QUEUE_END_OFFSET = 0x4590;
-
-// The authoritative Metin queue is a std::vector<int> at player+0x4588..0x4590.
-static bool QueueVectorValid(BYTE* player) {
-    __try {
-        DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
-        DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
-        // An empty std::vector has begin == end (both null when capacity is 0);
-        // that is valid, not a fault.  Only reject an inconsistent pair, a
-        // reversed range, or a misaligned element count.
-        if ((begin == nullptr) != (end == nullptr)) return false;
-        if (begin && end && end < begin) return false;
-        size_t bytes = reinterpret_cast<size_t>(end) - reinterpret_cast<size_t>(begin);
-        if (bytes % sizeof(DWORD) != 0) return false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
-}
-
-static bool QueueContainsVid(BYTE* player, int vid) {
-    __try {
-        DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
-        DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
-        if (!begin || !end || end < begin) return false;
-        for (DWORD* it = begin; it < end; ++it) {
-            if (static_cast<int>(*it) == vid) return true;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return false;
-}
-
-using ParseTupleInteger = char (*)(void*, int, int*);
-using ArgumentError = void* (*)(int);
-using BuildValue = void* (*)(const char*, ...);
-using GetActorByVid = void* (*)(void*, int);
-using SetMouseState = void (*)(void*, int, char);
-using RecordInput = void (*)(void*, char, int, int);
-using GetCursorPosition = void (*)(void*, int*, int*);
-using GameDownDispatch = bool (*)(void*, int, int);
-using GameUpDispatch = bool (*)(void*, int, int);
-using GetActorPosition = void (*)(void*, float*);
-using ProjectionSetup = void (*)();
-using Project = void (*)(void*, float, float, float, float*, float*, int*);
 
 // The character-manager red-black tree node (std::set), the same tree the
 // entity snapshot and chr.GetProjectPosition walk.  Fields verified against
@@ -134,472 +53,6 @@ struct CharacterNode {
 static_assert(offsetof(CharacterNode, is_nil) == 0x19, "character node sentinel offset changed");
 static_assert(offsetof(CharacterNode, vid) == 0x20, "character node VID offset changed");
 static_assert(offsetof(CharacterNode, actor) == 0x28, "character node actor offset changed");
-
-// Observe only. Do not generate input records or alter recorder settings.
-static void LogQueueInputState(int vid) {
-    char line[256] = {};
-    __try {
-        BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
-        if (!recorder) {
-            sprintf_s(line, "queue input diagnostic: tick=%llu vid=%d recorder=missing",
-                      GetTickCount64(), vid);
-        } else {
-            unsigned bg = 0;
-            unsigned mouse_down = 0;
-            __try {
-                BYTE* app = *reinterpret_cast<BYTE**>(g_game_base + RVA_APP_GLOBAL);
-                if (app) {
-                    bg = static_cast<unsigned>(app[0x20]);
-                }
-                BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
-                if (player) {
-                    mouse_down = static_cast<unsigned>(player[PLAYER_MOUSE_DOWN_OFFSET]);
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-            }
-            sprintf_s(line,
-                      "queue input diagnostic: tick=%llu vid=%d recorder_enabled=%u sample_ms=%u flush_ms=%u bg=%u mouse_down=%u",
-                      GetTickCount64(), vid, static_cast<unsigned>(recorder[8]),
-                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 10)),
-                      static_cast<unsigned>(*reinterpret_cast<WORD*>(recorder + 12)),
-                      bg, mouse_down);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        strcpy_s(line, "queue input diagnostic: recorder read unavailable");
-    }
-    AppendStatus(g_feature_status_path, line);
-}
-
-// Fill the client's own cursor position (client coordinates).  This is the
-// same source the input recorder logs for its movement samples, so a synthetic
-// click stays on the recorded movement path even while the window is unfocused
-// (the OS cursor would instead report wherever the physical pointer is).
-static void GetGameCursorPosition(int* out_x, int* out_y) {
-    *out_x = 0;
-    *out_y = 0;
-    void* game_instance = *reinterpret_cast<void**>(
-        g_game_base + RVA_GAME_INSTANCE);
-    if (!game_instance) return;
-    auto get_cursor_position = reinterpret_cast<GetCursorPosition>(
-        g_game_base + RVA_GET_CURSOR_POSITION);
-    __try {
-        get_cursor_position(game_instance, out_x, out_y);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        *out_x = 0;
-        *out_y = 0;
-    }
-}
-
-// Emit a bare synthetic left-click (down code 1, up code 2) into the client
-// input recorder.  FUN_140471b10 is a no-op while the recorder is disabled.
-// Used for UI automations (reaction game, channel dialog) that a human would
-// click but that never pass through the Windows mouse handler.
-//
-// Returns true only when both the down and up records were actually emitted
-// into an enabled recorder.  The whole path (recorder dereference, cursor
-// getter, and record calls) is fault-guarded.  This is a deprecated
-// compatibility path; it must not introduce a second recorder event alongside
-// real dispatch.
-static bool EmitSyntheticClick() {
-    bool emitted = false;
-    __try {
-        BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
-        if (recorder && recorder[8] != 0) {
-            int cursor_x = 0;
-            int cursor_y = 0;
-            GetGameCursorPosition(&cursor_x, &cursor_y);
-            auto record_input = reinterpret_cast<RecordInput>(
-                g_game_base + RVA_RECORD_INPUT);
-            record_input(recorder, 1, cursor_x, cursor_y);
-            record_input(recorder, 2, cursor_x, cursor_y);
-            emitted = true;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        emitted = false;
-    }
-    return emitted;
-}
-
-// Reproduce the WndProc mouse-down/up sequence at explicit client-pixel
-// coordinates: record down (code 1) -> game down dispatch -> record up
-// (code 2) -> game up dispatch.  No picker override; the client's own
-// hit-testing picks whatever is under those coordinates.
-//
-// The down/up dispatch results are captured and logged (route diagnostics),
-// and an access fault after the down dispatch triggers a best-effort release
-// so the player is never left in a pressed state.  Returns false when the game
-// instance is missing, the down dispatch faulted, or the down dispatch
-// reported that nothing was handled.
-// Log the viewport bounds and the player's post-down pick state so a failed
-// queue add can be classified as off-screen, ground-click, or wrong-actor.
-// player+0xec pick code: 0=cleared/unknown, 1=ground move, 2=item, 5=actor
-// (picked VID stored at player+0x58).  game+0x1c/0x18 are the viewport
-// width/height, game+0x30/0x34 the client offsets, game+0x20/0x24 the
-// normalized cursor written by the down dispatch.
-static void LogClickPickState(int vid, int x, int y) {
-    char line[352] = {};
-    __try {
-        void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
-        BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
-        int view_w = 0, view_h = 0, x_off = 0, y_off = 0, cur_x = 0, cur_y = 0;
-        unsigned pick_code = 0, picked_vid = 0, mouse_down = 0;
-        if (game_instance) {
-            view_w = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x1c);
-            view_h = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x18);
-            x_off = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x30);
-            y_off = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x34);
-            cur_x = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x20);
-            cur_y = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(game_instance) + 0x24);
-        }
-        if (player) {
-            pick_code = *reinterpret_cast<unsigned*>(player + 0xec);
-            picked_vid = *reinterpret_cast<unsigned*>(player + 0x58);
-            mouse_down = static_cast<unsigned>(player[PLAYER_MOUSE_DOWN_OFFSET]);
-        }
-        sprintf_s(line,
-                  "native click pick: vid=%d x=%d y=%d viewport=%dx%d off=%d,%d cursor=%d,%d pick_code=%u picked_vid=%u mouse_down=%u",
-                  vid, x, y, view_w, view_h, x_off, y_off, cur_x, cur_y,
-                  pick_code, picked_vid, mouse_down);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        sprintf_s(line, "native click pick: vid=%d x=%d y=%d unavailable", vid, x, y);
-    }
-    AppendStatus(g_feature_status_path, line);
-}
-
-static bool DispatchClickAt(int vid, int x, int y) {
-    void* game_instance = *reinterpret_cast<void**>(g_game_base + RVA_GAME_INSTANCE);
-    if (!game_instance) return false;
-    auto record_input = reinterpret_cast<RecordInput>(g_game_base + RVA_RECORD_INPUT);
-    BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
-    auto game_down = reinterpret_cast<GameDownDispatch>(g_game_base + RVA_GAME_DOWN_DISPATCH);
-    auto game_up = reinterpret_cast<GameUpDispatch>(g_game_base + RVA_GAME_UP_DISPATCH);
-
-    bool down_dispatched = false;
-    bool up_dispatched = false;
-    bool fault = false;
-    __try {
-        if (recorder) record_input(recorder, 1, x, y);
-        down_dispatched = game_down(game_instance, x, y);
-        LogClickPickState(vid, x, y);
-        if (recorder) record_input(recorder, 2, x, y);
-        up_dispatched = game_up(game_instance, x, y);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        fault = true;
-    }
-
-    // If the down dispatch ran but the up dispatch faulted (or vice versa)
-    // before release, attempt a release once so player +0xFF is not stuck.
-    if (fault && down_dispatched) {
-        __try {
-            game_up(game_instance, x, y);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
-    }
-
-    {
-        char line[192] = {};
-        sprintf_s(line,
-                  "native click dispatch: x=%d y=%d down=%d up=%d fault=%d",
-                  x, y, down_dispatched ? 1 : 0, up_dispatched ? 1 : 0,
-                  fault ? 1 : 0);
-        AppendStatus(g_feature_status_path, line);
-    }
-
-    if (fault) {
-        AppendStatus(g_feature_status_path, "native queue wrapper click dispatch fault");
-        return false;
-    }
-    return down_dispatched;
-}
-
-// Performs the actual click dispatch for a positive VID, assuming the
-// re-entrancy guard is held.  Returns an ADD_* code.  The acknowledgement is
-// derived from the requested VID's membership in the authoritative queue, not
-// from a raw size delta (a click can remove-then-add, keeping the size equal).
-static constexpr int PROJECT_CLICK_HEIGHT = 100;
-
-// Linear scan of the character-manager tree for the actor matching a VID.
-// Mirrors chr.GetProjectPosition's resolution (the same tree the entity
-// snapshot walks) so the projected position matches what the pick uses.
-static void* FindActorByVid(BYTE* manager, int vid) {
-    __try {
-        CharacterNode* head = manager ? *reinterpret_cast<CharacterNode**>(manager + 0xf8) : nullptr;
-        if (!head) return nullptr;
-        CharacterNode* node = head->left;
-        for (int count = 0; node && node != head && count < 4096; ++count) {
-            if (node->is_nil) break;
-            if (node->actor && static_cast<int>(node->vid) == vid) {
-                return node->actor;
-            }
-            if (node->right && !node->right->is_nil) {
-                node = node->right;
-                int hops = 0;
-                while (node->left && !node->left->is_nil && hops++ < 4096) node = node->left;
-                if (hops >= 4096) return nullptr;
-            } else {
-                CharacterNode* parent = node->parent;
-                int hops = 0;
-                while (parent && !parent->is_nil && node == parent->right && hops++ < 4096) {
-                    node = parent;
-                    parent = parent->parent;
-                }
-                if (hops >= 4096) return nullptr;
-                node = parent;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-    return nullptr;
-}
-
-// Project an actor VID to client-pixel screen coordinates.  Unlike the Python
-// chr.GetProjectPosition binding, this refreshes the projection matrix first
-// (FUN_14061ca10, which player.GetProjectPosition also calls but
-// chr.GetProjectPosition skips), so the result aligns with the rendered screen
-// rect the pick uses.  Returns false when the actor is unresolvable or the
-// projection reports the point is behind the camera.
-static bool ProjectActorToScreen(int vid, int height, int* out_x, int* out_y) {
-    *out_x = -100;
-    *out_y = -100;
-    __try {
-        BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
-        void* actor = FindActorByVid(manager, vid);
-        if (!actor) return false;
-
-        float pos[3] = { 0.0f, 0.0f, 0.0f };
-        auto get_position = reinterpret_cast<GetActorPosition>(g_game_base + RVA_GET_ACTOR_POSITION);
-        get_position(actor, pos);
-
-        auto setup = reinterpret_cast<ProjectionSetup>(g_game_base + RVA_PROJECTION_SETUP);
-        setup();
-
-        void* camera = *reinterpret_cast<void**>(g_game_base + RVA_CAMERA);
-        if (!camera) return false;
-
-        float x = pos[0];
-        unsigned y_bits = *reinterpret_cast<unsigned*>(&pos[1]) ^
-                          *reinterpret_cast<unsigned*>(g_game_base + RVA_POS_Y_OBF);
-        float y = *reinterpret_cast<float*>(&y_bits);
-        float z = static_cast<float>(height) + pos[2];
-
-        auto project = reinterpret_cast<Project>(g_game_base + RVA_PROJECT);
-        float screen_x = 0.0f;
-        float screen_y = 0.0f;
-        int behind = 0;
-        project(camera, x, y, z, &screen_x, &screen_y, &behind);
-        if (behind == 1) return false;
-
-        *out_x = static_cast<int>(screen_x);
-        *out_y = static_cast<int>(screen_y);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static int NativeMetinQueueAddInner(int vid, int click_x, int click_y) {
-    LogQueueInputState(vid);
-
-    BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
-    BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
-    if (!player || !manager) {
-        AppendStatus(g_feature_status_path, "native queue wrapper skipped: singleton missing");
-        return ADD_NOT_ADDED;
-    }
-    if (!QueueVectorValid(player)) {
-        AppendStatus(g_feature_status_path, "native queue wrapper skipped: queue vector invalid");
-        return ADD_NOT_ADDED;
-    }
-
-    // Check membership before any click.  The native click path can remove an
-    // already-queued actor under its duplicate gate, so a click on an
-    // already-present VID must not be dispatched.
-    if (QueueContainsVid(player, vid)) {
-        AppendStatus(g_feature_status_path, "native queue wrapper: VID already present; no click");
-        return ADD_ALREADY_PRESENT;
-    }
-
-    if (player[PLAYER_MOUSE_DOWN_OFFSET] != 0) {
-        AppendStatus(g_feature_status_path, "native queue wrapper skipped: mouse already down");
-        return ADD_NOT_ADDED;
-    }
-
-    auto get_actor = reinterpret_cast<GetActorByVid>(g_game_base + RVA_GET_ACTOR_BY_VID);
-    void* target_actor = get_actor(player, vid);
-    if (!target_actor) {
-        AppendStatus(g_feature_status_path, "native queue wrapper skipped: actor unresolved");
-        return ADD_NOT_ADDED;
-    }
-
-    // Re-validate the singletons immediately before mutating shared state; a
-    // phase change may have replaced them between the checks above.
-    if (*reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON) != player ||
-        *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) != manager) {
-        AppendStatus(g_feature_status_path, "native queue wrapper skipped: singleton changed");
-        return ADD_NOT_ADDED;
-    }
-
-    // Resolve the click coordinates: explicit, or native projection.
-    int px = click_x;
-    int py = click_y;
-    if (click_x < 0 || click_y < 0) {
-        if (!ProjectActorToScreen(vid, PROJECT_CLICK_HEIGHT, &px, &py)) {
-            AppendStatus(g_feature_status_path,
-                         "native queue wrapper rejected: actor not projectable");
-            return ADD_NOT_ADDED;
-        }
-        {
-            char line[160] = {};
-            sprintf_s(line,
-                      "native queue wrapper route: native-projection vid=%d x=%d y=%d",
-                      vid, px, py);
-            AppendStatus(g_feature_status_path, line);
-        }
-    } else {
-        {
-            char line[160] = {};
-            sprintf_s(line,
-                      "native queue wrapper route: full-dispatch vid=%d x=%d y=%d",
-                      vid, px, py);
-            AppendStatus(g_feature_status_path, line);
-        }
-    }
-
-    // Reproduce the hover-pick state a physical mouse establishes: the click
-    // router resolves its actor through the manager's picked-actor field
-    // (manager+0xE0), which the synthetic down dispatch does not set (a real
-    // mouse sets it on hover, before the click).  Override it for the duration
-    // of the click, then restore it.  Combined with the full down/up dispatch
-    // above this reproduces the physical path: hover-pick + click.
-    void** picked_actor = reinterpret_cast<void**>(
-        manager + CHARACTER_MANAGER_PICKED_ACTOR_OFFSET);
-    void* saved_picked_actor = *picked_actor;
-    bool dispatched = false;
-    __try {
-        *picked_actor = target_actor;
-        dispatched = DispatchClickAt(vid, px, py);
-    } __finally {
-        // Restore only if the manager is still the same object we overrode.
-        __try {
-            if (*reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER) == manager) {
-                *picked_actor = saved_picked_actor;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-        }
-    }
-    if (!dispatched) {
-        return ADD_NOT_ADDED;
-    }
-
-    // Acknowledge by requested-VID membership change.  If the VID is not
-    // present after dispatch the outcome is unknown: do not report success and
-    // never immediately retry (the click may already have executed).
-    int outcome = QueueContainsVid(player, vid) ? ADD_ADDED : ADD_UNKNOWN;
-    {
-        char line[128] = {};
-        sprintf_s(line, "native queue wrapper result: vid=%d code=%d", vid, outcome);
-        AppendStatus(g_feature_status_path, line);
-    }
-    return outcome;
-}
-
-static void* NativeMetinQueueAdd(void*, void* args) {
-    auto parse_integer = reinterpret_cast<ParseTupleInteger>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
-    auto argument_error = reinterpret_cast<ArgumentError>(g_game_base + RVA_ARGUMENT_ERROR);
-    auto build_value = reinterpret_cast<BuildValue>(g_game_base + RVA_BUILD_VALUE);
-    const char* int_format = reinterpret_cast<const char*>(g_game_base + RVA_INTEGER_FORMAT);
-
-    int vid = 0;
-    if (!parse_integer(args, 0, &vid)) return argument_error(0);
-
-    if (vid < 0) return build_value(int_format, ADD_NOT_ADDED);
-
-    // Optional explicit click coordinates (client pixels).  When provided, the
-    // wrapper reproduces the full WndProc mouse-down/up dispatch at these
-    // coordinates.  vid == 0 with coordinates is a UI-control click; a positive
-    // VID with coordinates is a world-target click.
-    int click_x = -1;
-    int click_y = -1;
-    parse_integer(args, 1, &click_x);
-    parse_integer(args, 2, &click_y);
-
-    // Reject recursive re-entry before any mutation.  The owner is released on
-    // every exit below.
-    LONG owner = static_cast<LONG>(GetCurrentThreadId());
-    if (InterlockedCompareExchange(&g_wrapper_owner, owner, 0) != 0) {
-        AppendStatus(g_feature_status_path, "native queue wrapper re-entrant call rejected");
-        return build_value(int_format, ADD_NOT_ADDED);
-    }
-
-    int result = ADD_NOT_ADDED;
-    __try {
-        if (vid == 0) {
-            // vid == 0 sentinel: a bare synthetic click, or (with coordinates)
-            // a full-dispatch click on a UI control.  The latter is the
-            // replacement for the deprecated bare-record UI path.
-            if (click_x >= 0 && click_y >= 0) {
-                result = DispatchClickAt(vid, click_x, click_y) ? 1 : 0;
-            } else {
-                result = EmitSyntheticClick() ? 1 : 0;
-            }
-        } else {
-            result = NativeMetinQueueAddInner(vid, click_x, click_y);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        AppendStatus(g_feature_status_path, "native input queue wrapper access fault");
-        result = ADD_NOT_ADDED;
-    }
-    InterlockedExchange(&g_wrapper_owner, 0);
-    return build_value(int_format, result);
-}
-
-static bool InstallNativeMetinQueueWrapper(BYTE* base) {
-    // Only patch when the patch site is readable and the current entry is still
-    // the stock binding we expect.  The guard read below faults on an
-    // out-of-image or protected address instead of writing through it.
-    void** method = reinterpret_cast<void**>(base + RVA_METIN_QUEUE_ADD_METHOD);
-    void* expected = base + RVA_METIN_QUEUE_ADD_BINDING;
-    __try {
-        if (*method != expected) {
-            AppendStatus(g_feature_status_path,
-                         "native queue wrapper skipped: binding already changed");
-            return false;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        AppendStatus(g_feature_status_path,
-                     "native queue wrapper skipped: method table unreadable");
-        return false;
-    }
-    DWORD old_protection = 0;
-    if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) {
-        AppendStatus(g_feature_status_path,
-                     "native queue wrapper skipped: method table protect failed");
-        return false;
-    }
-    *method = reinterpret_cast<void*>(&NativeMetinQueueAdd);
-    DWORD ignored = 0;
-    VirtualProtect(method, sizeof(*method), old_protection, &ignored);
-    g_native_queue_wrapper_installed = true;
-    AppendStatus(g_feature_status_path, "native full-input queue wrapper installed");
-    return true;
-}
-
-static void RestoreNativeMetinQueueWrapper() {
-    if (!g_native_queue_wrapper_installed || !g_game_base) return;
-    void** method = reinterpret_cast<void**>(g_game_base + RVA_METIN_QUEUE_ADD_METHOD);
-    __try {
-        // Restore only the entry we own; never overwrite a foreign change.
-        if (*method != reinterpret_cast<void*>(&NativeMetinQueueAdd)) return;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return;
-    }
-    DWORD old_protection = 0;
-    if (!VirtualProtect(method, sizeof(*method), PAGE_READWRITE, &old_protection)) return;
-    *method = g_game_base + RVA_METIN_QUEUE_ADD_BINDING;
-    DWORD ignored = 0;
-    VirtualProtect(method, sizeof(*method), old_protection, &ignored);
-    g_native_queue_wrapper_installed = false;
-}
 
 static bool IsCurrentFeatureDll() {
     HANDLE file = CreateFileW(g_active_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -711,6 +164,575 @@ using ImportAddModule = void* (*)(const char*);
 using ModuleGetDict = void* (*)(void*);
 using RunStringFlags = void* (*)(const char*, int, void*, void*, void*);
 
+// ---------------------------------------------------------------------------
+// Native Hunter observer (read-only private module `_lirin_hunter_native`).
+// Every RVA below is verified in handovers/HUNTER_NATIVE_API_CONTRACT.md and
+// is used only as `g_game_base + RVA`.
+// ---------------------------------------------------------------------------
+#ifdef USE_FEATURE_SCRIPT
+
+static constexpr ULONG_PTR RVA_GET_ACTOR_BY_VID = 0x05353B0;   // FUN_1405353b0 (manager, vid)
+static constexpr ULONG_PTR RVA_QUEUE_ELIGIBILITY = 0x003ED370; // FUN_1403ed370 (player, actor)
+
+static constexpr ULONG_PTR RVA_INIT_MODULE4 = 0x00AA5ED0;
+static constexpr ULONG_PTR RVA_DICT_NEW = 0x00AE8AE0;
+static constexpr ULONG_PTR RVA_DICT_SET_ITEM_STRING = 0x00AE8D30;
+static constexpr ULONG_PTR RVA_TUPLE_NEW = 0x00AE0F10;
+static constexpr ULONG_PTR RVA_INT_FROM_LONG = 0x00ACE140;
+static constexpr ULONG_PTR RVA_LONG_FROM_ULONGLONG = 0x00AD2390;
+static constexpr ULONG_PTR RVA_STRING_FROM_STRING = 0x00ADB610;
+static constexpr ULONG_PTR RVA_PY_NONE = 0x075437D8;
+
+static constexpr ptrdiff_t PLAYER_QUEUE_BEGIN_OFFSET = 0x4588;
+static constexpr ptrdiff_t PLAYER_QUEUE_END_OFFSET = 0x4590;
+static constexpr ptrdiff_t PLAYER_QUEUE_CAP_OFFSET = 0x4598;
+static constexpr ptrdiff_t PLAYER_QUEUE_ENABLED_OFFSET = 0x457C;
+
+static constexpr size_t HUNTER_QUEUE_GUARD = 1024;
+static constexpr int HUNTER_OBSERVER_API_VERSION = 1;
+
+struct PyMethodDefNative {
+    const char* ml_name;
+    void* ml_meth;
+    int ml_flags;
+    const char* ml_doc;
+};
+#define METH_VARARGS 0x0001
+#define METH_NOARGS  0x0004
+
+using InitModule4Fn = void* (*)(const char*, void*, const char*, void*, int);
+using DictNewFn = void* (*)();
+using DictSetItemStringFn = int (*)(void*, const char*, void*);
+using TupleNewFn = void* (*)(long long);
+using IntFromLongFn = void* (*)(long);
+using LongFromULongLongFn = void* (*)(unsigned long long);
+using StringFromStringFn = void* (*)(const char*);
+using ParseTupleIntegerFn = char (*)(void*, int, int*);
+using ArgumentErrorFn = void* (*)(int);
+using GetActorByVidFn = void* (*)(void*, unsigned int);
+using EligibilityFn = int (*)(void*, void*);
+
+// Verified CPython 2.7 object header: ob_refcnt @0, ob_type @8; tp_dealloc at
+// ob_type + 0x30 (the same layout every decompiled DECREF site uses).
+struct PyObjectHeader { long long refcnt; void* type; };
+
+static void ObserverIncref(void* op) {
+    if (op) ++reinterpret_cast<PyObjectHeader*>(op)->refcnt;
+}
+
+static void ObserverDecref(void* op) {
+    if (!op) return;
+    PyObjectHeader* h = reinterpret_cast<PyObjectHeader*>(op);
+    if (--h->refcnt == 0) {
+        void* type = h->type;
+        void (*dealloc)(void*) = *reinterpret_cast<void(**)(void*)>(
+            reinterpret_cast<char*>(type) + 0x30);
+        dealloc(op);
+    }
+}
+
+// Copy the authoritative queue VIDs into a bounded buffer.  Returns the element
+// count, or -1 when the state is unreadable/invalid (never "empty").  The only
+// accepted empty state is begin == end == capacity == nullptr.  Enforces
+// 4-byte alignment, begin <= end <= capacity, and rechecks begin/end/capacity
+// after the copy.
+static long long ReadQueueVids(BYTE* player, unsigned int* out, size_t cap) {
+    __try {
+        DWORD* begin = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET);
+        DWORD* end = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET);
+        DWORD* capacity = *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_CAP_OFFSET);
+        // Reject any pointer that is not 4-byte aligned.
+        if ((reinterpret_cast<uintptr_t>(begin) % sizeof(DWORD)) != 0 ||
+            (reinterpret_cast<uintptr_t>(end) % sizeof(DWORD)) != 0 ||
+            (reinterpret_cast<uintptr_t>(capacity) % sizeof(DWORD)) != 0) return -1;
+        // Only the all-null triple is a valid empty vector.
+        if (begin == nullptr || end == nullptr || capacity == nullptr) {
+            if (begin == nullptr && end == nullptr && capacity == nullptr) return 0;
+            return -1;
+        }
+        if (end < begin || capacity < end) return -1;
+        size_t length = reinterpret_cast<size_t>(end) - reinterpret_cast<size_t>(begin);
+        size_t capacity_len = reinterpret_cast<size_t>(capacity) - reinterpret_cast<size_t>(begin);
+        if (length % sizeof(DWORD) != 0 || capacity_len % sizeof(DWORD) != 0) return -1;
+        length /= sizeof(DWORD);
+        capacity_len /= sizeof(DWORD);
+        if (length > HUNTER_QUEUE_GUARD || capacity_len > HUNTER_QUEUE_GUARD) return -1;
+        if (length > cap) return -1;
+        for (size_t i = 0; i < length; ++i) out[i] = static_cast<unsigned int>(begin[i]);
+        // Recheck metadata for a concurrent change.
+        if (*reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_BEGIN_OFFSET) != begin ||
+            *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_END_OFFSET) != end ||
+            *reinterpret_cast<DWORD**>(player + PLAYER_QUEUE_CAP_OFFSET) != capacity) return -1;
+        return static_cast<long long>(length);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// Set the standard dict keys for a valid/error result.  Values are borrowed
+// (the caller keeps ownership) except where noted; this helper does not steal.
+static void FillResultStatus(void* dict, bool valid, const char* error) {
+    auto dict_set = reinterpret_cast<DictSetItemStringFn>(g_game_base + RVA_DICT_SET_ITEM_STRING);
+    auto int_from_long = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    void* valid_obj = int_from_long(valid ? 1 : 0);
+    dict_set(dict, "valid", valid_obj);
+    ObserverDecref(valid_obj);
+    if (error == nullptr) {
+        void* none = reinterpret_cast<void*>(g_game_base + RVA_PY_NONE);
+        ObserverIncref(none);
+        dict_set(dict, "error", none);
+        ObserverDecref(none);
+    } else {
+        auto str_from_string = reinterpret_cast<StringFromStringFn>(g_game_base + RVA_STRING_FROM_STRING);
+        void* err_obj = str_from_string(error);
+        dict_set(dict, "error", err_obj);
+        ObserverDecref(err_obj);
+    }
+}
+
+static void* ObserverNowMs(void*, void*) {
+    auto long_from_ulonglong = reinterpret_cast<LongFromULongLongFn>(g_game_base + RVA_LONG_FROM_ULONGLONG);
+    return long_from_ulonglong(static_cast<unsigned long long>(GetTickCount64()));
+}
+
+// Convert the native player address to an opaque Python integer token.  The raw
+// C++ pointer is NEVER inserted into a Python container as a PyObject* (that
+// would let refcounting write into the player object).  A null cookie yields
+// None.
+static void SetPlayerCookie(void* dict, void* cookie) {
+    auto dict_set = reinterpret_cast<DictSetItemStringFn>(g_game_base + RVA_DICT_SET_ITEM_STRING);
+    auto long_from_ulonglong = reinterpret_cast<LongFromULongLongFn>(g_game_base + RVA_LONG_FROM_ULONGLONG);
+    void* token = nullptr;
+    if (cookie != nullptr) {
+        token = long_from_ulonglong(static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(cookie)));
+    } else {
+        token = reinterpret_cast<void*>(g_game_base + RVA_PY_NONE);
+        ObserverIncref(token);
+    }
+    dict_set(dict, "player_cookie", token);
+    ObserverDecref(token);
+}
+
+static void* ObserverSnapshot(void*, void*) {
+    auto dict_new = reinterpret_cast<DictNewFn>(g_game_base + RVA_DICT_NEW);
+    auto dict_set = reinterpret_cast<DictSetItemStringFn>(g_game_base + RVA_DICT_SET_ITEM_STRING);
+    auto tuple_new = reinterpret_cast<TupleNewFn>(g_game_base + RVA_TUPLE_NEW);
+    auto int_from_long = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    auto long_from_ulonglong = reinterpret_cast<LongFromULongLongFn>(g_game_base + RVA_LONG_FROM_ULONGLONG);
+
+    void* dict = dict_new();
+    if (dict == nullptr) return nullptr;
+
+    unsigned int vids[HUNTER_QUEUE_GUARD];
+    long long length = -1;
+    int enabled = 0;
+    int max_size = 0;
+    int binding_ok = 0;
+    bool valid = false;
+    const char* error = "unreadable";
+    void* cookie = nullptr;
+
+    __try {
+        BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+        if (player == nullptr) {
+            error = "player singleton missing";
+        } else {
+            cookie = player;
+            void* method = *reinterpret_cast<void**>(g_game_base + RVA_METIN_QUEUE_ADD_METHOD);
+            binding_ok = (method == reinterpret_cast<void*>(g_game_base + RVA_METIN_QUEUE_ADD_BINDING)) ? 1 : 0;
+            enabled = (*reinterpret_cast<char*>(player + PLAYER_QUEUE_ENABLED_OFFSET) != 0) ? 1 : 0;
+            length = ReadQueueVids(player, vids, HUNTER_QUEUE_GUARD);
+            if (length < 0) {
+                error = "queue vector unreadable";
+            } else {
+                // max_size is not derived here; the gateway sources it from the
+                // stock player.MetinQueueGetMaxSize() binding (the verified
+                // stock query).  max_size stays 0 in the raw snapshot.
+                valid = true;
+                error = nullptr;
+            }
+            // Recheck the singleton did not change during the copy.
+            if (valid && *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON) != player) {
+                valid = false;
+                length = -1;
+                error = "player singleton changed";
+                cookie = nullptr;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        valid = false;
+        length = -1;
+        error = "access fault";
+        cookie = nullptr;
+    }
+
+    // build the vids tuple (empty when invalid/unreadable)
+    void* tup = tuple_new(length > 0 ? length : 0);
+    if (tup == nullptr) { ObserverDecref(dict); return nullptr; }
+    if (length > 0) {
+        for (long long i = 0; i < length; ++i) {
+            void* vid_obj = int_from_long(static_cast<long>(vids[i]));
+            if (vid_obj == nullptr) { ObserverDecref(tup); ObserverDecref(dict); return nullptr; }
+            // PyTuple_SET_ITEM semantics: steal the new reference.
+            reinterpret_cast<void**>(tup)[3 + i] = vid_obj;
+        }
+    }
+
+    void* api_obj = int_from_long(HUNTER_OBSERVER_API_VERSION);
+    dict_set(dict, "api_version", api_obj);
+    ObserverDecref(api_obj);
+
+    FillResultStatus(dict, valid, error);
+
+    SetPlayerCookie(dict, cookie);
+    dict_set(dict, "vids", tup);
+    ObserverDecref(tup);
+
+    void* enabled_obj = int_from_long(enabled);
+    dict_set(dict, "enabled", enabled_obj);
+    ObserverDecref(enabled_obj);
+
+    void* max_obj = int_from_long(max_size);
+    dict_set(dict, "max_size", max_obj);
+    ObserverDecref(max_obj);
+
+    void* tick_obj = long_from_ulonglong(static_cast<unsigned long long>(GetTickCount64()));
+    dict_set(dict, "observed_tick_ms", tick_obj);
+    ObserverDecref(tick_obj);
+
+    void* binding_obj = int_from_long(binding_ok);
+    dict_set(dict, "stock_binding_ok", binding_obj);
+    ObserverDecref(binding_obj);
+
+    return dict;
+}
+
+static void* ObserverAdmission(void*, void* args) {
+    auto parse_integer = reinterpret_cast<ParseTupleIntegerFn>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
+    auto argument_error = reinterpret_cast<ArgumentErrorFn>(g_game_base + RVA_ARGUMENT_ERROR);
+    auto dict_new = reinterpret_cast<DictNewFn>(g_game_base + RVA_DICT_NEW);
+    auto dict_set = reinterpret_cast<DictSetItemStringFn>(g_game_base + RVA_DICT_SET_ITEM_STRING);
+    auto int_from_long = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    auto get_actor = reinterpret_cast<GetActorByVidFn>(g_game_base + RVA_GET_ACTOR_BY_VID);
+    auto eligibility = reinterpret_cast<EligibilityFn>(g_game_base + RVA_QUEUE_ELIGIBILITY);
+
+    int vid = 0;
+    if (!parse_integer(args, 0, &vid)) return argument_error(0);
+
+    void* dict = dict_new();
+    if (dict == nullptr) return nullptr;
+
+    bool valid = false;
+    int eligible = 0;
+    const char* reason = "unreadable";
+    void* cookie = nullptr;
+
+    __try {
+        if (vid <= 0) {
+            valid = true;
+            eligible = 0;
+            reason = "zero or negative VID";
+        } else {
+            BYTE* player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+            BYTE* manager = *reinterpret_cast<BYTE**>(g_game_base + RVA_CHARACTER_MANAGER);
+            if (player == nullptr || manager == nullptr) {
+                reason = "singleton missing";
+            } else {
+                cookie = player;
+                void* actor = get_actor(manager, static_cast<unsigned int>(vid));
+                if (actor == nullptr) {
+                    valid = true;
+                    eligible = 0;
+                    reason = "actor unresolved";
+                } else {
+                    valid = true;
+                    eligible = eligibility(player, actor) != 0 ? 1 : 0;
+                    reason = eligible ? nullptr : "native predicate rejected";
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        valid = false;
+        eligible = 0;
+        reason = "access fault";
+        cookie = nullptr;
+    }
+
+    FillResultStatus(dict, valid, reason);
+
+    void* eligible_obj = int_from_long(eligible);
+    dict_set(dict, "eligible", eligible_obj);
+    ObserverDecref(eligible_obj);
+
+    SetPlayerCookie(dict, cookie);
+
+    return dict;
+}
+
+static void* ObserverAuditStatus(void*, void*) {
+    auto dict_new = reinterpret_cast<DictNewFn>(g_game_base + RVA_DICT_NEW);
+    auto dict_set = reinterpret_cast<DictSetItemStringFn>(g_game_base + RVA_DICT_SET_ITEM_STRING);
+    auto int_from_long = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    auto long_from_ulonglong = reinterpret_cast<LongFromULongLongFn>(g_game_base + RVA_LONG_FROM_ULONGLONG);
+
+    void* dict = dict_new();
+    if (dict == nullptr) return nullptr;
+
+    bool valid = false;
+    const char* error = "unreadable";
+    int recorder_enabled = 0;
+    int sample_ms = 0;
+    int flush_ms = 0;
+    int app_active = 0;
+
+    __try {
+        BYTE* recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+        BYTE* app = *reinterpret_cast<BYTE**>(g_game_base + RVA_APP_GLOBAL);
+        if (recorder == nullptr || app == nullptr) {
+            error = "recorder or app singleton missing";
+        } else {
+            recorder_enabled = (recorder[8] != 0) ? 1 : 0;
+            sample_ms = static_cast<int>(*reinterpret_cast<WORD*>(recorder + 10));
+            flush_ms = static_cast<int>(*reinterpret_cast<WORD*>(recorder + 12));
+            app_active = static_cast<int>(app[0x20]);
+            valid = true;
+            error = nullptr;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        valid = false;
+        error = "access fault";
+    }
+
+    FillResultStatus(dict, valid, error);
+
+    void* tick_obj = long_from_ulonglong(static_cast<unsigned long long>(GetTickCount64()));
+    dict_set(dict, "observed_tick_ms", tick_obj);
+    ObserverDecref(tick_obj);
+
+    void* rec_obj = int_from_long(recorder_enabled);
+    dict_set(dict, "recorder_enabled", rec_obj);
+    ObserverDecref(rec_obj);
+
+    void* sample_obj = int_from_long(sample_ms);
+    dict_set(dict, "sample_ms", sample_obj);
+    ObserverDecref(sample_obj);
+
+    void* flush_obj = int_from_long(flush_ms);
+    dict_set(dict, "flush_ms", flush_obj);
+    ObserverDecref(flush_obj);
+
+    void* active_obj = int_from_long(app_active);
+    dict_set(dict, "app_active", active_obj);
+    ObserverDecref(active_obj);
+
+    return dict;
+}
+
+static PyMethodDefNative g_hunter_methods[] = {
+    {"now_ms",       reinterpret_cast<void*>(&ObserverNowMs),      METH_NOARGS,  "monotonic milliseconds (GetTickCount64)"},
+    {"snapshot",     reinterpret_cast<void*>(&ObserverSnapshot),   METH_NOARGS,  "authoritative queue snapshot (read-only)"},
+    {"admission",    reinterpret_cast<void*>(&ObserverAdmission),  METH_VARARGS, "full native queue eligibility for a VID"},
+    {"audit_status", reinterpret_cast<void*>(&ObserverAuditStatus), METH_NOARGS, "effective recorder/app-active status (read-only)"},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+static bool RegisterHunterNativeObserver() {
+    auto init_module4 = reinterpret_cast<InitModule4Fn>(g_game_base + RVA_INIT_MODULE4);
+    void* module = init_module4("_lirin_hunter_native", g_hunter_methods,
+                                "Read-only Hunter queue observation (API v1)",
+                                nullptr, 0x3f5);
+    return module != nullptr;
+}
+
+// Explicit experiment, separate from the read-only observer and stock binding.
+// Calls the native event producer only; no UI/button/picker/configuration writes.
+static constexpr ULONG_PTR RVA_RECORDER_EXPLICIT_EVENT = 0x00497840;
+static constexpr ULONG_PTR RVA_GAME_UI_GLOBAL = 0x07CCAB50;
+static constexpr ULONG_PTR RVA_GAME_STREAM_GLOBAL = 0x07CCAA18;
+using RecorderExplicitEventFn = void (*)(void*, unsigned char, int, int);
+
+struct RecorderPairContext {
+    BYTE* recorder;
+    BYTE* player;
+    BYTE* app;
+    BYTE* game;
+    BYTE* stream;
+    void* transport;
+    WORD sample_ms;
+    WORD flush_ms;
+    DWORD sample_due;
+    DWORD flush_due;
+    int width;
+    int height;
+    int x;
+    int y;
+    int active;
+    int requested_vid;
+};
+static RecorderPairContext g_recorder_pair = {};
+static bool g_recorder_pair_pending = false;
+static bool g_recorder_pair_failed = false;
+static DWORD g_recorder_pair_thread = 0;
+
+static void LogRecorderPair(const char* phase, int status,
+                            const RecorderPairContext& context) {
+    char line[256] = {};
+    if (status == 0) {
+        sprintf_s(line, "recorder_pair %s status=0 requested_vid=%d; "
+                  "recorder disabled, no event produced", phase, context.requested_vid);
+        AppendStatus(g_feature_status_path, line);
+        return;
+    }
+    sprintf_s(line,
+        "recorder_pair %s status=%d requested_vid=%d context_x=%d context_y=%d app_active=%d; "
+        "producer return is not delivery or manual-click equivalence",
+        phase, status, context.requested_vid, context.x, context.y, context.active);
+    AppendStatus(g_feature_status_path, line);
+}
+
+// 1=enabled context, 0=disabled (no producer call), negative=reject.
+static int ReadRecorderPairContext(RecorderPairContext* context, int vid) {
+    if (g_game_base == nullptr || GetCurrentThreadId() != g_recorder_pair_thread ||
+        !IsCurrentFeatureDll()) return -1;
+    __try {
+        // Exact-build producer prefix, verified from 140497840.json/.asm.
+        static const BYTE expected[] = {
+            0x40, 0x53, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00, 0x00,
+            0x48, 0x8b, 0x05, 0xf0, 0x77, 0x81, 0x07
+        };
+        if (memcmp(g_game_base + RVA_RECORDER_EXPLICIT_EVENT,
+                   expected, sizeof(expected)) != 0) return -1;
+        context->requested_vid = vid;
+        context->recorder = *reinterpret_cast<BYTE**>(g_game_base + RVA_INPUT_RECORDER);
+        context->player = *reinterpret_cast<BYTE**>(g_game_base + RVA_PLAYER_SINGLETON);
+        context->app = *reinterpret_cast<BYTE**>(g_game_base + RVA_APP_GLOBAL);
+        context->game = *reinterpret_cast<BYTE**>(g_game_base + RVA_GAME_UI_GLOBAL);
+        context->stream = *reinterpret_cast<BYTE**>(g_game_base + RVA_GAME_STREAM_GLOBAL);
+        if (!context->recorder || !context->player || !context->app ||
+            !context->game || !context->stream) return -1;
+        context->transport = *reinterpret_cast<void**>(context->stream + 0x58);
+        if (context->stream[0x199] != 5 || context->transport == nullptr ||
+            *reinterpret_cast<void**>(g_game_base + RVA_METIN_QUEUE_ADD_METHOD) !=
+                reinterpret_cast<void*>(g_game_base + RVA_METIN_QUEUE_ADD_BINDING)) return -1;
+        if (context->recorder[8] == 0) return 0;
+        context->sample_ms = *reinterpret_cast<WORD*>(context->recorder + 0x0a);
+        context->flush_ms = *reinterpret_cast<WORD*>(context->recorder + 0x0c);
+        context->sample_due = *reinterpret_cast<DWORD*>(context->recorder + 0x10);
+        context->flush_due = *reinterpret_cast<DWORD*>(context->recorder + 0x14);
+        context->width = *reinterpret_cast<int*>(context->game + 8);
+        context->height = *reinterpret_cast<int*>(context->game + 12);
+        context->active = context->app[0x20];
+        // Same sources as the native periodic sampler, no projected/forged coords.
+        BYTE* coordinates = context->active ? context->game + 0x20
+                                            : context->recorder + 0x9c;
+        context->x = *reinterpret_cast<int*>(coordinates);
+        context->y = *reinterpret_cast<int*>(coordinates + 4);
+        // Reject unsupported dimensions/overflowing normalization inputs.
+        if (context->width <= 0 || context->width > 65535 ||
+            context->height <= 0 || context->height > 65535 ||
+            context->x < -214748 || context->x > 214748 ||
+            context->y < -214748 || context->y > 214748) return -1;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+static int BeginRecorderPair(int vid) {
+    RecorderPairContext context = {};
+    context.requested_vid = vid;
+    if (g_recorder_pair_failed || g_recorder_pair_pending) return -1;
+    int status = ReadRecorderPairContext(&context, vid);
+    if (status == 1) {
+        // Mark before the call: a fault may occur after an append or cap flush.
+        g_recorder_pair = context;
+        g_recorder_pair_pending = true;
+        __try {
+            auto produce = reinterpret_cast<RecorderExplicitEventFn>(
+                g_game_base + RVA_RECORDER_EXPLICIT_EVENT);
+            produce(context.recorder, 1, context.x, context.y);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = -2; // Uncertain side effect; never retry.
+            g_recorder_pair_pending = false;
+        }
+    }
+    if (status < 0) g_recorder_pair_failed = true;
+    LogRecorderPair("down", status, context);
+    return status;
+}
+
+static int EndRecorderPair(int vid) {
+    // Keep the original context local, then consume it before any attempted up.
+    RecorderPairContext original = g_recorder_pair;
+    RecorderPairContext current = {};
+    if (!g_recorder_pair_pending || g_recorder_pair_failed ||
+        GetCurrentThreadId() != g_recorder_pair_thread) return -1;
+    g_recorder_pair_pending = false;
+    int status = ReadRecorderPairContext(&current, vid);
+    if (status != 1 || vid != original.requested_vid ||
+        current.recorder != original.recorder || current.player != original.player ||
+        current.app != original.app || current.game != original.game ||
+        current.stream != original.stream || current.transport != original.transport ||
+        current.sample_ms != original.sample_ms || current.flush_ms != original.flush_ms ||
+        current.sample_due != original.sample_due || current.flush_due != original.flush_due ||
+        current.width != original.width || current.height != original.height ||
+        current.active != original.active) {
+        status = -3; // Context/config changed: do not append into a new session.
+    } else {
+        __try {
+            auto produce = reinterpret_cast<RecorderExplicitEventFn>(
+                g_game_base + RVA_RECORDER_EXPLICIT_EVENT);
+            produce(original.recorder, 2, original.x, original.y);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = -2;
+        }
+    }
+    if (status < 0) g_recorder_pair_failed = true;
+    LogRecorderPair("up", status, original);
+    return status;
+}
+
+static void* RecorderPairBegin(void*, void* args) {
+    int vid = 0;
+    auto parse = reinterpret_cast<ParseTupleIntegerFn>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
+    if (!parse(args, 0, &vid) || vid <= 0) {
+        auto error = reinterpret_cast<ArgumentErrorFn>(g_game_base + RVA_ARGUMENT_ERROR);
+        return error(0);
+    }
+    auto make = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    return make(BeginRecorderPair(vid));
+}
+
+static void* RecorderPairEnd(void*, void* args) {
+    int vid = 0;
+    auto parse = reinterpret_cast<ParseTupleIntegerFn>(g_game_base + RVA_PARSE_TUPLE_INTEGER);
+    if (!parse(args, 0, &vid) || vid <= 0) {
+        auto error = reinterpret_cast<ArgumentErrorFn>(g_game_base + RVA_ARGUMENT_ERROR);
+        return error(0);
+    }
+    auto make = reinterpret_cast<IntFromLongFn>(g_game_base + RVA_INT_FROM_LONG);
+    return make(EndRecorderPair(vid));
+}
+
+static PyMethodDefNative g_recorder_pair_methods[] = {
+    {"begin_queue_add", reinterpret_cast<void*>(&RecorderPairBegin), METH_VARARGS,
+     "TEST ONLY: native down snapshot, no queue/button-state mutation"},
+    {"end_queue_add", reinterpret_cast<void*>(&RecorderPairEnd), METH_VARARGS,
+     "TEST ONLY: native up snapshot for the same guarded context"},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+static bool RegisterRecorderPairExperiment() {
+    g_recorder_pair_thread = GetCurrentThreadId();
+    auto init = reinterpret_cast<InitModule4Fn>(g_game_base + RVA_INIT_MODULE4);
+    return init("_lirin_recorder_pair_experiment", g_recorder_pair_methods,
+                "Opt-in recorder snapshots; NOT physical-click equivalence",
+                nullptr, 0x3f5) != nullptr;
+}
+
+#endif  // USE_FEATURE_SCRIPT
+
 static void AppendStatus(const wchar_t* status_path, const char* message) {
     HANDLE file = CreateFileW(status_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -795,12 +817,18 @@ static DWORD WINAPI RunProbe(void* module_ptr) {
     AppendStatus(status_path, "Python GIL acquired");
 #ifdef USE_FEATURE_SCRIPT
     g_game_base = base;
-    InstallNativeMetinQueueWrapper(base);
-    char source[MAX_PATH * 3 + 120] = {};
-    if (sprintf_s(source,
-                  "import __main__; __main__._lirin_native_queue_wrapper=%s; execfile(r'%s')",
-                  g_native_queue_wrapper_installed ? "True" : "False", script_path_utf8) <= 0) {
-        RestoreNativeMetinQueueWrapper();
+    if (!RegisterHunterNativeObserver()) {
+        AppendStatus(status_path, "Hunter observer module registration failed");
+    } else {
+        AppendStatus(status_path, "Hunter observer module registered");
+    }
+    if (!RegisterRecorderPairExperiment()) {
+        AppendStatus(status_path, "Recorder-pair experiment module registration failed");
+    } else {
+        AppendStatus(status_path, "Recorder-pair experiment module registered (opt-in only)");
+    }
+    char source[MAX_PATH * 3 + 32] = {};
+    if (sprintf_s(source, "execfile(r'%s')", script_path_utf8) <= 0) {
         release(gil_state);
         AppendStatus(status_path, "Python source construction failed");
         return 10;
@@ -817,9 +845,6 @@ static DWORD WINAPI RunProbe(void* module_ptr) {
     void* main_dict = main_module ? get_dict(main_module) : nullptr;
     void* result = main_dict ? run_string(source, 0x101, main_dict, main_dict, nullptr) : nullptr;
     AppendStatus(status_path, result ? "Python script returned successfully" : "Python call failed");
-#ifdef USE_FEATURE_SCRIPT
-    if (!result) RestoreNativeMetinQueueWrapper();
-#endif
     // A single probe run leaves one result reference; avoid guessing a deallocator address.
     release(gil_state);
     AppendStatus(status_path, "Python GIL released");
@@ -848,8 +873,6 @@ static DWORD WINAPI FeatureWakeThread(void*) {
     if (g_ready && !IsCurrentFeatureDll())
         AppendStatus(g_feature_status_path, "feature wake skipped: active DLL marker mismatch");
     while (g_ready && IsWindow(g_game_window) && IsCurrentFeatureDll()) {
-        // WH_CALLWNDPROC may not receive another message after injection. Keep
-        // the read-only entity snapshot independent of subsequent UI messages.
         if (!WriteVisibleVidsSnapshot() && GetTickCount64() - g_last_snapshot_error >= 5000) {
             g_last_snapshot_error = GetTickCount64();
             AppendStatus(g_feature_status_path, g_snapshot_error);
@@ -872,9 +895,6 @@ static LRESULT CALLBACK WindowHook(int code, WPARAM wparam, LPARAM lparam) {
             return next;
         }
         InterlockedExchange(&g_ready, 1);
-        // The feature snapshot has its own worker thread.  Keeping this hook
-        // installed would make every later window message pass through the
-        // injected DLL and synchronously re-read the marker file for no gain.
         HHOOK hook = g_hook;
         g_hook = nullptr;
         LRESULT next = CallNextHookEx(hook, code, wparam, lparam);

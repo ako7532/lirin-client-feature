@@ -28,23 +28,53 @@ except NameError:
 # execfile preserves the real script filename on the executing frame even
 # when the embedded __main__ module has no reliable __file__ value.
 DIRECTORY = os.path.dirname(os.path.abspath(sys._getframe().f_code.co_filename))
+_MANUAL_QUEUE_MODULE_PATH = os.path.join(DIRECTORY, "manual_queue_logging.py")
+_MANUAL_QUEUE_BOOTSTRAP_ERROR = os.path.join(
+    DIRECTORY, "manual_queue_bootstrap_error.log")
+try:
+    if not os.path.isfile(_MANUAL_QUEUE_MODULE_PATH):
+        import manual_queue_logging as _manual_queue_logging
+        ManualQueueLogger = _manual_queue_logging.ManualQueueLogger
+    else:
+        _manual_queue_namespace = {
+            "__file__": _MANUAL_QUEUE_MODULE_PATH,
+            "__name__": "_lirin_manual_queue_logging",
+        }
+        try:
+            execfile
+        except NameError:
+            _manual_queue_source = open(_MANUAL_QUEUE_MODULE_PATH, "rb").read()
+            exec(compile(_manual_queue_source, _MANUAL_QUEUE_MODULE_PATH, "exec"),
+                 _manual_queue_namespace)
+        else:
+            execfile(_MANUAL_QUEUE_MODULE_PATH, _manual_queue_namespace)
+        ManualQueueLogger = _manual_queue_namespace["ManualQueueLogger"]
+except Exception:
+    # This path runs before the ordinary feature logger exists. Keep bootstrap
+    # failures visible beside the staged script, then preserve the exception so
+    # the loader correctly reports Python-call failure.
+    try:
+        _bootstrap_handle = open(_MANUAL_QUEUE_BOOTSTRAP_ERROR, "a")
+        try:
+            _bootstrap_handle.write("%s\n" % traceback.format_exc())
+        finally:
+            _bootstrap_handle.close()
+    except Exception:
+        pass
+    raise
 SNAPSHOT = os.path.join(DIRECTORY, "client_feature_vids.txt")
 LOG = os.path.join(DIRECTORY, "metin_scanner.log")
 CONFIG = os.path.join(DIRECTORY, "client_feature_config.txt")
+MANUAL_QUEUE_LOG = os.path.join(DIRECTORY, "manual_metin_queue.jsonl")
+MANUAL_QUEUE_ENABLE = os.path.join(DIRECTORY, "manual_queue_logging.enabled")
+MANUAL_QUEUE_METADATA = os.path.join(DIRECTORY, "manual_queue_runtime_metadata.json")
+RECORDER_PAIR_MODE = os.path.join(DIRECTORY, "hunter_recorder_pair.mode.txt")
 MIN_RADIUS = 100
 MAX_RADIUS = 10000
 DEFAULT_RADIUS = 2500
-FEATURE_VERSION = 46
+FEATURE_VERSION = 52
 HUNTER_LIMIT = 5
-HUNTER_BURST_DELAY_MIN = 0.70
-HUNTER_BURST_DELAY_MAX = 2.50
-# Time-driven refill: after the queue is full, wait this noisy interval before
-# refilling again, matching the observed ~50s human rhythm instead of refilling
-# the instant a slot frees.
-HUNTER_REFILL_MIN = 35.0
-HUNTER_REFILL_MAX = 70.0
 PRIORITY_EVENT_METIN_NAME = "legendary metinstone"
-PRIORITY_EVENT_MISSING_SECONDS = 1.5
 REACTION_POLL_SECONDS = 0.05
 REACTION_DISCOVERY_SECONDS = 5.0
 REACTION_SAFETY_POLL_SECONDS = 0.25
@@ -131,8 +161,6 @@ BOSS_SWEEP_BUSY_STATES = (BOSS_WAIT_SPAWN, BOSS_FIND, BOSS_ATTACK,
 
 PHASE_LOADING = 4
 PHASE_GAME = 5
-NATIVE_QUEUE_WRAPPER_ACTIVE = bool(
-    getattr(__main__, "_lirin_native_queue_wrapper", False))
 
 
 def ascii_text(value):
@@ -149,172 +177,1206 @@ def next_reaction_click_delay():
                min(REACTION_CLICK_DELAY_MAX, delay))
 
 
-def emit_synthetic_click():
-    """Record a bare synthetic left-click for UI automations (reaction game,
-    channel dialog) that a human would click but that never pass through the
-    Windows mouse handler.  Calls MetinQueueAdd with the VID 0 sentinel, which
-    the native wrapper turns into a click-only record.  No-op without the
-    wrapper or while the input recorder is disabled."""
-    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
-        return
+def get_hunter_observer():
+    """Return the read-only native observer module, or None when unavailable.
+
+    The loader registers `_lirin_hunter_native` (API version 1) before running
+    this script.  Its absence is not a silent empty queue: the gateway reports
+    `valid=False` and Hunter stays unavailable."""
     try:
-        player.MetinQueueAdd(0)
+        import _lirin_hunter_native
+    except ImportError:
+        return None
+    return _lirin_hunter_native
+
+
+def hunter_now_ms():
+    """Monotonic clock backed by the observer's GetTickCount64.  None when the
+    observer (and therefore the monotonic clock) is unavailable."""
+    observer = get_hunter_observer()
+    if observer is None:
+        return None
+    try:
+        return int(observer.now_ms())
     except Exception:
-        pass
+        return None
 
 
-class QueueAddRejected(Exception):
-    """A queue add was rejected before any dispatch could run: the native
-    wrapper is missing or the target does not project on screen.  A certain,
-    pre-dispatch failure -- safe to try another target, and never to be
-    confused with an uncertain post-dispatch failure."""
+def recorder_pair_experiment_enabled():
+    """Explicit startup-only opt-in. Missing/invalid mode is OFF."""
+    try:
+        with open(RECORDER_PAIR_MODE, "rb") as source:
+            return source.read(32).strip() == b"on"
+    except IOError:
+        return False
 
 
-def _queue_add(vid):
-    """Add a VID through the native queue wrapper's full-dispatch route only.
-
-    The wrapper projects the target to on-screen client-pixel coordinates
-    natively (with the projection-matrix refresh the pick path requires) and
-    then reproduces the real WndProc mouse-down/up dispatch.  There is no
-    Python-side projection and no silent fallback to the single-argument
-    picker-override path: if the target does not project on screen, the wrapper
-    rejects it and the caller reports an explicit rejection.
-
-    The final MetinQueueAdd call is intentionally NOT wrapped here: an
-    exception after dispatch has begun is uncertain and must not be turned into
-    a fallback or a retry by the caller."""
-    if not NATIVE_QUEUE_WRAPPER_ACTIVE:
-        raise QueueAddRejected("native full-input queue wrapper missing")
-    return player.MetinQueueAdd(vid)
+def get_recorder_pair_experiment():
+    """Separate writer module; the native observer remains read-only."""
+    try:
+        import _lirin_recorder_pair_experiment
+    except ImportError:
+        return None
+    return _lirin_recorder_pair_experiment
 
 
-class NativeActionCoordinator(object):
-    """Tracks in-flight native actions through an explicit state machine.
+class HunterQueueGateway(object):
+    """Synchronous facade over the read-only observer and the stock `player`
+    bindings.  Every mutation runs synchronously on the update thread; deadlines
+    bound subsequent observation, never the duration of a native call.  No
+    background threads or blocking sleeps live here."""
 
-    Normal flow: requested -> validated -> dispatched -> awaiting -> completed.
-    Any non-terminal state may also become cancelled (phase change or explicit
-    cancel), rejected (validation failure), or unknown (deadline or ambiguous
-    outcome).  Each action records the phase generation it was requested under
-    and a wall-clock deadline."""
+    ALREADY_PRESENT = "ALREADY_PRESENT"
+    ADDED = "ADDED"
+    REJECTED_PRECALL = "REJECTED_PRECALL"
+    REJECTED_NATIVE = "REJECTED_NATIVE"
+    REMOVED = "REMOVED"
+    ALREADY_ABSENT = "ALREADY_ABSENT"
+    UNKNOWN = "UNKNOWN"
+    CANCELLED_PRECALL = "CANCELLED_PRECALL"
 
-    REQUESTED = "requested"
-    VALIDATED = "validated"
-    DISPATCHED = "dispatched"
-    AWAITING = "awaiting"
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-    UNKNOWN = "unknown"
+    def __init__(self, observer, player_module, clock=None,
+                 recorder_pair_enabled=False, recorder_pair=None, log=None):
+        self._observer = observer
+        self._player = player_module
+        self._clock = clock if clock is not None else hunter_now_ms
+        self._recorder_pair_enabled = bool(recorder_pair_enabled)
+        self._recorder_pair = recorder_pair
+        self._experiment_log = log or (lambda message: None)
+        self.input_experiment_error = None
 
-    _TERMINAL = (COMPLETED, CANCELLED, REJECTED, UNKNOWN)
-    _PENDING = (REQUESTED, VALIDATED, DISPATCHED, AWAITING)
+    def _pair_log(self, message):
+        # Logging must not interrupt the stock call or its finally block.
+        try:
+            self._experiment_log(message)
+        except Exception:
+            pass
 
-    def __init__(self, phase_getter, clock=time.time, retention=30.0):
-        self._phase_getter = phase_getter
-        self._clock = clock
-        self._retention = retention
-        self._next_id = 1
-        self._actions = {}
+    def _pair_failure(self, request, message):
+        self.input_experiment_error = message
+        request["recorder_pair_error"] = message
+        self._pair_log("recorder pair experiment HALTED: %s; no automatic retry" %
+                       message)
 
-    def request(self, action_type, target, timeout):
-        """Open a request.  Returns a fresh action id."""
-        action_id = self._next_id
-        self._next_id += 1
-        self._actions[action_id] = {
-            "type": action_type,
-            "target": target,
-            "state": self.REQUESTED,
-            "phase": self._phase_getter(),
-            "deadline": self._clock() + timeout,
-            "detail": None,
-            "terminal_at": None,
+    def _pair_begin(self, request, vid):
+        # Mark BEFORE calling: an exception can follow an uncertain append.
+        request["recorder_pair_attempted"] = True
+        try:
+            status = self._recorder_pair.begin_queue_add(vid)
+        except Exception as exc:
+            self._pair_failure(request, "down outcome unknown: %s" % ascii_text(exc))
+            return None
+        request["recorder_pair_begin_status"] = status
+        self._pair_log("recorder pair VID %d down status=%s (0=disabled, 1=producer returned)" %
+                       (vid, status))
+        if status not in (0, 1):
+            self._pair_failure(request, "down rejected/unknown status=%s" % status)
+            return None
+        return status == 1
+
+    def _pair_end(self, request, vid):
+        try:
+            status = self._recorder_pair.end_queue_add(vid)
+        except Exception as exc:
+            self._pair_failure(request, "up outcome unknown: %s" % ascii_text(exc))
+            return
+        request["recorder_pair_end_status"] = status
+        self._pair_log("recorder pair VID %d up status=%s (1=producer returned)" %
+                       (vid, status))
+        if status != 1:
+            self._pair_failure(request, "up rejected/unknown status=%s" % status)
+
+    def observer_available(self):
+        return self._observer is not None
+
+    def now_ms(self):
+        clock = self._clock
+        if clock is None:
+            return None
+        try:
+            return int(clock())
+        except Exception:
+            return None
+
+    def snapshot(self):
+        """Validated authoritative snapshot dict (see section 3.2)."""
+        base = {
+            "api_version": 1,
+            "valid": False,
+            "error": "observer unavailable",
+            "player_cookie": None,
+            "vids": (),
+            "enabled": False,
+            "max_size": 0,
+            "observed_tick_ms": None,
+            "stock_binding_ok": False,
         }
-        return action_id
+        if self._observer is None:
+            return base
+        try:
+            snap = self._observer.snapshot()
+        except Exception as exc:
+            base["error"] = "observer raised: %s" % ascii_text(exc)
+            return base
+        for key in base:
+            if key in snap:
+                base[key] = snap[key]
+        base["vids"] = tuple(int(v) for v in (snap.get("vids") or ()))
+        try:
+            stock_max = int(self._player.MetinQueueGetMaxSize())
+            if stock_max > 0:
+                base["max_size"] = stock_max
+        except Exception:
+            pass
+        if base.get("max_size") is None or int(base["max_size"] or 0) <= 0:
+            base["max_size"] = 0
+        return base
 
-    def state(self, action_id):
-        action = self._actions.get(action_id)
-        return action["state"] if action is not None else None
+    def admission(self, vid):
+        """Full native queue eligibility for a VID (read-only)."""
+        if self._observer is None:
+            return {"valid": False, "eligible": False,
+                    "reason": "observer unavailable", "player_cookie": None}
+        try:
+            return self._observer.admission(int(vid))
+        except Exception as exc:
+            return {"valid": False, "eligible": False,
+                    "reason": "admission raised: %s" % ascii_text(exc),
+                    "player_cookie": None}
 
-    def _transition(self, action_id, state, detail=None):
-        action = self._actions[action_id]
-        action["state"] = state
-        action["detail"] = detail
-        if state in self._TERMINAL and action["terminal_at"] is None:
-            action["terminal_at"] = self._clock()
-        return action
+    def audit_status(self):
+        """Read-only effective recorder/app-active status (section 3.3)."""
+        if self._observer is None:
+            return {"valid": False, "error": "observer unavailable",
+                    "observed_tick_ms": None, "recorder_enabled": 0,
+                    "sample_ms": 0, "flush_ms": 0, "app_active": 0}
+        try:
+            return self._observer.audit_status()
+        except Exception as exc:
+            return {"valid": False, "error": "audit raised: %s" % ascii_text(exc),
+                    "observed_tick_ms": None, "recorder_enabled": 0,
+                    "sample_ms": 0, "flush_ms": 0, "app_active": 0}
 
-    def validate(self, action_id, ok):
-        """REQUESTED -> VALIDATED, or REJECTED when validation fails."""
-        action = self._actions[action_id]
-        if action["state"] == self.REQUESTED:
-            if ok:
-                self._transition(action_id, self.VALIDATED)
+    def _dispatch_precheck(self, request):
+        """Fresh dispatch-time safety contract shared by add/remove.
+
+        Returns (pre, problem) where problem is None when safe to dispatch, or an
+        outcome string to return without mutating.  Always uses a fresh
+        authoritative snapshot; a cached pre-snapshot is never trusted."""
+        if request.get("dispatched"):
+            return None, self.CANCELLED_PRECALL
+        pre = self.snapshot()
+        request["pre_snapshot"] = pre
+        if not pre.get("valid"):
+            return pre, self.UNKNOWN
+        if not pre.get("stock_binding_ok"):
+            return pre, self.REJECTED_PRECALL
+        if pre.get("player_cookie") != request.get("player_cookie"):
+            return pre, self.CANCELLED_PRECALL
+        return pre, None
+
+    def add_once(self, request):
+        """One stock `player.MetinQueueAdd(vid)` under the full dispatch-time
+        contract.  Outcome is derived from authoritative membership, never a
+        truthy return alone.  A request already dispatched never executes again."""
+        vid = int(request["vid"])
+        if request.get("recorder_pair_attempted"):
+            return self.CANCELLED_PRECALL
+        if self.input_experiment_error:
+            return self.REJECTED_PRECALL
+        pre, problem = self._dispatch_precheck(request)
+        if problem is not None:
+            return problem
+        if vid in pre["vids"]:
+            return self.ALREADY_PRESENT
+        admission = self.admission(vid)
+        if not admission.get("valid"):
+            return self.UNKNOWN
+        if not admission.get("eligible"):
+            return self.REJECTED_PRECALL
+        pair_started = False
+        if self._recorder_pair_enabled:
+            if self._recorder_pair is None:
+                self._pair_failure(request, "native experiment module unavailable")
+                return self.REJECTED_PRECALL
+            pair_started = self._pair_begin(request, vid)
+            if pair_started is None:
+                return self.REJECTED_PRECALL
+        raw = None
+        try:
+            if pair_started:
+                # Recording can flush a full native sample buffer. Recheck
+                # identity/membership before the one queue mutation afterward.
+                checked = self.snapshot()
+                if (not checked.get("valid") or
+                        not checked.get("stock_binding_ok") or
+                        checked.get("player_cookie") != pre.get("player_cookie")):
+                    self._pair_failure(request, "identity unavailable/changed after down")
+                    return self.REJECTED_PRECALL
+                if vid in checked["vids"]:
+                    return self.ALREADY_PRESENT
+            request["dispatched"] = True
+            request["dispatched_ms"] = self.now_ms()
+            try:
+                raw = self._player.MetinQueueAdd(vid)
+            except Exception:
+                raw = None
+        finally:
+            if pair_started:
+                # A recorder up snapshot does not change OS/player button state.
+                # Never retry a failed/uncertain recorder call.
+                self._pair_end(request, vid)
+        request["raw_return"] = raw
+        post = self.snapshot()
+        request["last_snapshot"] = post
+        if not post.get("valid"):
+            return self.UNKNOWN
+        if post.get("player_cookie") != pre.get("player_cookie"):
+            return self.UNKNOWN
+        if vid in post["vids"]:
+            # Truthy stock return alone never means ADDED; membership is decisive.
+            # add returned falsy yet the VID is present -> invariant error, not a
+            # safe rejection.
+            return self.ADDED if raw else self.UNKNOWN
+        if raw == 0:
+            return self.REJECTED_NATIVE
+        return self.UNKNOWN
+
+    def remove_once(self, request):
+        """One verified `player.MetinQueueRemove(vid)` under the dispatch-time
+        contract."""
+        vid = int(request["vid"])
+        pre, problem = self._dispatch_precheck(request)
+        if problem is not None:
+            return problem
+        if vid not in pre["vids"]:
+            return self.ALREADY_ABSENT
+        request["dispatched"] = True
+        request["dispatched_ms"] = self.now_ms()
+        raw = None
+        try:
+            raw = self._player.MetinQueueRemove(vid)
+        except Exception:
+            raw = None
+        request["raw_return"] = raw
+        post = self.snapshot()
+        request["last_snapshot"] = post
+        if not post.get("valid"):
+            return self.UNKNOWN
+        if post.get("player_cookie") != pre.get("player_cookie"):
+            return self.UNKNOWN
+        if vid not in post["vids"]:
+            return self.REMOVED
+        return self.UNKNOWN
+
+    def set_enabled_once(self, value, lease=None):
+        """One `player.MetinQueueSetEnabled(value)` with post verification."""
+        pre = self.snapshot()
+        if not pre.get("valid") or not pre.get("stock_binding_ok"):
+            return "UNKNOWN", pre, pre
+        try:
+            self._player.MetinQueueSetEnabled(1 if value else 0)
+        except Exception:
+            return "UNKNOWN", self.snapshot(), pre
+        post = self.snapshot()
+        if post.get("valid") and bool(post["enabled"]) == bool(value):
+            return ("ENABLED" if value else "DISABLED"), post, pre
+        return "UNKNOWN", post, pre
+
+
+class HunterCandidateSelector(object):
+    """Publishes one immutable candidate snapshot per scan and selects one
+    candidate with deterministic nearest-then-VID ordering.  Names are for
+    display/priority only."""
+
+    def __init__(self, player_module, chr_module, nonplayer_module):
+        self._player = player_module
+        self._chr = chr_module
+        self._nonplayer = nonplayer_module
+
+    def publish(self, scan_vids, player_position, anchor_position, radius,
+                epoch, now_ms):
+        px, py = player_position[:2]
+        radius2 = float(radius) ** 2
+        candidates = []
+        for vid in scan_vids:
+            vid = int(vid)
+            if vid <= 0:
+                continue
+            try:
+                vnum = int(self._chr.GetVirtualNumber(vid))
+                name = ascii_text(self._chr.GetNameByVID(vid))
+                gx, gy = self._chr.GetPixelPosition(vid)[:2]
+            except Exception:
+                continue
+            if not self._nonplayer.IsMonsterStone(vnum):
+                continue
+            # squared-distance comparisons, no integer rounding
+            player_d2 = (gx - px) ** 2 + (gy - py) ** 2
+            if player_d2 > radius2:
+                continue
+            if anchor_position is not None:
+                ax, ay = anchor_position[:2]
+                if (gx - ax) ** 2 + (gy - ay) ** 2 > radius2:
+                    continue
+            candidates.append((player_d2, vid, name, vnum, gx, gy))
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return {
+            "epoch": epoch,
+            "created_ms": now_ms,
+            "radius": int(radius),
+            "player_position": (px, py),
+            "anchor_position": (tuple(anchor_position[:2])
+                                if anchor_position is not None else None),
+            "candidates": tuple(
+                {"vid": c[1], "name": c[2], "vnum": c[3],
+                 "x": c[4], "y": c[5], "distance2": c[0]}
+                for c in candidates),
+        }
+
+    @staticmethod
+    def _candidate_angle(snapshot, candidate):
+        px, py = snapshot.get("player_position") or (0, 0)
+        angle = math.degrees(math.atan2(candidate["y"] - py,
+                                        candidate["x"] - px))
+        return angle % 360.0
+
+    def select(self, snapshot, now_ms, queue_vids, excluded_vids, backoff,
+               priority=False, sweep_angle=None, sweep_direction=-1):
+        """Deterministic candidate selection: fresh snapshot (<=2000ms), not in
+        the authoritative queue, not excluded/pending, not in backoff; nearest
+        then VID.  Returns a candidate dict or None."""
+        if snapshot is None or now_ms is None:
+            return None
+        created = snapshot.get("created_ms")
+        if created is None or now_ms - created > 2000:
+            return None
+        eligible = []
+        for cand in snapshot["candidates"]:
+            vid = cand["vid"]
+            if vid in queue_vids or vid in excluded_vids:
+                continue
+            if now_ms < backoff.get(vid, 0):
+                continue
+            if priority and PRIORITY_EVENT_METIN_NAME not in cand["name"].lower():
+                continue
+            eligible.append(cand)
+        if not eligible:
+            return None
+        if priority or sweep_angle is None:
+            return eligible[0]
+
+        def sweep_key(candidate):
+            angle = self._candidate_angle(snapshot, candidate)
+            if sweep_direction < 0:
+                turn = (float(sweep_angle) - angle) % 360.0
             else:
-                self._transition(action_id, self.REJECTED, "invalid")
-        return action["state"]
+                turn = (angle - float(sweep_angle)) % 360.0
+            return (turn, candidate.get("distance2", 0), candidate["vid"])
 
-    def dispatch(self, action_id):
-        """VALIDATED -> DISPATCHED -> AWAITING."""
-        action = self._actions[action_id]
-        if action["state"] == self.VALIDATED:
-            self._transition(action_id, self.DISPATCHED)
-            self._transition(action_id, self.AWAITING)
-        return action["state"]
-
-    def acknowledge(self, action_id, outcome):
-        """AWAITING -> COMPLETED/UNKNOWN/REJECTED by the reported outcome."""
-        action = self._actions[action_id]
-        if action["state"] in (self.DISPATCHED, self.AWAITING):
-            terminal = {
-                self.COMPLETED: self.COMPLETED,
-                self.UNKNOWN: self.UNKNOWN,
-                self.REJECTED: self.REJECTED,
-            }.get(outcome, self.UNKNOWN)
-            self._transition(action_id, terminal, outcome)
-        return action["state"]
-
-    def cancel(self, action_id, reason="cancelled"):
-        action = self._actions[action_id]
-        if action["state"] not in self._TERMINAL:
-            self._transition(action_id, self.CANCELLED, reason)
-        return action["state"]
-
-    def on_phase_change(self):
-        """Cancel every pending action whose phase generation is now stale."""
-        current = self._phase_getter()
-        for action_id, action in list(self._actions.items()):
-            if action["state"] in self._PENDING and action["phase"] != current:
-                self._transition(action_id, self.CANCELLED, "phase change")
-
-    def poll(self):
-        """Move pending actions past their deadline to UNKNOWN and age out
-        terminal actions whose retention window has expired."""
-        now = self._clock()
-        for action_id, action in list(self._actions.items()):
-            if action["state"] in self._PENDING and now >= action["deadline"]:
-                self._transition(action_id, self.UNKNOWN, "deadline")
-            terminal_at = action.get("terminal_at")
-            if (action["state"] in self._TERMINAL and terminal_at is not None
-                    and now - terminal_at >= self._retention):
-                self._actions.pop(action_id, None)
-
-    def has_pending(self):
-        return any(a["state"] in self._PENDING for a in self._actions.values())
-
-    def finish(self, action_id):
-        """Drop a terminal action so the tracker does not grow unbounded."""
-        action = self._actions.get(action_id)
-        if action is not None and action["state"] in self._TERMINAL:
-            self._actions.pop(action_id, None)
+        return min(eligible, key=sweep_key)
 
 
-# Map the native wrapper's integer result to a coordinator outcome.
-_ADD_RESULT_OUTCOME = {
-    1: NativeActionCoordinator.COMPLETED,
-    2: NativeActionCoordinator.COMPLETED,
-    3: NativeActionCoordinator.UNKNOWN,
-    0: NativeActionCoordinator.REJECTED,
-}
+class ManualQueueRefillProfile(object):
+    """Cadence measured from the 2026-10-17 manual queue control.
+
+    The long samples are measured from the first observed vacancy until the
+    first addition in a refill burst.  The short samples are the observed gaps
+    between additions inside a burst.  Sampling the measured values preserves
+    the manual session's distribution without replaying a fixed timeline.
+    """
+
+    REFILL_START_DELAY_SAMPLES_MS = (
+        12984, 7688, 12297, 35531, 52547, 31718, 44922,
+        66266, 63000, 8156, 41781, 33282, 44156, 31500,
+        17281, 4406, 35781, 45500, 26625, 35016, 32281,
+    )
+    BURST_ADD_DELAY_SAMPLES_MS = (
+        437, 438, 453, 546, 547, 547, 547, 594, 656, 656,
+        656, 672, 688, 703, 704, 765, 765, 765, 765, 766,
+        766, 812, 891, 984, 984, 985, 1093, 1203, 1203,
+        1203, 1219, 1219, 1313, 1453, 1453, 1547, 1922,
+        2031, 2906,
+    )
+    # Of 16 multi-add manual bursts, 12 were purely clockwise, two were purely
+    # counter-clockwise and two contained a reversal.  Choose one stable sweep
+    # direction per burst using the observed pure-burst weighting.
+    SWEEP_DIRECTION_SAMPLES = (-1, -1, -1, -1, -1, -1,
+                               -1, -1, -1, -1, -1, -1,
+                               1, 1)
+
+    def __init__(self, chooser=None):
+        self._chooser = chooser or random.choice
+
+    def refill_start_delay_ms(self):
+        return int(self._chooser(self.REFILL_START_DELAY_SAMPLES_MS))
+
+    def burst_add_delay_ms(self):
+        return int(self._chooser(self.BURST_ADD_DELAY_SAMPLES_MS))
+
+    def sweep_direction(self):
+        return int(self._chooser(self.SWEEP_DIRECTION_SAMPLES))
+
+
+class HunterController(object):
+    """Hunter state machine: OFF/STARTING/RUNNING/WAITING/RECONCILING/PAUSED/
+    STOPPING/ERROR, with session epochs, an exclusive lease, an ownership
+    ledger, measured manual refill cadence, uncertainty reconciliation and
+    Legendary priority (gated by `priority_enabled`)."""
+
+    OFF = "OFF"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    WAITING = "WAITING"
+    RECONCILING = "RECONCILING"
+    PAUSED = "PAUSED"
+    STOPPING = "STOPPING"
+    ERROR = "ERROR"
+
+    PRIORITY_NONE = "NONE"
+    PRIORITY_DRAINING_OWNED = "DRAINING_OWNED"
+    PRIORITY_ADDING = "ADDING_PRIORITY"
+    PRIORITY_ACTIVE = "ACTIVE_PRIORITY"
+    PRIORITY_RETURNING = "RETURNING"
+
+    ADD_INTERVAL_MS = 1000
+    UNKNOWN_POLL_MS = 50
+    UNKNOWN_DEADLINE_MS = 2000
+    REJECT_BACKOFF_MS = 2000
+    CANDIDATE_STALE_MS = 2000
+    PRIORITY_ABSENCE_MS = 1500
+    POLL_GAP_MS = 100
+
+    def __init__(self, gateway, selector, clock, gameplay_available,
+                 log=None, capacity_limit=5, priority_enabled=False,
+                 radius_getter=None, anchor_getter=None, refill_profile=None):
+        self._gateway = gateway
+        self._selector = selector
+        self._clock = clock
+        self._gameplay_available = gameplay_available
+        self._log = log or (lambda msg: None)
+        self._capacity_limit = capacity_limit
+        self.priority_enabled = priority_enabled
+        self._radius_getter = radius_getter
+        self._anchor_getter = anchor_getter
+        self._refill_profile = refill_profile or ManualQueueRefillProfile()
+        self._lease_counter = 0
+        self._request_counter = 0
+        self.reset()
+
+    def reset(self):
+        self.state = self.OFF
+        self.user_requested_on = False
+        self.pause_reason = None
+        self.resume_token = None
+        self.epoch = 0
+        self.lease = None
+        self.pending_request = None
+        self.ledger = set()
+        self.reject_backoff = {}
+        self.quarantine = set()
+        self.priority_state = self.PRIORITY_NONE
+        self.priority_vid = 0
+        self.priority_intent = None
+        self.priority_target_absent_ms = None
+        self.next_add_ms = 0
+        self.refill_due_ms = None
+        self.refill_burst_active = False
+        self.refill_completed_count = None
+        self.sweep_angle = None
+        self.sweep_direction = -1
+        self.last_scan = None
+        self.last_snapshot = None
+        self.last_poll_ms = 0
+        self.error_reason = None
+        self.status_text = "off"
+        self.history = []
+
+    # -- helpers -------------------------------------------------------------
+    def _now(self):
+        clock = self._clock
+        if clock is None:
+            return None
+        try:
+            return int(clock())
+        except Exception:
+            return None
+
+    def _new_epoch(self):
+        self.epoch += 1
+        return self.epoch
+
+    def _invalidate_session(self, reason):
+        self._new_epoch()
+        self.lease = None
+        self.pending_request = None
+        self.resume_token = None
+        self.priority_intent = None
+        self.priority_state = self.PRIORITY_NONE
+        self.priority_vid = 0
+        self.priority_target_absent_ms = None
+        self.quarantine = set()
+        self.next_add_ms = 0
+        self.refill_due_ms = None
+        self.refill_burst_active = False
+        self.refill_completed_count = None
+        self.sweep_angle = None
+        self.sweep_direction = -1
+        self._log("session invalidated: %s (epoch %d)" % (reason, self.epoch))
+
+    def _set_state(self, state, status):
+        if self.state != state:
+            self._log("state %s -> %s" % (self.state, state))
+        self.state = state
+        self.status_text = status
+
+    def _request(self, kind, vid, deadline_ms, priority=False):
+        self._request_counter += 1
+        snapshot = self._gateway.snapshot()
+        return {
+            "id": self._request_counter,
+            "kind": kind,
+            "vid": vid,
+            "priority": priority,
+            "epoch": self.epoch,
+            "lease_id": self.lease["id"] if self.lease else None,
+            "player_cookie": snapshot.get("player_cookie"),
+            "created_ms": self._now(),
+            "deadline_ms": deadline_ms,
+            "dispatched": False,
+            "raw_return": None,
+            "last_snapshot": None,
+            "pre_snapshot": None,
+        }
+
+    def _current_radius(self):
+        if self._radius_getter is not None:
+            try:
+                return int(self._radius_getter())
+            except Exception:
+                pass
+        return int((self.last_scan or {}).get("radius") or 0)
+
+    def _current_anchor(self):
+        if self._anchor_getter is not None:
+            try:
+                return self._anchor_getter()
+            except Exception:
+                pass
+        return (self.last_scan or {}).get("anchor_position")
+
+    # -- lifecycle -----------------------------------------------------------
+    def start(self):
+        if self.state not in (self.OFF, self.ERROR):
+            return self.state
+        now = self._now()
+        if now is None:
+            self._set_state(self.ERROR, "Queue: monotonic clock unavailable")
+            self.error_reason = "clock unavailable"
+            return self.state
+        if not self._gameplay_available():
+            self._set_state(self.ERROR, "Queue: not in playable world")
+            self.error_reason = "gameplay unavailable"
+            return self.state
+        if self.pause_reason is not None:
+            self._set_state(self.ERROR, "Queue: safety pause active")
+            self.error_reason = "reaction pause active"
+            return self.state
+        snap = self._gateway.snapshot()
+        if not snap.get("valid"):
+            self._set_state(self.ERROR, "Queue: observer unavailable")
+            self.error_reason = "observer invalid: %s" % snap.get("error")
+            return self.state
+        if not snap.get("stock_binding_ok"):
+            self._set_state(self.ERROR, "Queue: stock binding changed")
+            self.error_reason = "stock binding identity mismatch"
+            return self.state
+        if snap["vids"]:
+            self._set_state(self.OFF, "Queue: busy - stop manual queue first")
+            self._log("start blocked: queued=%d enabled=%d" %
+                      (len(snap["vids"]), bool(snap["enabled"])))
+            return self.state
+        self.user_requested_on = True
+        self._set_state(self.STARTING, "Queue: acquiring lease")
+        self._lease_counter += 1
+        self.lease = {"id": self._lease_counter, "epoch": self.epoch,
+                      "cookie": snap.get("player_cookie")}
+        outcome, post, _pre = self._gateway.set_enabled_once(True, self.lease)
+        self._invalidate_snapshot()
+        if outcome != "ENABLED" or not post.get("valid") or not post["enabled"]:
+            self._set_state(self.ERROR, "Queue: enable failed")
+            self.error_reason = "enable outcome %s" % outcome
+            self.user_requested_on = False
+            self.lease = None
+            return self.state
+        self.ledger = set()
+        self.quarantine = set()
+        self.next_add_ms = now
+        self.refill_due_ms = None
+        self.refill_burst_active = True
+        self.refill_completed_count = None
+        self.sweep_angle = None
+        self.sweep_direction = self._refill_profile.sweep_direction()
+        self._set_state(self.RUNNING, "Queue: running")
+        return self.state
+
+    def _cleanup_owned(self, reason):
+        """Quiesce owned native state.  Returns "cleared", "foreign", or "error".
+        Disables a still-owned enabled session even when empty; removes owned VIDs
+        one at a time when foreign members are present.  Never clears a mixed/
+        foreign queue and never mutates without a valid current lease."""
+        if self.lease is None:
+            return "cleared"
+        snap = self._gateway.snapshot()
+        if not snap.get("valid") or not snap.get("stock_binding_ok"):
+            self.error_reason = "cleanup snapshot invalid"
+            return "error"
+        if snap.get("player_cookie") != self.lease.get("cookie"):
+            self.error_reason = "cleanup cookie changed"
+            return "error"
+        remaining = [v for v in snap["vids"] if v in self.ledger]
+        foreign = [v for v in snap["vids"] if v not in self.ledger]
+        if not foreign:
+            if snap["enabled"]:
+                outcome, post, _pre = self._gateway.set_enabled_once(False, self.lease)
+                self._invalidate_snapshot()
+                if outcome != "DISABLED":
+                    self.error_reason = "disable outcome %s" % outcome
+                    return "error"
+                if post.get("valid") and post["vids"]:
+                    self.error_reason = "disable left queue populated"
+                    return "error"
+            self.ledger = set()
+            return "cleared"
+        for vid in remaining:
+            request = self._request("remove", vid, self._now() + 2000)
+            outcome = self._gateway.remove_once(request)
+            self._invalidate_snapshot()
+            if outcome in (HunterQueueGateway.REMOVED, HunterQueueGateway.ALREADY_ABSENT):
+                self.ledger.discard(vid)
+            else:
+                self.error_reason = "remove %d %s" % (vid, outcome)
+                return "error"
+        if self.ledger:
+            self.error_reason = "owned VIDs not removed"
+            return "error"
+        return "foreign"
+
+    def stop(self, reason="stopped"):
+        self.user_requested_on = False
+        self.pause_reason = None
+        self.resume_token = None
+        self._set_state(self.STOPPING, "Queue: stopping")
+        result = self._cleanup_owned(reason)
+        self.pending_request = None
+        self.priority_state = self.PRIORITY_NONE
+        self.priority_vid = 0
+        self.priority_intent = None
+        if result == "error":
+            self._set_state(self.ERROR, "Queue: native cleanup incomplete")
+            self._log("stop unconfirmed: %s (%s)" % (reason, self.error_reason))
+            return self.state
+        self.lease = None
+        self._set_state(self.OFF, "Queue: %s" % reason)
+        return self.state
+
+    def pause(self, reason):
+        if self.state == self.OFF:
+            return None
+        self.pause_reason = reason
+        token = {"epoch": self.epoch,
+                 "lease_id": (self.lease or {}).get("id"),
+                 "cookie": (self.lease or {}).get("cookie"),
+                 "priority_intent": self.priority_intent}
+        result = self._cleanup_owned(reason)
+        self.pending_request = None
+        if result == "error":
+            self._set_state(self.ERROR, "Queue: pause cleanup incomplete")
+            self._log("pause unconfirmed: %s (%s)" % (reason, self.error_reason))
+            return None
+        self._set_state(self.PAUSED, "Queue: paused (%s)" % reason)
+        self.resume_token = token
+        return token
+
+    def resume(self, token):
+        if not token or self.state != self.PAUSED:
+            return self.state
+        if not self.user_requested_on:
+            self._set_state(self.OFF, "Queue: off")
+            return self.state
+        if (token.get("epoch") != self.epoch or
+                token.get("lease_id") != (self.lease or {}).get("id")):
+            self._log("resume token stale; staying paused")
+            return self.state
+        if not self._gameplay_available():
+            return self.state
+        snap = self._gateway.snapshot()
+        if not snap.get("valid"):
+            self._set_state(self.ERROR, "Queue: observer unavailable")
+            return self.state
+        if snap["vids"] or snap["enabled"]:
+            self._log("resume blocked: queue busy")
+            return self.state
+        outcome, post, _pre = self._gateway.set_enabled_once(True, self.lease)
+        self._invalidate_snapshot()
+        if outcome != "ENABLED" or not post.get("valid") or not post["enabled"]:
+            self._set_state(self.ERROR, "Queue: resume enable failed")
+            self.error_reason = "resume enable %s" % outcome
+            return self.state
+        self.pause_reason = None
+        self.resume_token = None
+        self.next_add_ms = self._now()
+        self.refill_due_ms = None
+        self.refill_burst_active = True
+        self.refill_completed_count = None
+        self.sweep_angle = None
+        self.sweep_direction = self._refill_profile.sweep_direction()
+        self._set_state(self.RUNNING, "Queue: running")
+        return self.state
+
+    def on_session_change(self, reason):
+        self._invalidate_session(reason)
+        self.user_requested_on = False
+        self.pause_reason = None
+        self.resume_token = None
+        self.ledger = set()
+        self.reject_backoff = {}
+        self.last_scan = None
+        self._set_state(self.OFF, "Queue: stopped (%s)" % reason)
+
+    def on_scan(self, snapshot):
+        self.last_scan = snapshot
+
+    def _invalidate_snapshot(self):
+        """Drop the cached queue observation so the next read is fresh.  Ledger
+        pruning and ownership checks must never run against an observation
+        older than the most recent mutation."""
+        self.last_snapshot = None
+
+    # -- per-tick processing ------------------------------------------------
+    def tick(self, now_ms):
+        if now_ms is None:
+            self._set_state(self.ERROR, "Queue: monotonic clock unavailable")
+            return self.state
+
+        # Throttle cheap queue observation to once per POLL_GAP_MS while active.
+        if self.last_snapshot is None or now_ms - self.last_poll_ms >= self.POLL_GAP_MS:
+            snap = self._gateway.snapshot()
+            self.last_poll_ms = now_ms
+            self.last_snapshot = snap
+        snap = self.last_snapshot
+
+        # session-safety: revalidate cookie against the current observation
+        if self.lease is not None:
+            if not snap.get("valid"):
+                self._invalidate_session("observer invalid")
+                self._set_state(self.ERROR, "Queue: observer unavailable")
+                return self.state
+            if snap.get("player_cookie") != self.lease.get("cookie"):
+                self._invalidate_session("player singleton changed")
+                self._set_state(self.ERROR, "Queue: session changed")
+                return self.state
+
+        # reconcile a dispatched-but-unresolved request regardless of state
+        if self.pending_request is not None:
+            return self._reconcile(now_ms)
+
+        if self.state in (self.OFF, self.PAUSED, self.STOPPING):
+            return self.state
+
+        if self.state == self.ERROR:
+            return self.state
+
+        # RUNNING and WAITING both re-evaluate the refill decision each tick.
+        return self._run(now_ms)
+
+    def _reconcile(self, now_ms):
+        request = self.pending_request
+        self._set_state(self.RECONCILING, "Queue: reconciling")
+        snap = self._gateway.snapshot()
+        if snap.get("valid") and request["kind"] == "add":
+            if request["vid"] in snap["vids"]:
+                self.ledger.add(request["vid"])
+                if request.get("sweep_angle_after_add") is not None:
+                    self.sweep_angle = request["sweep_angle_after_add"]
+                if request.get("priority"):
+                    self.priority_vid = request["vid"]
+                    self.priority_target_absent_ms = None
+                    self.priority_state = self.PRIORITY_ACTIVE
+                self.pending_request = None
+                self._set_state(self.RUNNING, "Queue: running")
+                return self.state
+            if now_ms - request["created_ms"] < self.UNKNOWN_DEADLINE_MS:
+                return self.state  # keep observing until the deadline
+        if request.get("dispatched") and now_ms - request["created_ms"] >= self.UNKNOWN_DEADLINE_MS:
+            self.quarantine.add(request["vid"])
+            self.history.append(dict(request))
+            self.pending_request = None
+            self._set_state(self.ERROR, "Queue: unresolved request")
+            self.error_reason = ("request %d unresolved; VID %d quarantined for "
+                                 "epoch %d" % (request["id"], request["vid"], self.epoch))
+            self._cleanup_owned("unresolved request")
+            return self.state
+        return self.state
+
+    def _run(self, now_ms):
+        snap = self.last_snapshot or self._gateway.snapshot()
+        self.last_snapshot = snap
+        if not snap.get("valid"):
+            self._set_state(self.ERROR, "Queue: observer unavailable")
+            return self.state
+        vids = snap["vids"]
+
+        # exclusive-ownership invariants
+        if self.lease is not None:
+            if not snap.get("enabled"):
+                self._invalidate_session("queue disabled externally")
+                self._set_state(self.ERROR, "Queue: ownership lost (disabled)")
+                self.error_reason = "queue disabled externally"
+                return self.state
+            foreign = [v for v in vids if v not in self.ledger]
+            if foreign:
+                self._invalidate_session("foreign queue membership")
+                self._set_state(self.ERROR, "Queue: ownership conflict")
+                self.error_reason = "foreign VIDs %s" % foreign
+                return self.state
+        # reconcile naturally-departed ledger VIDs
+        current = set(vids)
+        for v in list(self.ledger):
+            if v not in current:
+                self.ledger.discard(v)
+
+        experiment_error = getattr(self._gateway, "input_experiment_error", None)
+        if experiment_error:
+            self.error_reason = experiment_error
+            self._set_state(self.ERROR, "Queue: recorder experiment halted")
+            return self.state
+
+        max_size = int(snap.get("max_size") or 0)
+        if max_size <= 0:
+            self._set_state(self.ERROR, "Queue: invalid max size")
+            return self.state
+        capacity = min(self._capacity_limit, max_size)
+        full = len(vids) >= capacity
+
+        if self.priority_enabled and self.priority_state != self.PRIORITY_NONE:
+            if self._advance_priority(now_ms, snap):
+                return self.state
+
+        if full:
+            self.refill_due_ms = None
+            self.refill_burst_active = False
+            self.refill_completed_count = capacity
+            self.sweep_angle = None
+            self._set_state(self.WAITING, "Queue: full %d/%d" % (len(vids), capacity))
+            return self.state
+
+        # Full or exhausted bursts establish the achieved queue count.  Wait
+        # for its first departure before scheduling one measured manual delay.
+        # An empty exhausted queue schedules a delay without needing a departure.
+        if not self.refill_burst_active:
+            if self.refill_due_ms is None:
+                if (self.refill_completed_count is not None and
+                        self.refill_completed_count > 0 and
+                        len(vids) >= self.refill_completed_count):
+                    self._set_state(
+                        self.WAITING,
+                        "Queue: filled available %d/%d; waiting for departure" %
+                        (len(vids), capacity))
+                    return self.state
+                delay_ms = self._refill_profile.refill_start_delay_ms()
+                self.refill_due_ms = now_ms + delay_ms
+                self._log("manual refill scheduled in %d ms (queue %d/%d)" %
+                          (delay_ms, len(vids), capacity))
+            if now_ms < self.refill_due_ms:
+                self._set_state(
+                    self.WAITING,
+                    "Queue: manual refill in %d ms (%d/%d)" %
+                    (self.refill_due_ms - now_ms, len(vids), capacity))
+                return self.state
+            self.refill_due_ms = None
+            self.refill_burst_active = True
+            self.refill_completed_count = None
+            self.sweep_angle = None
+            self.sweep_direction = self._refill_profile.sweep_direction()
+            self.next_add_ms = now_ms
+            self._log("manual refill burst started (queue %d/%d)" %
+                      (len(vids), capacity))
+
+        if now_ms < self.next_add_ms:
+            self._set_state(self.WAITING, "Queue: next add in %d ms" % (self.next_add_ms - now_ms))
+            return self.state
+
+        if self.last_scan is None:
+            self._set_state(self.WAITING, "Queue: waiting for scan")
+            return self.state
+
+        if self.last_scan.get("epoch") != self.epoch:
+            self._set_state(self.WAITING, "Queue: stale scan")
+            return self.state
+
+        candidate = self._selector.select(
+            self.last_scan, now_ms, set(vids), set(self.ledger) | set(self.quarantine),
+            self.reject_backoff, priority=False,
+            sweep_angle=self.sweep_angle,
+            sweep_direction=self.sweep_direction)
+        if candidate is None:
+            # A missing/stale scan cannot prove that this burst is exhausted.
+            created_ms = self.last_scan.get("created_ms")
+            if (created_ms is None or now_ms < created_ms or
+                    now_ms - created_ms > self.CANDIDATE_STALE_MS):
+                self._set_state(self.WAITING, "Queue: stale scan")
+                return self.state
+            self.refill_burst_active = False
+            self.refill_completed_count = len(vids)
+            self.refill_due_ms = None
+            self.sweep_angle = None
+            self._log("manual refill burst complete: no eligible candidate "
+                      "(queue %d/%d)" % (len(vids), capacity))
+            self._set_state(
+                self.WAITING,
+                "Queue: filled available %d/%d; %s" %
+                (len(vids), capacity,
+                 "waiting for departure" if vids else "refill wait next"))
+            return self.state
+
+        if not self._revalidate(candidate, snap):
+            return self.state
+
+        request = self._request("add", candidate["vid"], now_ms + self.UNKNOWN_DEADLINE_MS)
+        try:
+            request["sweep_angle_after_add"] = (
+                HunterCandidateSelector._candidate_angle(self.last_scan, candidate))
+        except Exception:
+            request["sweep_angle_after_add"] = None
+        self.next_add_ms = now_ms + self._refill_profile.burst_add_delay_ms()
+        outcome = self._gateway.add_once(request)
+        self._invalidate_snapshot()
+        if outcome == HunterQueueGateway.ADDED:
+            self.ledger.add(candidate["vid"])
+            if request.get("sweep_angle_after_add") is not None:
+                self.sweep_angle = request["sweep_angle_after_add"]
+            post = request.get("last_snapshot") or {}
+            if (post.get("valid") and
+                    len(post.get("vids") or ()) >= capacity):
+                self.refill_due_ms = None
+                self.refill_burst_active = False
+                self.refill_completed_count = capacity
+            self._log("added VID %d (queue %d/%d)" % (candidate["vid"], len(snap["vids"]) + 1, capacity))
+        elif outcome == HunterQueueGateway.REJECTED_NATIVE:
+            self.reject_backoff[candidate["vid"]] = now_ms + self.REJECT_BACKOFF_MS
+        elif outcome == HunterQueueGateway.UNKNOWN:
+            self.pending_request = request
+            self._set_state(self.RECONCILING, "Queue: reconciling")
+            return self.state
+        self._set_state(self.RUNNING, "Queue: running")
+        return self.state
+
+    def _revalidate(self, candidate, snap):
+        """Fresh actor race/position, fresh player/anchor/radius, and exact
+        native admission for the one selected VID."""
+        vid = candidate["vid"]
+        try:
+            vnum = int(self._selector._chr.GetVirtualNumber(vid))
+            if vnum != int(candidate.get("vnum")):
+                return False
+            name = ascii_text(self._selector._chr.GetNameByVID(vid))
+            gx, gy = self._selector._chr.GetPixelPosition(vid)[:2]
+            is_stone = getattr(self._selector._chr, "IsStone", None)
+            if not callable(is_stone) or not is_stone(vid):
+                return False
+            if not self._selector._nonplayer.IsMonsterStone(vnum):
+                return False
+        except Exception:
+            return False
+        try:
+            player_pos = self._selector._player.GetMainCharacterPosition()
+            px, py = player_pos[:2]
+        except Exception:
+            return False
+        radius = self._current_radius()
+        if radius <= 0:
+            return False
+        anchor = self._current_anchor()
+        if (gx - px) ** 2 + (gy - py) ** 2 > float(radius) ** 2:
+            return False
+        if anchor is not None:
+            ax, ay = anchor[:2]
+            if (gx - ax) ** 2 + (gy - ay) ** 2 > float(radius) ** 2:
+                return False
+        admission = self._gateway.admission(vid)
+        if not admission.get("valid"):
+            self._set_state(self.ERROR, "Queue: admission unavailable")
+            self.error_reason = admission.get("reason")
+            return False
+        if not admission.get("eligible"):
+            self.reject_backoff[vid] = self._now() + self.REJECT_BACKOFF_MS
+            return False
+        if admission.get("player_cookie") != snap.get("player_cookie"):
+            self._invalidate_session("admission cookie changed")
+            return False
+        return True
+
+    def _advance_priority(self, now_ms, snap):
+        """Legendary priority state machine.  Returns True when it handled the
+        tick (no ordinary refill this tick)."""
+        vids = snap["vids"]
+        if self.priority_state == self.PRIORITY_DRAINING_OWNED:
+            owned = [v for v in vids if v in self.ledger]
+            if not owned:
+                self.priority_state = self.PRIORITY_ADDING
+                self.next_add_ms = now_ms + self.ADD_INTERVAL_MS
+            else:
+                vid = owned[0]
+                request = self._request("remove", vid, now_ms + 2000)
+                outcome = self._gateway.remove_once(request)
+                self._invalidate_snapshot()
+                if outcome in (HunterQueueGateway.REMOVED, HunterQueueGateway.ALREADY_ABSENT):
+                    self.ledger.discard(vid)
+                elif outcome == HunterQueueGateway.UNKNOWN:
+                    self._set_state(self.ERROR, "Queue: priority drain uncertain")
+                    return True
+            return True
+        if self.priority_state == self.PRIORITY_ADDING:
+            if now_ms < self.next_add_ms:
+                return True
+            cand = None
+            intent_vid = (self.priority_intent or {}).get("vid")
+            if intent_vid is not None:
+                for c in (self.last_scan or {}).get("candidates", ()):
+                    if c["vid"] == intent_vid:
+                        cand = c
+                        break
+            if cand is None:
+                cand = self._selector.select(self.last_scan, now_ms, set(), set(),
+                                             {}, priority=True)
+            if cand is None or not self._revalidate(cand, snap):
+                self._set_state(self.ERROR, "Queue: priority target invalid")
+                return True
+            request = self._request("add", cand["vid"], now_ms + self.UNKNOWN_DEADLINE_MS,
+                                    priority=True)
+            self.next_add_ms = now_ms + self.ADD_INTERVAL_MS
+            outcome = self._gateway.add_once(request)
+            self._invalidate_snapshot()
+            if outcome == HunterQueueGateway.ADDED:
+                self.priority_vid = cand["vid"]
+                self.ledger.add(cand["vid"])
+                self.priority_target_absent_ms = None
+                self.priority_state = self.PRIORITY_ACTIVE
+                self._log("priority target added: VID %d" % cand["vid"])
+            elif outcome == HunterQueueGateway.UNKNOWN:
+                self.pending_request = request
+                self._set_state(self.RECONCILING, "Queue: reconciling")
+            else:
+                self._set_state(self.ERROR, "Queue: priority add rejected")
+            return True
+        if self.priority_state == self.PRIORITY_ACTIVE:
+            still_present = self.priority_vid in vids
+            seen_live = any(c["vid"] == self.priority_vid
+                            for c in (self.last_scan or {}).get("candidates", ()))
+            if still_present:
+                self.priority_target_absent_ms = None
+                return True
+            if seen_live:
+                self._set_state(self.ERROR, "Queue: priority target lost from queue")
+                return True
+            if self.priority_target_absent_ms is None:
+                self.priority_target_absent_ms = now_ms
+                return True
+            if now_ms - self.priority_target_absent_ms < self.PRIORITY_ABSENCE_MS:
+                return True
+            self._log("priority target gone: VID %d" % self.priority_vid)
+            self.priority_vid = 0
+            self.priority_state = self.PRIORITY_NONE
+            self.priority_target_absent_ms = None
+            self.priority_intent = None
+            self.next_add_ms = now_ms
+            self.refill_due_ms = None
+            self.refill_burst_active = True
+            self.refill_completed_count = None
+            self.sweep_angle = None
+            self.sweep_direction = self._refill_profile.sweep_direction()
+            self._set_state(self.RUNNING, "Queue: running")
+            return True
+        return False
+
+    def request_priority(self, vid=None):
+        """Enter the Legendary priority flow (drains owned entries first)."""
+        if not self.priority_enabled:
+            return False
+        if self.state not in (self.RUNNING, self.WAITING):
+            return False
+        if self.lease is None:
+            return False
+        self.priority_intent = {"vid": vid, "epoch": self.epoch}
+        self.priority_vid = 0
+        self.priority_target_absent_ms = None
+        self.priority_state = self.PRIORITY_DRAINING_OWNED
+        self.next_add_ms = self._now()
+        return True
+
+
+class HunterAuditObserver(object):
+    """Explicitly-enabled, read-only audit-status observation (plan section 10.1).
+
+    Independent of Hunter ON.  Polls the verified audit_status() query on the
+    update thread (throttled), logging the first observation, state/interval
+    changes, and a 1 Hz heartbeat with observation count and max sampling gap.
+    It never writes, enables, disables or tunes the recorder, and it keeps an
+    invalid/unknown status distinct from "recorder-disabled"."""
+
+    POLL_GAP_MS = 100
+    HEARTBEAT_MS = 1000
+
+    def __init__(self, gateway, clock, log=None, enabled=False):
+        self._gateway = gateway
+        self._clock = clock
+        self._log = log or (lambda msg: None)
+        self.enabled = enabled
+        self._last_obs = None
+        self._last_poll_ms = 0
+        self._last_heartbeat_ms = 0
+        self._obs_count = 0
+        self._max_gap_ms = 0
+
+    def observe(self, now_ms):
+        if not self.enabled or now_ms is None:
+            return
+        if self._last_poll_ms and now_ms - self._last_poll_ms < self.POLL_GAP_MS:
+            return
+        gap = (now_ms - self._last_poll_ms) if self._last_poll_ms else 0
+        self._last_poll_ms = now_ms
+        if gap > self._max_gap_ms:
+            self._max_gap_ms = gap
+        status = self._gateway.audit_status()
+        self._obs_count += 1
+        if not status.get("valid"):
+            if self._last_obs is None or self._last_obs.get("valid"):
+                self._log("audit status invalid: %s" % status.get("error"))
+            self._last_obs = status
+            return
+        prev = self._last_obs
+        if prev is None or not prev.get("valid"):
+            self._log("audit first observation: recorder_enabled=%s sample_ms=%s "
+                      "flush_ms=%s app_active=%s" %
+                      (status.get("recorder_enabled"), status.get("sample_ms"),
+                       status.get("flush_ms"), status.get("app_active")))
+        elif (prev.get("recorder_enabled") != status.get("recorder_enabled") or
+              prev.get("sample_ms") != status.get("sample_ms") or
+              prev.get("flush_ms") != status.get("flush_ms") or
+              prev.get("app_active") != status.get("app_active")):
+            self._log("audit change: recorder_enabled=%s->%s sample_ms=%s->%s "
+                      "flush_ms=%s->%s app_active=%s->%s" %
+                      (prev.get("recorder_enabled"), status.get("recorder_enabled"),
+                       prev.get("sample_ms"), status.get("sample_ms"),
+                       prev.get("flush_ms"), status.get("flush_ms"),
+                       prev.get("app_active"), status.get("app_active")))
+        self._last_obs = status
+        if (self._last_heartbeat_ms == 0 or
+                now_ms - self._last_heartbeat_ms >= self.HEARTBEAT_MS):
+            self._last_heartbeat_ms = now_ms
+            self._log("audit heartbeat: observations=%d max_gap_ms=%d" %
+                      (self._obs_count, self._max_gap_ms))
 
 
 # --- Yin Yang Duel strategy (cards 0..8; even=black, odd=white) ---
@@ -1472,7 +2534,6 @@ class MemoryActionAdapter(object):
         start = getattr(window, "_YinYangMemoryWindow__OnStartClicked", None)
         if not callable(start):
             return False
-        emit_synthetic_click()
         try:
             start()
             return True
@@ -1485,7 +2546,6 @@ class MemoryActionAdapter(object):
         click = getattr(card, "OnMouseLeftButtonDown", None)
         if not callable(click):
             return False
-        emit_synthetic_click()
         try:
             click()
             return True
@@ -1627,6 +2687,24 @@ def make_radar_dot(parent, x, y, size, color, fallback):
     return dot
 
 
+def radar_player_reach_offsets(player_position, anchor_position, radius):
+    """Drawing-only player-radius boundary clipped to the anchored circle."""
+    if anchor_position is None or radius <= 0:
+        return ()  # In following mode the existing blue ring is the same circle.
+    dx = player_position[0] - anchor_position[0]
+    dy = player_position[1] - anchor_position[1]
+    radius2 = float(radius) ** 2
+    offsets = []
+    for index in range(96):
+        angle = 2.0 * math.pi * index / 96.0
+        x = dx + radius * math.cos(angle)
+        y = dy + radius * math.sin(angle)
+        # The tiny tolerance concerns outline rounding only, not selection.
+        if x * x + y * y <= radius2 * (1.0 + 1e-12):
+            offsets.append((x, y))
+    return tuple(offsets)
+
+
 class GameplayPhaseGuard(object):
     """Observe registrations of the client's existing phase UI windows."""
 
@@ -1685,75 +2763,6 @@ def get_gameplay_phase_guard():
     return guard
 
 
-class MetinQueueAdmissionGuard(object):
-    """Mirror native per-VID exclusions set through the player bindings."""
-
-    observer_version = 1
-
-    def __init__(self, original_immune=None, original_untargetable=None):
-        self.owner = None
-        self.immune_vids = set()
-        self.untargetable_vids = set()
-        self.original_immune = (original_immune or
-                                player.SetMetinQueueVIDImmune)
-        self.original_untargetable = (original_untargetable or
-                                      player.SetMetinQueueVIDUntargetable)
-
-        def set_immune(vid, enabled):
-            result = self.original_immune(vid, enabled)
-            self._Update(self.immune_vids, "immune", vid, enabled)
-            return result
-
-        def set_untargetable(vid, enabled):
-            result = self.original_untargetable(vid, enabled)
-            self._Update(self.untargetable_vids, "untargetable", vid, enabled)
-            return result
-
-        self.set_immune = set_immune
-        self.set_untargetable = set_untargetable
-        player.SetMetinQueueVIDImmune = self.set_immune
-        player.SetMetinQueueVIDUntargetable = self.set_untargetable
-
-    def _Update(self, values, kind, vid, enabled):
-        vid = int(vid)
-        enabled = bool(enabled)
-        if vid == 0:
-            changed = bool(values)
-            values.clear()
-        elif enabled:
-            changed = vid not in values
-            values.add(vid)
-        else:
-            changed = vid in values
-            values.discard(vid)
-        owner = self.owner
-        if owner is not None and changed:
-            owner.OnNativeQueueVIDState(kind, vid, enabled)
-
-    def SetOwner(self, owner):
-        self.owner = owner
-
-    def RejectionReason(self, vid):
-        if int(vid) in self.untargetable_vids:
-            return "native untargetable VID"
-        if int(vid) in self.immune_vids:
-            return "native immune VID"
-        return None
-
-def get_metin_queue_admission_guard():
-    guard = getattr(__main__, "_lirin_metin_queue_admission_guard", None)
-    if (guard is None or not hasattr(guard, "SetOwner") or
-            getattr(guard, "observer_version", 0) !=
-            MetinQueueAdmissionGuard.observer_version):
-        original_immune = getattr(guard, "original_immune",
-                                  player.SetMetinQueueVIDImmune)
-        original_untargetable = getattr(
-            guard, "original_untargetable", player.SetMetinQueueVIDUntargetable)
-        guard = MetinQueueAdmissionGuard(original_immune, original_untargetable)
-        __main__._lirin_metin_queue_admission_guard = guard
-    return guard
-
-
 class ScannerWatcher(ui.Window):
     """Keep scanning and the hotkey alive while the panel is hidden."""
 
@@ -1773,7 +2782,7 @@ class MetinScanner(ui.BoardWithTitleBar):
     def __init__(self):
         ui.BoardWithTitleBar.__init__(self)
         self.feature_version = FEATURE_VERSION
-        self.native_queue_wrapper_active = NATIVE_QUEUE_WRAPPER_ACTIVE
+        self.hunter_observer = get_hunter_observer()
         self.AddFlag("movable")
         self.AddFlag("float")
         self.SetSize(620, 555)
@@ -1789,17 +2798,6 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.anchor_position = None
         self.hotkey_down = False
         self.hunter_enabled = False
-        self.hunter_queued_vids = set()
-        self.hunter_logged_rejections = set()
-        self.hunter_initial_fill = True
-        self.hunter_batch_add_count = 0
-        self.hunter_refilling = False
-        self.hunter_next_refill = 0.0
-        self.hunter_next_add = 0.0
-        self.priority_event_vid = 0
-        self.priority_event_vnum = 0
-        self.priority_event_name = None
-        self.priority_event_missing_since = None
         self.anchor_channel = None
         self.anchor_map = None
         self.boss_vnum = None
@@ -1840,6 +2838,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.reaction_last_error = None
         self.reaction_pause_started = None
         self.reaction_native_paused = False
+        self.reaction_resume_token = None
         self.reaction_saved_hunter_enabled = False
         self.reaction_saved_queue_enabled = False
         self.reaction_saved_boss_attack = False
@@ -1875,10 +2874,37 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.gameplay_available = True
         self.gameplay_next_check = 0.0
         self.gameplay_stopped = False
-        self.action_coordinator = NativeActionCoordinator(
-            lambda: self.gameplay_phase)
+        self._game_window = None
+        pair_enabled = recorder_pair_experiment_enabled()
+        self.hunter_gateway = HunterQueueGateway(
+            self.hunter_observer, player,
+            recorder_pair_enabled=pair_enabled,
+            recorder_pair=(get_recorder_pair_experiment() if pair_enabled else None),
+            log=self._hunter_log)
+        self.hunter_selector = HunterCandidateSelector(player, chr, nonplayer)
+        self.hunter_controller = HunterController(
+            self.hunter_gateway, self.hunter_selector,
+            clock=hunter_now_ms,
+            gameplay_available=self.IsGameplayAvailable,
+            log=self._hunter_log,
+            capacity_limit=HUNTER_LIMIT,
+            radius_getter=lambda: self.radius,
+            anchor_getter=lambda: self.anchor_position,
+        )
+        self.hunter_audit = HunterAuditObserver(
+            self.hunter_gateway, hunter_now_ms, log=self._hunter_log, enabled=True)
         self.config_autoload = False
         self.radius = DEFAULT_RADIUS
+        self.manual_queue_logger = ManualQueueLogger(
+            self.hunter_gateway,
+            hunter_now_ms,
+            MANUAL_QUEUE_LOG,
+            MANUAL_QUEUE_ENABLE,
+            FEATURE_VERSION,
+            context_provider=self._manual_queue_context,
+            metadata_path=MANUAL_QUEUE_METADATA,
+            report_error=self._manual_queue_log_error,
+        )
         self.next_scan = 0.0
         self.last_radius_error = None
         self.last_scan_error = None
@@ -1992,10 +3018,13 @@ class MetinScanner(ui.BoardWithTitleBar):
             player_color = ui.GenerateColor(1.0, 0.90, 0.20, 1.0)
             metin_color = ui.GenerateColor(1.0, 0.25, 0.20, 1.0)
             other_color = ui.GenerateColor(0.72, 0.85, 0.85, 1.0)
+            outside_color = ui.GenerateColor(0.45, 0.45, 0.45, 1.0)
+            reach_color = ui.GenerateColor(0.25, 1.0, 0.40, 1.0)
         except Exception:
             background_color, grid_color = 0xEE15242E, 0xAA405762
             ring_color, player_color = 0xFF55AAFF, 0xFFFFFF33
             metin_color, other_color = 0xFFFF4433, 0xFFBBDDDD
+            outside_color, reach_color = 0xFF737373, 0xFF40FF66
         self.map_background = ui.Bar()
         self.map_background.SetParent(self.farming_page)
         self.map_background.SetPosition(335, 43)
@@ -2032,12 +3061,20 @@ class MetinScanner(ui.BoardWithTitleBar):
             y = int(self.radar_center[1] + self.radar_pixels * math.sin(angle))
             self.map_ring.append(make_radar_dot(
                 self.farming_page, x, y, 3, ring_color, "."))
+        self.map_reach = []
+        for index in range(96):
+            dot = make_radar_dot(self.farming_page, self.radar_center[0],
+                                 self.radar_center[1], 2, reach_color, ".")
+            dot.Hide()
+            self.map_reach.append(dot)
         self.map_player = make_radar_dot(self.farming_page, self.radar_center[0] - 2,
                                          self.radar_center[1] - 2, 6, player_color, "P")
         self.map_metins = []
+        self.map_outside_metins = []
         self.map_others = []
         for pool, count, color, symbol in (
                 (self.map_metins, 32, metin_color, "M"),
+                (self.map_outside_metins, 32, outside_color, "m"),
                 (self.map_others, 64, other_color, ".")):
             for index in range(count):
                 dot = make_radar_dot(self.farming_page, self.radar_center[0],
@@ -2046,7 +3083,10 @@ class MetinScanner(ui.BoardWithTitleBar):
                 pool.append(dot)
         self.map_count_label = limit_text(
             make_text(self.farming_page, 335, 310,
-                      "Yellow: you  Red: metin  White: other"), 260)
+                      "Red: 0 in range  Gray: 0 out  White: 0"), 260)
+        self.map_reach_label = limit_text(
+            make_text(self.farming_page, 335, 325,
+                      "Yellow: you  Blue: anchor  Green: reach"), 260)
         self.anchor_button = make_button(
             self.farming_page, 335, "Anchor", self.ToggleAnchor, 341)
         self.anchor_label = limit_text(
@@ -2098,12 +3138,10 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.SwitchTab("farming")
         self.phase_guard = get_gameplay_phase_guard()
         self.phase_guard.SetOwner(self)
-        self.queue_admission_guard = get_metin_queue_admission_guard()
-        self.queue_admission_guard.SetOwner(self)
         self.gameplay_phase = self.phase_guard.current_phase
         self.AddLine("Ready. Log file: metin_scanner.log")
-        self.AddLine("Native full-input queue wrapper: %s" %
-                     ("active" if self.native_queue_wrapper_active else "UNAVAILABLE"))
+        self.AddLine("Native Hunter observer: %s" %
+                     ("active" if self.hunter_observer is not None else "UNAVAILABLE"))
         try:
             saved_config = read_config_file()
             self.config_autoload = saved_config.get("autoload", "0") == "1"
@@ -2176,10 +3214,160 @@ class MetinScanner(ui.BoardWithTitleBar):
             row = self.lines[index] if index < len(self.lines) else ""
             label.SetText(row[:72])
 
+    def _hunter_log(self, message):
+        self.AddLine("Hunter: %s" % message)
+
+    def _manual_queue_log_error(self, message):
+        # Reporting only: a logger failure never changes queue/Hunter/gameplay.
+        self.AddLine("Manual queue log: %s" % message)
+
+    def _manual_queue_context(self, enrich, queue_snapshot):
+        """Read-only context for ManualQueueLogger.
+
+        Actor calls are limited to baselines/membership changes.  The method
+        consumes an already-observed queue snapshot and never starts scanning,
+        Hunter, the native queue, a solver, or an input/recorder routine.
+        """
+        context = {
+            "valid": True,
+            "gameplay_epoch": int(self.hunter_controller.epoch),
+            "gameplay_available_cached": bool(self.gameplay_available),
+            "map": None,
+            "channel": None,
+            "radius": int(self.radius),
+            "anchor_position": (list(self.anchor_position[:2])
+                                if self.anchor_position is not None else None),
+            "automation": {
+                "scanner_running": bool(self.running),
+                "hunter_toggle_on": bool(self.hunter_enabled),
+                "hunter_automatic_additions_enabled": bool(
+                    self.hunter_enabled and
+                    self.hunter_controller.user_requested_on and
+                    self.hunter_controller.state not in
+                    (HunterController.OFF, HunterController.ERROR,
+                     HunterController.STOPPING, HunterController.PAUSED)),
+                "hunter_state": self.hunter_controller.state,
+                "hunter_user_requested_on": bool(
+                    self.hunter_controller.user_requested_on),
+                "boss_sweep_enabled": bool(self.boss_enabled),
+                "reaction_solver_enabled": bool(self.reaction_enabled),
+                "yin_yang_solver_enabled": bool(self.yinyang_duel_enabled),
+                "twin_souls_solver_enabled": bool(self.twin_souls_enabled),
+            },
+            "player": {
+                "main_character_vid": None,
+                "position": None,
+                "current_target_vid": None,
+                "movement_state": None,
+                "attack_state": None,
+                "movement_attack_unavailable_reason":
+                    "no verified read-only movement/attack-state getter",
+            },
+            "scanner_snapshot": None,
+            "actors": None,
+        }
+        try:
+            context["map"] = ascii_text(background.GetCurrentMapName())
+        except Exception as exc:
+            context["map_error"] = ascii_text(exc)
+        try:
+            context["channel"] = int(net.GetChannelNumber())
+        except Exception as exc:
+            context["channel_error"] = ascii_text(exc)
+        try:
+            context["player"]["main_character_vid"] = int(
+                player.GetMainCharacterIndex())
+        except Exception as exc:
+            context["player"]["main_character_vid_error"] = ascii_text(exc)
+        try:
+            position = player.GetMainCharacterPosition()
+            context["player"]["position"] = [position[0], position[1], position[2]]
+        except Exception as exc:
+            context["player"]["position_error"] = ascii_text(exc)
+        try:
+            context["player"]["current_target_vid"] = int(player.GetTargetVID())
+        except Exception as exc:
+            context["player"]["current_target_vid_error"] = ascii_text(exc)
+
+        scanner = self.hunter_controller.last_scan
+        candidate_by_vid = {}
+        if scanner is not None:
+            now_ms = hunter_now_ms()
+            created_ms = scanner.get("created_ms")
+            candidates = list(scanner.get("candidates") or ())
+            candidate_by_vid = dict((int(item["vid"]), item)
+                                    for item in candidates)
+            ranked = sorted(candidates,
+                            key=lambda item: (item.get("distance2", 0),
+                                              item.get("vid", 0)))
+            ranks = dict((int(item["vid"]), index + 1)
+                         for index, item in enumerate(ranked))
+            selected_vid = context["player"].get("current_target_vid")
+            context["scanner_snapshot"] = {
+                "created_tick_ms": created_ms,
+                "age_ms": (None if now_ms is None or created_ms is None
+                           else max(0, int(now_ms) - int(created_ms))),
+                "epoch": scanner.get("epoch"),
+                "candidate_count": len(candidates),
+                "selected_target_distance_rank_among_scanner_candidates":
+                    ranks.get(selected_vid),
+                "selected_target_eligible_distance_rank": None,
+                "eligible_rank_unavailable_reason":
+                    "scanner snapshot does not retain native admission for every candidate",
+                "candidate_first_observed_tick_ms": None,
+                "first_observed_unavailable_reason":
+                    "existing scanner snapshots retain latest observation only",
+            }
+
+        if enrich and queue_snapshot and queue_snapshot.get("valid"):
+            queue_vids = [int(value) for value in
+                          (queue_snapshot.get("vids") or ())]
+            actors = []
+            player_position = context["player"].get("position")
+            anchor_position = context.get("anchor_position")
+            for vid in queue_vids:
+                actor = {
+                    "vid": vid,
+                    "name": None,
+                    "race": None,
+                    "position": None,
+                    "is_stone": None,
+                    "dead": None,
+                    "hp": None,
+                    "dead_hp_unavailable_reason":
+                        "no verified read-only dead/HP getter",
+                    "player_distance": None,
+                    "anchor_distance": None,
+                    "scanner_candidate": candidate_by_vid.get(vid),
+                }
+                try:
+                    actor["race"] = int(chr.GetVirtualNumber(vid))
+                    actor["name"] = ascii_text(chr.GetNameByVID(vid))
+                    actor_position = chr.GetPixelPosition(vid)
+                    actor["position"] = [actor_position[0], actor_position[1],
+                                         actor_position[2]]
+                    is_stone = getattr(chr, "IsStone", None)
+                    if is_stone is not None:
+                        actor["is_stone"] = bool(is_stone(vid))
+                    if player_position is not None:
+                        actor["player_distance"] = int(
+                            ((actor_position[0] - player_position[0]) ** 2 +
+                             (actor_position[1] - player_position[1]) ** 2) ** 0.5)
+                    if anchor_position is not None:
+                        actor["anchor_distance"] = int(
+                            ((actor_position[0] - anchor_position[0]) ** 2 +
+                             (actor_position[1] - anchor_position[1]) ** 2) ** 0.5)
+                except Exception as exc:
+                    actor["enrichment_error"] = ascii_text(exc)
+                actors.append(actor)
+            context["actors"] = actors
+        return context
+
     def ClearMap(self):
-        for dot in self.map_metins + self.map_others:
+        for dot in (self.map_metins + self.map_outside_metins +
+                    self.map_others + self.map_reach):
             dot.Hide()
-        self.map_count_label.SetText("Yellow: you  Red: metin  White: other")
+        self.map_count_label.SetText("Red: 0 in range  Gray: 0 out  White: 0")
 
     def UpdateConfigAutoloadButton(self):
         self.config_auto_button.SetText("Auto ON" if self.config_autoload else "Auto OFF")
@@ -2236,7 +3424,8 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.radius_edit.SetText(str(radius))
             self.reaction_enabled = values.get("reaction_enabled", "0") == "1"
             self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
-            self.reaction_label.SetText("Watches and solves the reaction game" if self.reaction_enabled
+            self.reaction_label.SetText("Automatic solving unavailable; safety pause active"
+                                        if self.reaction_enabled
                                         else "Manual reaction; combat safety remains active")
             if values.get("anchor_enabled", "0") == "1":
                 anchor_channel = int(values["anchor_channel"])
@@ -2318,7 +3507,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             return False
 
     def DisableAndClearMetinQueue(self):
-        """Disable/clear once; native true-to-false already performs a clear."""
+        """Disable/clear once; native true-to-false already performs a clear.
+        Retained only for disabled-feature internals.  Hunter cleanup goes
+        through the controller's ownership rules, never this broad clear."""
         try:
             enabled = bool(player.MetinQueueIsEnabled())
         except Exception:
@@ -2330,42 +3521,13 @@ class MetinScanner(ui.BoardWithTitleBar):
         if enabled is None:
             player.MetinQueueSetEnabled(0)
 
-    def ClearNativeAutomation(self):
-        try:
-            player.SetAttackKeyState(False)
-        except Exception:
-            pass
-        try:
-            self.DisableAndClearMetinQueue()
-        except Exception:
-            pass
-        try:
-            player.ClearTarget()
-        except Exception:
-            pass
-        self.hunter_queued_vids.clear()
-        self.hunter_logged_rejections.clear()
-        self.hunter_initial_fill = True
-        self.hunter_batch_add_count = 0
-        self.hunter_next_add = 0.0
-        self.hunter_refilling = False
-        self.hunter_next_refill = 0.0
-        self.ResetPriorityEventState()
-
-    def ResetPriorityEventState(self):
-        self.priority_event_vid = 0
-        self.priority_event_vnum = 0
-        self.priority_event_name = None
-        self.priority_event_missing_since = None
-
     def HasActiveNativeAutomation(self):
         return bool(self.hunter_enabled or self.boss_modes_paused or
                     self.reaction_native_paused or
                     (self.boss_enabled and self.boss_state == BOSS_ATTACK))
 
     def EmergencyStopForGameplayExit(self, reason):
-        if self.HasActiveNativeAutomation():
-            self.ClearNativeAutomation()
+        self.hunter_controller.on_session_change(reason)
         self.running = False
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
@@ -2385,22 +3547,21 @@ class MetinScanner(ui.BoardWithTitleBar):
 
     def OnGameplayPhaseWindowRegistered(self, phase, window):
         self.gameplay_phase = int(phase)
-        self.action_coordinator.on_phase_change()
         self.gameplay_available = (self.gameplay_phase == PHASE_GAME)
         self.gameplay_next_check = 0.0
         window_name = ascii_text(getattr(type(window), "__name__", "unknown"))
         if self.gameplay_available:
             self.gameplay_stopped = False
+            window_id = id(window)
+            if self._game_window is not None and self._game_window != window_id:
+                # A replacement phase-5 window is a new gameplay session: bump the
+                # epoch and stay OFF; never auto-enable old state.
+                self.hunter_controller.on_session_change("gameplay window replaced")
+            self._game_window = window_id
             self.AddLine("Playable game window registered: %s" % window_name)
-            if self.running and self.hunter_enabled and not self.boss_modes_paused:
-                try:
-                    player.MetinQueueSetEnabled(1)
-                except Exception:
-                    pass
             return
         if self.gameplay_phase == PHASE_LOADING:
-            if self.HasActiveNativeAutomation():
-                self.ClearNativeAutomation()
+            self.hunter_controller.on_session_change("phase loading")
             self.state_label.SetText("Paused while the game is loading.")
             return
         self.EmergencyStopForGameplayExit(
@@ -2414,13 +3575,6 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.AddLine("Python net.Disconnect called args=%r kwargs=%r stack=%s" %
                      (args, kwargs, " > ".join(frames)))
 
-    def OnNativeQueueVIDState(self, kind, vid, enabled):
-        if int(vid) == 0:
-            self.AddLine("Native queue %s VID set cleared" % kind)
-        else:
-            self.AddLine("Native queue %s VID %d: %s" %
-                         (kind, int(vid), "ON" if enabled else "OFF"))
-
     def IsGameplayAvailable(self, now=None):
         if self.gameplay_phase is not None and self.gameplay_phase != PHASE_GAME:
             return False
@@ -2433,8 +3587,7 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.gameplay_available = False
             if (self.boss_enabled and self.boss_state in
                     (BOSS_CHANGE_CHANNEL, BOSS_WAIT_CHANNEL, BOSS_SETTLE_CHANNEL)):
-                if self.HasActiveNativeAutomation():
-                    self.ClearNativeAutomation()
+                self.hunter_controller.on_session_change("game connection closed")
                 return False
             self.EmergencyStopForGameplayExit("game connection is closed")
             return False
@@ -2454,13 +3607,17 @@ class MetinScanner(ui.BoardWithTitleBar):
             else:
                 dot.Hide()
 
-    def UpdateMap(self, metin_offsets, other_offsets):
+    def UpdateMap(self, metin_offsets, other_offsets, outside_offsets=()):
         self.UpdateMapPool(self.map_metins, metin_offsets)
+        self.UpdateMapPool(self.map_outside_metins, outside_offsets)
         self.UpdateMapPool(self.map_others, other_offsets)
-        self.map_count_label.SetText("Yellow: you  Red: %d metins  White: %d others" %
-                                     (len(metin_offsets), len(other_offsets)))
+        self.map_count_label.SetText("Red: %d in range  Gray: %d out  White: %d" %
+                                     (len(metin_offsets), len(outside_offsets),
+                                      len(other_offsets)))
 
     def UpdatePlayerMarker(self, player_position):
+        self.UpdateMapPool(self.map_reach, radar_player_reach_offsets(
+            player_position, self.anchor_position, self.radius))
         center = self.anchor_position or player_position
         dx = player_position[0] - center[0]
         dy = player_position[1] - center[1]
@@ -2564,27 +3721,22 @@ class MetinScanner(ui.BoardWithTitleBar):
     def ToggleReaction(self):
         self.reaction_enabled = not self.reaction_enabled
         self.reaction_button.SetText("ON" if self.reaction_enabled else "OFF")
-        self.reaction_label.SetText("Watches and solves the reaction game" if self.reaction_enabled
+        # Automatic solving is unavailable in this Hunter-focused change; the
+        # toggle remains, but no solver runs.
+        self.reaction_label.SetText("Automatic solving unavailable; safety pause active"
+                                    if self.reaction_enabled
                                     else "Manual reaction; combat safety remains active")
         self.reaction_next_poll = 0.0
-        self.AddLine("Auto Reaction %s" % ("ON" if self.reaction_enabled else "OFF"))
+        self.AddLine("Auto Reaction %s (solver unavailable)" %
+                     ("ON" if self.reaction_enabled else "OFF"))
 
     def PauseNativeAutomationForReaction(self):
         if self.reaction_native_paused:
             return
-        self.reaction_saved_hunter_enabled = bool(self.hunter_enabled)
-        try:
-            self.reaction_saved_queue_enabled = bool(player.MetinQueueIsEnabled())
-        except Exception:
-            self.reaction_saved_queue_enabled = False
-        self.reaction_saved_boss_attack = bool(
-            self.boss_enabled and self.boss_state == BOSS_ATTACK)
         self.reaction_native_paused = True
-        self.ClearNativeAutomation()
-        if self.reaction_saved_hunter_enabled:
-            self.hunter_label.SetText("Queue: paused for reaction")
-        if self.reaction_saved_boss_attack:
-            self.boss_label.SetText("Boss attack paused for reaction")
+        self.reaction_resume_token = self.hunter_controller.pause('reaction')
+        self.hunter_label.SetText("Queue: paused for reaction")
+        self.AddLine("Reaction safety: native automation paused")
 
     def PollReactionGame(self, now):
         if now < self.reaction_next_poll:
@@ -2616,54 +3768,9 @@ class MetinScanner(ui.BoardWithTitleBar):
             if self.reaction_pause_started is None:
                 self.reaction_pause_started = now
                 self.PauseNativeAutomationForReaction()
-                if self.reaction_enabled:
-                    self.AddLine("Reaction game visible; native automation paused")
-                else:
-                    self.AddLine("Manual reaction required; native automation paused")
-            if not self.reaction_enabled:
-                return True
-            if bool(getattr(window, "isPlaying", False)):
-                self.reaction_started = True
-            elif not self.reaction_started:
-                play_button = getattr(window, "playButton", None)
-                if play_button is not None and play_button.IsShow():
-                    emit_synthetic_click()
-                    window._ReactionGameWindow__OnClickPlay()
-                    self.reaction_started = True
-                    self.AddLine("Reaction game start requested")
-                return True
-            if not bool(getattr(window, "isPlaying", False)):
-                return True
-            slot = getattr(window, "activeSlot", None)
-            buttons = getattr(window, "slotButtons", ())
-            if not isinstance(slot, INTEGER_TYPES) or slot < 0 or slot >= len(buttons):
-                return True
-            if not bool(getattr(window, "firstBallSpawned", False)):
-                return True
-            if bool(getattr(window, "isHit", False)):
-                return True
-            ball_time = getattr(window, "lastBallMoveTime", None)
-            if ball_time is None:
-                return True
-            ball_key = (ball_time, slot)
-            if ball_key == self.reaction_last_ball:
-                return True
-            if ball_key != self.reaction_pending_ball:
-                delay = next_reaction_click_delay()
-                self.reaction_pending_ball = ball_key
-                self.reaction_click_at = now + delay
-                self.AddLine("Reaction game slot %d observed; click in %.2fs" %
-                             (slot, delay))
-                return True
-            if now < self.reaction_click_at:
-                return True
-            emit_synthetic_click()
-            window._ReactionGameWindow__OnClickSlot(slot)
-            self.reaction_last_ball = ball_key
-            self.reaction_pending_ball = None
-            self.reaction_click_at = 0.0
-            self.AddLine("Reaction game clicked slot %d" % slot)
-            self.reaction_last_error = None
+                self.AddLine("Reaction game visible; native automation paused "
+                             "(solver unavailable)")
+            # Automatic solving is unavailable; no play/slot clicks are issued.
             return True
         except Exception as exc:
             problem = ascii_text(exc)
@@ -2687,49 +3794,18 @@ class MetinScanner(ui.BoardWithTitleBar):
             if self.boss_target_missing_since is not None:
                 self.boss_target_missing_since += elapsed
         if self.reaction_native_paused:
-            if (self.reaction_saved_boss_attack and self.boss_enabled and
-                    self.boss_state == BOSS_ATTACK):
-                self.StartBossFind()
-            elif (self.reaction_saved_hunter_enabled and self.hunter_enabled and
-                    self.running and self.reaction_saved_queue_enabled and
-                    self.gameplay_available):
-                try:
-                    player.MetinQueueSetEnabled(1)
-                    self.hunter_initial_fill = True
-                    self.hunter_label.SetText("Queue: refilling after reaction")
-                except Exception as exc:
-                    self.hunter_enabled = False
-                    self.hunter_button.SetText("OFF")
-                    self.hunter_label.SetText("Queue: reaction restore failed")
-                    self.AddLine("Reaction queue restore error: %s" % exc)
+            self.hunter_controller.resume(getattr(self, "reaction_resume_token", None))
             self.reaction_native_paused = False
-            self.reaction_saved_hunter_enabled = False
-            self.reaction_saved_queue_enabled = False
-            self.reaction_saved_boss_attack = False
+            self.reaction_resume_token = None
+            self.hunter_label.SetText(self.hunter_controller.status_text)
         self.AddLine("Reaction game pause ended after %.1fs" % elapsed)
 
     def ToggleYinYangDuel(self):
-        self.yinyang_duel_enabled = not self.yinyang_duel_enabled
-        self.yinyang_duel_button.SetText("ON" if self.yinyang_duel_enabled else "OFF")
-        self.yinyang_duel_next_poll = 0.0
-        self.yinyang_duel_last_error = None
-        self.yinyang_duel_debug = None
-        self.yinyang_duel_stall = None
-        if self.yinyang_duel_enabled:
-            if not self.running:
-                self.Start()
-                if not self.running:
-                    self.yinyang_duel_enabled = False
-                    self.yinyang_duel_button.SetText("OFF")
-                    self.yinyang_duel_label.SetText(
-                        "Yin Yang Duel: enter the game world first")
-                    return
-            self.yinyang_duel_label.SetText("Yin Yang Duel: probing runtime")
-            self.AddLine("Yin Yang Duel ON")
-            self.DiagnosticYinYangDuel()
-        else:
-            self.yinyang_duel_label.SetText("Yin Yang Duel off")
-            self.AddLine("Yin Yang Duel OFF")
+        self.yinyang_duel_enabled = False
+        self.yinyang_duel_button.SetText("OFF")
+        self.yinyang_duel_label.SetText(
+            "Yin Yang Duel unavailable: temporarily disabled")
+        self.AddLine("Yin Yang Duel unavailable: temporarily disabled")
 
     def DiagnosticYinYangDuel(self):
         """Dump the YinYangDuelWindow runtime API so the minigame can be driven."""
@@ -2921,7 +3997,6 @@ class MetinScanner(ui.BoardWithTitleBar):
                     bool(getattr(card, "played", False)) if card is not None else None))
             return False
         tracker.mark_pending(key)
-        emit_synthetic_click()
         try:
             card.OnMouseLeftButtonDown()
         except Exception as exc:
@@ -2980,7 +4055,6 @@ class MetinScanner(ui.BoardWithTitleBar):
         """
         name, continue_action = duel_result_continue_member(window)
         if continue_action is not None:
-            emit_synthetic_click()
             try:
                 continue_action()
                 self.yinyang_duel_label.SetText(
@@ -2990,7 +4064,6 @@ class MetinScanner(ui.BoardWithTitleBar):
                 return False
         close = getattr(window, "Close", None)
         if callable(close):
-            emit_synthetic_click()
             try:
                 close()
                 self.yinyang_duel_label.SetText("Yin Yang Duel: result window closed")
@@ -3150,31 +4223,11 @@ class MetinScanner(ui.BoardWithTitleBar):
     # --- Twin Souls controller ---
 
     def ToggleTwinSouls(self):
-        self.twin_souls_enabled = not self.twin_souls_enabled
-        self.twin_souls_button.SetText("ON" if self.twin_souls_enabled else "OFF")
-        self.twin_souls_next_poll = 0.0
-        self.twin_souls_discover_at = 0.0
-        self.twin_souls_last_error = None
-        self.twin_souls_last_status = None
-        self.twin_souls_last_state = None
-        self.twin_souls_last_board = None
-        self.twin_souls_last_finished_board = None
-        if self.twin_souls_enabled:
-            if not self.running:
-                self.Start()
-                if not self.running:
-                    self.twin_souls_enabled = False
-                    self.twin_souls_button.SetText("OFF")
-                    self.twin_souls_label.SetText(
-                        "Twin Souls: enter the game world first")
-                    return
-            self.twin_souls_label.SetText("Twin Souls: probing runtime")
-            self.AddLine("Twin Souls ON")
-            self.DiagnosticTwinSouls()
-        else:
-            self._TwinSoulsRelease()
-            self.twin_souls_label.SetText("Twin Souls off")
-            self.AddLine("Twin Souls OFF")
+        self.twin_souls_enabled = False
+        self.twin_souls_button.SetText("OFF")
+        self.twin_souls_label.SetText(
+            "Twin Souls unavailable: temporarily disabled")
+        self.AddLine("Twin Souls unavailable: temporarily disabled")
 
     def _TwinSoulsRelease(self):
         self.twin_souls_window = None
@@ -3646,61 +4699,19 @@ class MetinScanner(ui.BoardWithTitleBar):
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep OFF", False)
             return
-        if (self.boss_vnum is None or self.boss_position is None or
-                self.anchor_position is None or self.anchor_channel is None):
-            self.AddLine("Boss Sweep: select the boss and click Mark Boss first")
-            return
-        if not self.native_queue_wrapper_active:
-            self.AddLine("Boss Sweep unavailable: native full-input queue wrapper missing")
-            return
-        if not self.running:
-            self.Start()
-            if not self.running:
-                return
-        self.FindBossRuntime()
-        missing = []
-        if self.boss_timer is None:
-            missing.append("boss timer (open M map once)")
-        if self.boss_switch_dialog is None:
-            missing.append("channel changer")
-        if missing:
-            self.AddLine("Boss Sweep unavailable: %s" % ", ".join(missing))
-            return
-        try:
-            self.boss_channels = self.GetBossChannels()
-        except Exception as exc:
-            self.AddLine("Boss Sweep unavailable: %s" % exc)
-            return
-        self.boss_enabled = True
-        self.boss_state = BOSS_WAIT_TIMER
-        self.boss_state_started = time.time()
-        self.boss_next_poll = 0.0
-        self.boss_timer_armed = True
-        self.boss_last_error = None
-        self.boss_button.SetText("ON")
-        self.boss_label.SetText("Waiting for %s timer" % self.boss_name)
-        self.AddLine("Boss Sweep ON; return CH%d at %d, %d; channels %s" %
-                     (self.anchor_channel, self.anchor_position[0],
-                      self.anchor_position[1], ",".join(map(str, self.boss_channels))))
+        self.AddLine("Boss Sweep unavailable: temporarily disabled in this "
+                     "Hunter-focused change")
+        self.boss_label.SetText("Boss Sweep unavailable")
 
     def PauseMetinQueueForBoss(self):
+        # Boss Sweep is unavailable; retained for later repair.
         self.boss_saved_hunter_enabled = bool(self.hunter_enabled)
         try:
             self.boss_saved_queue_enabled = bool(player.MetinQueueIsEnabled())
         except Exception:
             self.boss_saved_queue_enabled = False
-        self.hunter_enabled = False
-        self.hunter_button.SetText("OFF")
-        self.hunter_queued_vids.clear()
-        self.hunter_initial_fill = True
-        self.hunter_batch_add_count = 0
-        self.hunter_next_add = 0.0
-        self.ResetPriorityEventState()
         self.DisableAndClearMetinQueue()
         self.boss_modes_paused = True
-        self.hunter_label.SetText("Queue: paused for boss")
-        self.AddLine("Boss pause: hunter was enabled=%s, queue was enabled=%s" %
-                     (self.boss_saved_hunter_enabled, self.boss_saved_queue_enabled))
 
     def RestoreAfterBoss(self):
         self.StopBossAttack()
@@ -3717,17 +4728,7 @@ class MetinScanner(ui.BoardWithTitleBar):
                 pass
             self.hunter_enabled = bool(self.boss_saved_hunter_enabled)
             self.hunter_button.SetText("ON" if self.hunter_enabled else "OFF")
-            if self.hunter_enabled:
-                self.hunter_initial_fill = True
-                self.hunter_batch_add_count = 0
-                self.hunter_next_add = 0.0
-                self.hunter_label.SetText("Queue: starting paced batch after boss")
-            else:
-                self.hunter_label.SetText("Queue: boss sweep finished")
-        else:
-            self.AddLine("Boss restore skipped: boss_modes_paused was already False")
-        self.AddLine("Boss restore: hunter enabled=%s (saved was %s)" %
-                     (self.hunter_enabled, self.boss_saved_hunter_enabled))
+            self.hunter_label.SetText("Queue: boss sweep finished")
         self.boss_modes_paused = False
         self.boss_saved_hunter_enabled = False
         self.boss_saved_queue_enabled = False
@@ -3803,27 +4804,7 @@ class MetinScanner(ui.BoardWithTitleBar):
         return best
 
     def StartBossAttack(self, candidate):
-        if not self.native_queue_wrapper_active:
-            raise RuntimeError("native full-input queue wrapper missing")
-        distance, vid, px, py = candidate
-        self.boss_target_vid = vid
-        player.SetAttackKeyState(False)
-        player.MetinQueueClear()
-        player.AddMetinQueueAllowedRace(self.boss_vnum)
-        player.MetinQueueSetEnabled(1)
-        self._dispatch_native_add(vid, 2.0)
-        queue_size = int(player.MetinQueueGetSize())
-        if queue_size < 1:
-            player.MetinQueueSetEnabled(0)
-            raise RuntimeError("temporary boss queue rejected VID %d" % vid)
-        self.boss_state = BOSS_ATTACK
-        self.boss_state_started = time.time()
-        self.boss_deadline = self.boss_state_started + BOSS_COMBAT_TIMEOUT_SECONDS
-        self.boss_target_missing_since = None
-        self.boss_label.SetText("CH%d: attacking %s" %
-                                (int(net.GetChannelNumber()), self.boss_name))
-        self.AddLine("CH%d: boss found [VID %d], distance %d; one-target chase queue started" %
-                     (int(net.GetChannelNumber()), vid, distance))
+        raise RuntimeError("Boss Sweep unavailable: temporarily disabled")
 
     def StopBossAttack(self):
         try:
@@ -3863,7 +4844,6 @@ class MetinScanner(ui.BoardWithTitleBar):
         if selected != channel:
             raise ValueError("channel dialog selected %s, expected %d" %
                              (selected, channel))
-        emit_synthetic_click()
         self.boss_switch_dialog.AcceptButton()
 
     def RequestBossChannel(self, channel, returning=False):
@@ -4111,8 +5091,7 @@ class MetinScanner(ui.BoardWithTitleBar):
     def Stop(self):
         if self.boss_enabled:
             self.StopBossSweep("Boss Sweep stopped", False)
-        if self.HasActiveNativeAutomation():
-            self.ClearNativeAutomation()
+        self.hunter_controller.stop("stopped")
         self.running = False
         self.hunter_enabled = False
         self.hunter_button.SetText("OFF")
@@ -4122,6 +5101,8 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.AddLine("Stopped")
 
     def Dispose(self):
+        if self.manual_queue_logger.active:
+            self.manual_queue_logger.stop(hunter_now_ms(), "panel_disposed")
         self.watcher.Hide()
         self.Stop()
         self.Hide()
@@ -4131,368 +5112,75 @@ class MetinScanner(ui.BoardWithTitleBar):
             self.AddLine("Metin Hunter unavailable during Boss Sweep")
             return
         if self.hunter_enabled:
+            self.hunter_controller.stop("stopped")
             self.hunter_enabled = False
-            self.ClearNativeAutomation()
             self.hunter_button.SetText("OFF")
-            self.hunter_label.SetText("Queue: stopped and cleared")
-            self.AddLine("Metin Hunter OFF; queue cleared")
+            self.hunter_label.SetText("Queue: stopped")
+            self.AddLine("Metin Hunter OFF")
             return
-        if not self.native_queue_wrapper_active:
-            self.AddLine("Metin Hunter unavailable: native full-input queue wrapper missing")
+        if self.hunter_observer is None:
+            self.AddLine("Metin Hunter unavailable: native observer missing")
             return
         if not self.running:
             self.Start()
             if not self.running:
                 return
-        try:
-            if not player.MetinQueueIsEnabled():
-                player.MetinQueueSetEnabled(1)
-            cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
-            size = int(player.MetinQueueGetSize())
-            if cap <= 0 or size < 0:
-                raise ValueError("invalid metin queue capacity or size")
-        except Exception as exc:
-            self.AddLine("Metin Hunter unavailable: %s" % exc)
-            return
-        self.hunter_queued_vids.clear()
-        self.hunter_logged_rejections.clear()
-        self.hunter_initial_fill = (size == 0)
-        self.hunter_batch_add_count = 0
-        self.hunter_refilling = False
-        self.hunter_next_refill = 0.0
-        now = time.time()
-        self.hunter_next_add = now + random.uniform(0.2, 0.6)
-        self.hunter_enabled = True
-        self.hunter_button.SetText("ON")
-        self.hunter_label.SetText("Starting %d/%d - first add in %.1fs" %
-                                  (size, cap,
-                                   max(0.0, self.hunter_next_add - now)))
-        self.AddLine("Metin Hunter ON; queue limit %d" % cap)
-
-    def ScheduleHunterRefill(self, now):
-        self.hunter_refilling = False
-        self.hunter_next_refill = now + random.uniform(HUNTER_REFILL_MIN,
-                                                       HUNTER_REFILL_MAX)
-
-    def _dispatch_native_add(self, vid, timeout):
-        """Run a synchronous native queue add through the action coordinator's
-        state machine, returning the raw wrapper result (0/1/2/3).  The
-        coordinator records the phase generation and deadline so the surrounding
-        loop can detect a phase change or a hang.
-
-        A certain pre-dispatch rejection (QueueAddRejected) becomes REJECTED.
-        Any other exception from the dispatch call becomes UNKNOWN, because the
-        click may already have executed; it is never reclassified or retried."""
-        action_id = self.action_coordinator.request("queue_add", vid, timeout)
-        if (self.action_coordinator.validate(action_id, vid > 0) !=
-                NativeActionCoordinator.VALIDATED):
-            return 0
-        self.action_coordinator.dispatch(action_id)
-        try:
-            result = _queue_add(vid)
-        except QueueAddRejected:
-            # Certain pre-dispatch rejection: safe to report and move on.
-            result = 0
-            outcome = NativeActionCoordinator.REJECTED
-        except Exception:
-            # The dispatch call itself failed after it may have executed: the
-            # outcome is uncertain, never a rejection or an immediate retry.
-            result = 3
-            outcome = NativeActionCoordinator.UNKNOWN
+        self.hunter_controller.user_requested_on = True
+        state = self.hunter_controller.start()
+        if state == self.hunter_controller.RUNNING:
+            self.hunter_enabled = True
+            self.hunter_button.SetText("ON")
         else:
-            outcome = _ADD_RESULT_OUTCOME.get(
-                result, NativeActionCoordinator.UNKNOWN)
-        self.action_coordinator.acknowledge(action_id, outcome)
-        # Retain UNKNOWN actions (identity + detail survive for diagnostics);
-        # poll() ages them out.  Certain outcomes are dropped now.
-        if outcome != NativeActionCoordinator.UNKNOWN:
-            self.action_coordinator.finish(action_id)
-        return result
-
-    def FeedMetinQueue(self, candidates):
-        if not self.hunter_enabled:
-            return
-        if not player.MetinQueueIsEnabled():
             self.hunter_enabled = False
             self.hunter_button.SetText("OFF")
-            self.hunter_label.SetText("Queue: disabled")
-            self.AddLine("Metin Hunter paused: queue was disabled")
-            return
-        cap = min(HUNTER_LIMIT, int(player.MetinQueueGetMaxSize()))
-        size = int(player.MetinQueueGetSize())
-        now = time.time()
-        if size >= cap:
-            if self.hunter_refilling or self.hunter_next_refill == 0.0:
-                self.ScheduleHunterRefill(now)
-            refill_wait = self.hunter_next_refill - now
-            if refill_wait > 0.0:
-                self.hunter_label.SetText(
-                    "Full %d/%d - refill in %.1fs" %
-                    (size, cap, refill_wait))
-            else:
-                self.hunter_label.SetText(
-                    "Full %d/%d - refill ready" % (size, cap))
-            return
-        # Time-driven refill: wait a noisy interval after the queue was last
-        # full, then burst-fill back to the cap. This mirrors the observed
-        # ~50s human rhythm instead of refilling the instant a slot frees.
-        if size == 0:
-            # Never leave an empty queue waiting for the long refill timer.
-            # Keep the small per-add delay, but begin looking immediately.
-            self.hunter_refilling = True
-            self.hunter_next_refill = 0.0
-        elif not self.hunter_refilling:
-            if now < self.hunter_next_refill:
-                self.hunter_label.SetText(
-                    "Waiting %d/%d - refill in %.1fs" %
-                    (size, cap, self.hunter_next_refill - now))
-                return
-            self.hunter_refilling = True
-        if now < self.hunter_next_add:
-            self.hunter_label.SetText(
-                "Refilling %d/%d - next add in %.1fs" %
-                (size, cap, self.hunter_next_add - now))
-            return
-        eligible = []
-        for distance, vid, name in candidates:
-            if vid in self.hunter_queued_vids:
-                continue
-            try:
-                vnum = chr.GetVirtualNumber(vid)
-                if not nonplayer.IsMonsterStone(vnum):
-                    continue
-                is_stone = getattr(chr, "IsStone", None)
-                if not callable(is_stone) or not is_stone(vid):
-                    reason = "native actor is not a stone"
-                    rejection = (int(vid), reason)
-                    if rejection not in self.hunter_logged_rejections:
-                        self.hunter_logged_rejections.add(rejection)
-                        self.AddLine("Skipped %s [VID %d]: %s" %
-                                     (name or "Metin", vid, reason))
-                    continue
-                reason = self.queue_admission_guard.RejectionReason(vid)
-                if reason is not None:
-                    rejection = (int(vid), reason)
-                    if rejection not in self.hunter_logged_rejections:
-                        self.hunter_logged_rejections.add(rejection)
-                        self.AddLine("Skipped %s [VID %d]: %s" %
-                                     (name or "Metin", vid, reason))
-                    continue
-                px, py = chr.GetPixelPosition(vid)[:2]
-                player_x, player_y = player.GetMainCharacterPosition()[:2]
-                distance = int(((px - player_x) ** 2 +
-                                (py - player_y) ** 2) ** 0.5)
-                if distance > self.radius:
-                    continue
-                center_x, center_y = (self.anchor_position or
-                                      (player_x, player_y))[:2]
-                circle_distance = int(((px - center_x) ** 2 +
-                                       (py - center_y) ** 2) ** 0.5)
-                if circle_distance > self.radius:
-                    continue
-                can_attack = getattr(player, "CanAttackInstance", None)
-                if callable(can_attack) and not can_attack(vid):
-                    continue
-                eligible.append((distance, vid, name))
-            except Exception:
-                continue  # Entity disappeared or changed before queue admission.
-        if not eligible:
-            self.hunter_label.SetText(
-                "Searching %d/%d - no eligible Metin" % (size, cap))
-            if size > 0:
-                self.ScheduleHunterRefill(now)
-            return
-        distance, vid, name = random.choice(eligible)
-        old_size = size
-        add_started = time.time()
-        result = self._dispatch_native_add(vid, 2.0)
-        add_elapsed_ms = (time.time() - add_started) * 1000.0
-        new_size = int(player.MetinQueueGetSize())
-        if result == 2:
-            # Already present in the authoritative queue; the wrapper did not
-            # dispatch a click (a click could remove it).  Treat as queued.
-            self.hunter_queued_vids.add(vid)
-            self.AddLine("VID %d already queued (no click), queue %d/%d, call %.2fms" %
-                         (vid, new_size, cap, add_elapsed_ms))
-            if new_size >= cap:
-                self.ScheduleHunterRefill(now)
-            return
-        # Success is the native result only (requested VID newly present in the
-        # authoritative queue).  Unrelated queue growth must not read as success.
-        if result == 1:
-            self.hunter_queued_vids.add(vid)
-            if new_size >= cap:
-                self.ScheduleHunterRefill(now)
-            delay = random.uniform(HUNTER_BURST_DELAY_MIN, HUNTER_BURST_DELAY_MAX)
-            self.hunter_next_add = now + delay
-            if new_size >= cap:
-                self.hunter_label.SetText(
-                    "Full %d/%d - refill in %.1fs" %
-                    (new_size, cap,
-                     max(0.0, self.hunter_next_refill - now)))
-            else:
-                self.hunter_label.SetText(
-                    "Refilling %d/%d - next add in %.1fs" %
-                    (new_size, cap, delay))
-            self.AddLine("Queued %s [VID %d], distance %d, queue %d->%d/%d, call %.2fms; next add >= %.2fs" %
-                         (name or "Metin", vid, distance, old_size, new_size,
-                          cap, add_elapsed_ms, delay))
-            return
-        if result == 3:
-            # Outcome unknown: the dispatch ran but the requested VID is not in
-            # the queue.  Do NOT mark it queued (it is not), and do NOT retry it
-            # immediately; let the next scan re-evaluate.  Re-attempting is safe:
-            # the wrapper checks membership first and reports "already present"
-            # without dispatching a click if the add actually landed.
-            self.AddLine("Queue outcome unknown for VID %d, queue %d->%d/%d, call %.2fms; no immediate retry" %
-                         (vid, old_size, new_size, cap, add_elapsed_ms))
-            delay = random.uniform(HUNTER_BURST_DELAY_MIN,
-                                   HUNTER_BURST_DELAY_MAX)
-            self.hunter_next_add = now + delay
-            self.hunter_label.SetText(
-                "Outcome unknown %d/%d - recheck in %.1fs" % (new_size, cap, delay))
-            return
-        self.AddLine("Queue rejected VID %d, queue %d->%d, call %.2fms" %
-                     (vid, old_size, new_size, add_elapsed_ms))
-        delay = random.uniform(HUNTER_BURST_DELAY_MIN,
-                               HUNTER_BURST_DELAY_MAX)
-        self.hunter_next_add = now + delay
-        self.hunter_label.SetText(
-            "Retrying %d/%d - next try in %.1fs" % (new_size, cap, delay))
+        self.hunter_label.SetText(self.hunter_controller.status_text)
 
-    def StartPriorityEventMetin(self, candidate):
-        distance, vid, name, expected_vnum = candidate
-        try:
-            vnum = int(chr.GetVirtualNumber(vid))
-            live_name = ascii_text(chr.GetNameByVID(vid))
-            if (vnum != expected_vnum or
-                    PRIORITY_EVENT_METIN_NAME not in live_name.lower()):
-                return False
-            name = live_name
-            if not nonplayer.IsMonsterStone(vnum):
-                return False
-            is_stone = getattr(chr, "IsStone", None)
-            if not callable(is_stone) or not is_stone(vid):
-                return False
-            reason = self.queue_admission_guard.RejectionReason(vid)
-            if reason is not None:
-                raise RuntimeError(reason)
-            px, py = chr.GetPixelPosition(vid)[:2]
-            player_x, player_y = player.GetMainCharacterPosition()[:2]
-            distance = int(((px - player_x) ** 2 +
-                            (py - player_y) ** 2) ** 0.5)
-            center_x, center_y = (self.anchor_position or
-                                  (player_x, player_y))[:2]
-            circle_distance = int(((px - center_x) ** 2 +
-                                   (py - center_y) ** 2) ** 0.5)
-            if distance > self.radius or circle_distance > self.radius:
-                return False
-            can_attack = getattr(player, "CanAttackInstance", None)
-            if callable(can_attack) and not can_attack(vid):
-                raise RuntimeError("native actor cannot be attacked")
-            self.DisableAndClearMetinQueue()
-            self.hunter_queued_vids.clear()
-            self.hunter_initial_fill = True
-            self.hunter_batch_add_count = 0
-            self.hunter_next_add = 0.0
-            player.AddMetinQueueAllowedRace(vnum)
-            player.MetinQueueSetEnabled(1)
-            self._dispatch_native_add(vid, 2.0)
-            if int(player.MetinQueueGetSize()) < 1:
-                raise RuntimeError("one-target queue rejected VID %d" % vid)
-            self.priority_event_vid = int(vid)
-            self.priority_event_vnum = vnum
-            self.priority_event_name = name or "Legendary Metinstone"
-            self.priority_event_missing_since = None
-            self.hunter_label.SetText("Priority: %s" % self.priority_event_name)
-            self.AddLine("Priority event Metin found: %s [vnum %d, VID %d], distance %d; ordinary queue cancelled" %
-                         (self.priority_event_name, vnum, vid, distance))
-            return True
-        except Exception as exc:
-            try:
-                self.DisableAndClearMetinQueue()
-                if self.hunter_enabled:
-                    player.MetinQueueSetEnabled(1)
-            except Exception:
-                pass
-            self.ResetPriorityEventState()
-            self.hunter_initial_fill = True
-            self.hunter_batch_add_count = 0
-            self.hunter_next_add = 0.0
-            self.AddLine("Priority event Metin rejected safely: %s" % ascii_text(exc))
-            return False
-
-    def FinishPriorityEventMetin(self):
-        name = self.priority_event_name or "Legendary Metinstone"
-        self.DisableAndClearMetinQueue()
-        self.ResetPriorityEventState()
-        self.hunter_queued_vids.clear()
-        self.hunter_initial_fill = True
-        self.hunter_batch_add_count = 0
-        self.hunter_next_add = 0.0
-        if self.hunter_enabled:
-            player.MetinQueueSetEnabled(1)
-            self.hunter_label.SetText("Queue: refilling after priority Metin")
-        self.AddLine("Priority event Metin gone: %s; ordinary Hunter restored" % name)
-
-    def HandlePriorityEventMetin(self, candidates, now):
-        if not self.hunter_enabled or self.boss_modes_paused:
-            return False
-        candidates = sorted(candidates)
-        if self.priority_event_vid:
-            for candidate in candidates:
-                if int(candidate[1]) == self.priority_event_vid:
-                    self.priority_event_missing_since = None
-                    return True
-            if candidates:
-                return self.StartPriorityEventMetin(candidates[0])
-            if self.priority_event_missing_since is None:
-                self.priority_event_missing_since = now
-                return True
-            if now - self.priority_event_missing_since < PRIORITY_EVENT_MISSING_SECONDS:
-                return True
-            self.FinishPriorityEventMetin()
-            return False
-        if not candidates:
-            return False
-        return self.StartPriorityEventMetin(candidates[0])
 
     def Scan(self, player_position):
         vids = visible_vids()
         x, y = (self.anchor_position or player_position)[:2]
-        player_x, player_y = player_position[:2]
+        try:
+            snapshot = self.hunter_selector.publish(
+                vids, player_position, self.anchor_position, self.radius,
+                self.hunter_controller.epoch, hunter_now_ms())
+        except Exception as exc:
+            self.AddLine("Metin Hunter error: %s" % ascii_text(exc))
+            self.ClearMap()
+            return
+
+        # Red dots/counts use the exact same immutable range snapshot as Hunter.
+        # Native admission and queue ownership remain later, separate checks.
+        candidates = snapshot["candidates"]
+        candidate_vids = set(candidate["vid"] for candidate in candidates)
         found = {}
         metin_offsets = []
+        for candidate in candidates:
+            gx, gy = candidate["x"], candidate["y"]
+            metin_offsets.append((gx - x, gy - y))
+            key = (candidate["vnum"], candidate["name"])
+            found.setdefault(key, []).append(int(((gx - x) ** 2 + (gy - y) ** 2) ** 0.5))
+        outside_offsets = []
         other_offsets = []
-        candidates = []
-        priority_event_candidates = []
+        radius2 = float(self.radius) ** 2
         for vid in vids:
+            if vid in candidate_vids:
+                continue
             try:
                 vnum = chr.GetVirtualNumber(vid)
                 is_metin = nonplayer.IsMonsterStone(vnum)
                 if not is_metin and len(other_offsets) >= len(self.map_others):
                     continue
                 px, py = chr.GetPixelPosition(vid)[:2]
-                circle_distance = int(((px - x) ** 2 + (py - y) ** 2) ** 0.5)
-                if circle_distance > self.radius:
+                circle_distance2 = (px - x) ** 2 + (py - y) ** 2
+                if circle_distance2 > radius2:
                     continue
-                if not is_metin:
-                    if circle_distance > 1 and len(other_offsets) < len(self.map_others):
-                        other_offsets.append((px - x, py - y))
-                    continue
-                if len(metin_offsets) < len(self.map_metins):
-                    metin_offsets.append((px - x, py - y))
-                name = ascii_text(chr.GetNameByVID(vid))
-                player_distance = int(((px - player_x) ** 2 + (py - player_y) ** 2) ** 0.5)
-                if player_distance <= self.radius:
-                    candidates.append((player_distance, vid, name))
-                    if PRIORITY_EVENT_METIN_NAME in name.lower():
-                        priority_event_candidates.append(
-                            (player_distance, vid, name, int(vnum)))
-                key = (vnum, name)
-                if key not in found:
-                    found[key] = []
-                found[key].append(circle_distance)
+                if is_metin:
+                    player_distance2 = ((px - player_position[0]) ** 2 +
+                                        (py - player_position[1]) ** 2)
+                    if player_distance2 > radius2:
+                        outside_offsets.append((px - x, py - y))
+                elif circle_distance2 > 1:
+                    other_offsets.append((px - x, py - y))
             except Exception:
                 continue  # Entity may have despawned after the native snapshot.
         mode = "anchored" if self.anchor_position is not None else "following"
@@ -4503,19 +5191,24 @@ class MetinScanner(ui.BoardWithTitleBar):
                              (name or "Metin", vnum, len(distances), min(distances)))
             summary = "radius=%d %s: %s" % (self.radius, mode, "; ".join(parts))
         else:
-            summary = "radius=%d %s: no metins visible in range" % (self.radius, mode)
-        self.UpdateMap(metin_offsets, other_offsets)
+            summary = "radius=%d %s: no metins visible in Hunter range" % (self.radius, mode)
+        summary += "; outside player reach=%d" % len(outside_offsets)
+        self.UpdateMap(metin_offsets, other_offsets, outside_offsets)
         self.AddLine(summary)
         try:
-            now = time.time()
-            if self.HandlePriorityEventMetin(priority_event_candidates, now):
-                return
-            self.FeedMetinQueue(candidates)
+            self.hunter_controller.on_scan(snapshot)
+            if (self.hunter_controller.priority_enabled and
+                    self.hunter_controller.priority_state ==
+                    HunterController.PRIORITY_NONE):
+                priority_vid = None
+                for cand in snapshot["candidates"]:
+                    if PRIORITY_EVENT_METIN_NAME in cand["name"].lower():
+                        priority_vid = cand["vid"]
+                        break
+                if priority_vid is not None:
+                    self.hunter_controller.request_priority(priority_vid)
         except Exception as exc:
-            self.hunter_enabled = False
-            self.hunter_button.SetText("OFF")
-            self.hunter_label.SetText("Queue: error")
-            self.AddLine("Metin Hunter error: %s" % exc)
+            self.AddLine("Metin Hunter error: %s" % ascii_text(exc))
 
     def RefreshRadius(self):
         try:
@@ -4535,11 +5228,33 @@ class MetinScanner(ui.BoardWithTitleBar):
         self.next_scan = 0.0
         self.AddLine("Radius changed to %d" % self.radius)
 
+    def _tick_hunter(self, now_ms):
+        """Run controller maintenance (reconciliation/cleanup) even when the
+        additions toggle is OFF; candidate refill still needs a fresh scan."""
+        if self.hunter_controller.state == HunterController.OFF:
+            return
+        try:
+            self.hunter_controller.tick(now_ms)
+            self.hunter_label.SetText(self.hunter_controller.status_text)
+            if self.hunter_controller.state == HunterController.ERROR:
+                self.hunter_enabled = False
+                self.hunter_button.SetText("OFF")
+        except Exception as exc:
+            self.AddLine("Metin Hunter error: %s" % ascii_text(exc))
+
     def OnUpdate(self):
         now = time.time()
-        self.action_coordinator.poll()
+        now_ms = hunter_now_ms()
+        # This opt-in observer is independent of scanner/Hunter/gameplay state.
+        # It runs first so invalid/session transitions are recorded too.
+        self.manual_queue_logger.tick(now_ms)
         if not self.IsGameplayAvailable(now):
             return
+        # Maintenance and audit observation run before the Reaction early return
+        # so pending reconciliation/cleanup and coverage logging are never
+        # bypassed while a reaction window is visible.
+        self._tick_hunter(now_ms)
+        self.hunter_audit.observe(now_ms)
         if self.PollReactionGame(now):
             return
         self.ResumeAfterReaction(now)
@@ -4577,8 +5292,6 @@ class MetinScanner(ui.BoardWithTitleBar):
                     self.AddLine("Scan error: %s" % problem)
                     self.last_scan_error = problem
                 self.ClearMap()
-            # Jitter the scan cadence so Hunter adds don't land on a whole-second
-            # grid; the effective click gaps then carry sub-second variation.
             self.next_scan = now + random.uniform(0.85, 1.15)
 
 
